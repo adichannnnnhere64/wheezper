@@ -21,4 +21,6 @@ pkgs.mkShell {
     llvmPackages.llvm # provides llvm-lib / llvm-ar / llvm-rc
   ];
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+  # bindgen (llama.cpp/whisper.cpp) needs libc headers visible to libclang
+  env.BINDGEN_EXTRA_CLANG_ARGS = "-I${pkgs.glibc.dev}/include";
 }

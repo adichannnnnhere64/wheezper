@@ -16,7 +16,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libasound2-dev
-      - run: cargo test --release
+      - run: cargo test --release --workspace
 
   build-linux:
     runs-on: ubuntu-latest
@@ -25,7 +25,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libasound2-dev
+      # two steps: the LLM worker is built first, then embedded into wheezper
+      - run: cargo build --release -p llm-worker
       - run: cargo build --release
+        env:
+          WHEEZPER_LLM_WORKER: ${{ github.workspace }}/target/release/wheezper-llm
       - name: Package
         run: tar czf wheezper-linux-amd64.tar.gz -C target/release wheezper
       - uses: actions/upload-artifact@v4
@@ -37,11 +41,15 @@ jobs:
     runs-on: windows-latest
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
+      LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ilammy/msvc-dev-cmd@v1
+      - run: cargo build --release -p llm-worker
       - run: cargo build --release
+        env:
+          WHEEZPER_LLM_WORKER: ${{ github.workspace }}\target\release\wheezper-llm.exe
       - name: Check the exe needs no redistributables
         shell: pwsh
         run: |

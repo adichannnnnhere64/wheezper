@@ -26,6 +26,45 @@ pub const MODELS: &[ModelSpec] = &[
 
 const HF_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
+/// Built-in LLM models (GGUF, run via hardwired llama.cpp — no Ollama needed).
+pub struct LlmModelSpec {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub url: &'static str,
+    pub approx_mb: u64,
+}
+
+pub const LLM_MODELS: &[LlmModelSpec] = &[LlmModelSpec {
+    name: "gemma3-1b",
+    file: "gemma-3-1b-it-Q4_K_M.gguf",
+    url: "https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf",
+    approx_mb: 779,
+}];
+
+/// Resolve a built-in LLM model name/path into a local GGUF, downloading on
+/// first use. Accepts an existing path, a known name (gemma3-1b), or an
+/// Ollama-style tag (gemma3:1b -> gemma3-1b).
+pub fn resolve_llm(arg: Option<&str>) -> Result<PathBuf> {
+    let raw = arg.unwrap_or("gemma3-1b");
+    let arg = raw.replace(':', "-");
+    let path = Path::new(&arg);
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let spec = LLM_MODELS.iter().find(|m| m.name == arg).ok_or_else(|| {
+        let names: Vec<&str> = LLM_MODELS.iter().map(|m| m.name).collect();
+        anyhow!(
+            "LLM model '{raw}' is neither an existing file nor a known model name ({})",
+            names.join(", ")
+        )
+    })?;
+    let dest = cache_dir()?.join(spec.file);
+    if !dest.exists() {
+        download_to(spec.url, &dest, spec.approx_mb)?;
+    }
+    Ok(dest)
+}
+
 /// Resolve `--model` (or default `base`) into a local model path,
 /// downloading on first use. Accepts:
 ///   - a path to an existing .bin file (used as-is)
@@ -47,7 +86,7 @@ pub fn resolve(arg: Option<&str>) -> Result<PathBuf> {
     })?;
     let dest = cache_dir()?.join(&spec.file);
     if !dest.exists() {
-        download(&spec, &dest)?;
+        download_to(&format!("{HF_BASE}/{}", spec.file), &dest, spec.approx_mb)?;
     }
     Ok(dest)
 }
@@ -95,16 +134,16 @@ pub fn cache_dir() -> Result<PathBuf> {
     }
 }
 
-fn download(spec: &DownloadSpec, dest: &Path) -> Result<()> {
-    let url = format!("{HF_BASE}/{}", spec.file);
-    eprintln!("wheezper: model not cached, downloading (~{} MB)…", spec.approx_mb);
+/// Download `url` to `dest` (temp file + rename) with progress on stderr.
+fn download_to(url: &str, dest: &Path, approx_mb: u64) -> Result<()> {
+    eprintln!("wheezper: downloading (~{} MB)…", approx_mb);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating model dir {}", parent.display()))?;
     }
     let tmp = dest.with_extension("part");
 
-    let resp = ureq::get(&url).call().context("starting model download")?;
+    let resp = ureq::get(url).call().context("starting model download")?;
     if !resp.status().is_success() {
         bail!("download failed: HTTP {}", resp.status());
     }
@@ -114,7 +153,7 @@ fn download(spec: &DownloadSpec, dest: &Path) -> Result<()> {
         .find(|(name, _)| name.as_str() == "content-length")
         .and_then(|(_, v)| v.to_str().ok())
         .and_then(|v| v.parse().ok())
-        .unwrap_or(spec.approx_mb * 1_000_000);
+        .unwrap_or(approx_mb * 1_000_000);
 
     let mut reader = resp.into_parts().1.into_reader();
     let mut file = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;

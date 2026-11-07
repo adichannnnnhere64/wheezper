@@ -23,6 +23,9 @@ VC++ redistributable needed).
 - **Calls**: `--source dual` transcribes mic ("me") + system loopback
   ("them") into speaker-labeled notes; `--webhook` pushes each utterance
   as JSON.
+- **Built-in LLM**: `--ollama` summarizes the session via an Ollama server
+  if you run one, else via **llama.cpp compiled into wheezper itself**
+  (worker embedded in the exe, Gemma model auto-downloads) — no installs.
 
 ## Usage
 
@@ -122,37 +125,48 @@ webhook = "http://192.168.1.20:8399/hook"
 notes = "notes/work.md"
 ```
 
-## Ollama: summary + polish (local LLM, no data leaves your machine)
+## Built-in LLM: summaries + polish (nothing to install)
 
-If you run [Ollama](https://ollama.com), wheezper can post-process the
-transcript with any model it hosts — Google's Gemma by default:
+`--ollama` post-processes the transcript with a local LLM — and it works even
+if you don't have (or can't run) an Ollama server:
+
+- **Ollama server running?** It uses it (any hosted model).
+- **No server?** wheezper falls back to **llama.cpp compiled into wheezper
+  itself**: no Ollama install, no setup. The LLM model (default Google
+  **gemma3-1b**, ~800 MB GGUF) auto-downloads on first use, exactly like the
+  whisper models.
 
 ```bash
-ollama pull gemma3:1b   # Google's smallest, ~800 MB — good summaries
-
 wheezper --ollama                       # summary appended to notepad on stop
 wheezper --ollama --polish              # also clean each utterance (latency!)
-wheezper --ollama --ollama-model llama3.2   # any hosted model works
-wheezper --ollama http://server:11434        # remote Ollama server
+wheezper --ollama --ollama-model gemma3:1b   # any Ollama model / gguf path
+wheezper --ollama http://server:11434        # explicit remote Ollama server
 ```
 
-On stop (Ctrl-C), the whole session transcript is sent to the model and a
-summary block (`one-paragraph, Key points, Action items`) is appended:
+How the built-in engine fits in one exe: whisper.cpp and llama.cpp both
+bundle their own ggml, so they cannot be linked into a single executable.
+wheezper therefore carries a tiny helper (`wheezper-llm`, ~5 MB) **inside
+itself** and extracts it to the model cache dir on first use — the
+distribution stays a single `wheezper.exe`.
+
+On stop (Ctrl-C), the whole session transcript is summarized and a block is
+appended:
 
 ```markdown
-## Summary — 2026-11-07 21:58
+## Summary — 2026-11-07 22:33
 
-The meeting focused on the Q3 migration timeline... The speakers agreed on ... 
+This meeting focuses on a call to action emphasizing the importance of...
+
 ## Key points:
-*   ...
+*   The speakers are emphasizing the importance of American citizens...
 ## Action items:
-*   ...
+*   None mentioned in the transcript.
 ```
 
 `--polish` additionally cleans each utterance (punctuation, filler words)
-before writing — adds a per-line LLM round-trip, so use it when latency
-doesn't matter. If the Ollama server is down or the model missing, wheezper
-warns and keeps the raw transcript untouched.
+before writing — it adds a per-line LLM round-trip, so use it when latency
+doesn't matter. Any failure (no server, model missing, disk full) just warns
+and keeps the raw transcript.
 
 ## Termux
 
@@ -175,6 +189,10 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
     --webhook <URL>   POST each utterance to this URL as JSON
     --partial         rolling live captions of the utterance in progress
+    --ollama [URL]    session summary via Ollama server at URL if running,
+                      else built-in llama.cpp (model auto-downloads)
+    --ollama-model <M>  gemma3:1b [default] | any Ollama model | .gguf path
+    --polish         LLM-clean each utterance before writing (latency!)
     --config <PATH>   config file [default: ./wheezper.toml, then config dir]
     --list-devices    list audio devices and exit
     --rate <HZ>       stdin sample rate [default: 16000, mono f32le]

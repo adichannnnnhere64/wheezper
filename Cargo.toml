@@ -6,6 +6,10 @@ description = "Live meeting/call transcription to a notepad. Single portable bin
 license = "MIT"
 repository = "https://github.com/adichannnnnhere64/wheezper"
 readme = "README.md"
+build = "build.rs"
+
+[workspace]
+members = ["llm-worker"]
 
 [dependencies]
 whisper-rs = "0.16"
@@ -16,6 +20,7 @@ cpal = { version = "0.18", features = ["pulseaudio"] }
 ctrlc = "3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "1.2.1"
+llama-cpp-2 = "0.1.161"
 
 # vendored to pin whisper.cpp and force /MT (static CRT) on Windows so the
 # exe runs with zero redistributable installs

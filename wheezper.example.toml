@@ -12,11 +12,12 @@ language = "en"        # or "auto" to detect per segment
 # device = "hdmi"           # substring match, see --list-devices
 # host = "pulseaudio"       # pulseaudio | wasapi | alsa | ...
 
-# local LLM post-processing via an Ollama server (https://ollama.com):
-# a session summary is appended to the notepad when you stop
+# local LLM post-processing: session summary appended on stop.
+# Uses an Ollama server if one is running, else llama.cpp built into
+# wheezper itself (model auto-downloads, nothing to install).
 ollama = true             # or "http://ollama-server:11434"
-ollama-model = "gemma3:1b"  # any model the server hosts (gemma3 = Google's)
-# polish = true              # LLM-clean each utterance before writing (latency!)
+ollama-model = "gemma3:1b"  # Google's gemma3 (default) | .gguf path
+# polish = true              # LLM-clean each utterance (latency!)
 
 # partial = true            # rolling live captions (stdout only)
 # rate = 16000              # stdin only

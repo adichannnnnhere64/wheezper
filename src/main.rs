@@ -71,14 +71,16 @@ struct Cli {
     #[arg(long)]
     partial: bool,
 
-    /// Use a local Ollama server (https://ollama.com) to post-process the
-    /// transcript: a session summary is appended to the notepad on stop.
-    /// Optionally pass a server URL [default: http://localhost:11434]
+    /// Post-process the transcript with a local LLM:
+    /// uses an Ollama server if one is running at the URL (default
+    /// http://localhost:11434) — otherwise falls back to llama.cpp compiled
+    /// INTO wheezper (no Ollama install needed; the LLM model auto-downloads
+    /// on first use). A session summary is appended to the notepad on stop.
     #[arg(long, num_args = 0..=1, default_missing_value = "http://localhost:11434")]
     ollama: Option<String>,
 
-    /// Ollama model for summary/polish — anything the server hosts
-    /// [default: gemma3:1b, Google's smallest]
+    /// LLM model for summary/polish. Server: anything it hosts.
+    /// Built-in: gemma3-1b [default, Google's, ~800 MB GGUF] or a .gguf path
     #[arg(long, default_value = "gemma3:1b")]
     ollama_model: String,
 
@@ -203,8 +205,8 @@ struct Engine {
     /// every call to 30 s, so each one costs ~3-5 s; previews must never
     /// block finals or audio).
     partial_tx: Option<std::sync::mpsc::SyncSender<PartialMsg>>,
-    /// Local LLM post-processing (Ollama): summary on stop, optional polish.
-    ollama: Option<llm::Ollama>,
+    /// Local LLM post-processing: session summary on stop, optional polish.
+    llm: Option<llm::Llm>,
     polish: bool,
 }
 
@@ -215,15 +217,28 @@ impl Engine {
         eprintln!("wheezper: notes -> {}", notepad.path().display());
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
 
-        let ollama = cli.ollama.as_deref().map(|url| {
-            let o = llm::Ollama::new(url, &cli.ollama_model);
-            if let Err(e) = o.check() {
-                eprintln!("wheezper: warning: {e:#}");
-            } else {
-                eprintln!("wheezper: ollama ok — model {} @ {}", o.model, o.url);
+        let llm: Option<llm::Llm> = if let Some(url) = cli.ollama.as_deref() {
+            let server = llm::Ollama::new(url, &cli.ollama_model);
+            match server.check() {
+                Ok(()) => {
+                    eprintln!("wheezper: ollama server ok — model {} @ {}", server.model, server.url);
+                    Some(llm::Llm::Server(server))
+                }
+                Err(e) => {
+                    // no server: hardwired llama.cpp, model auto-downloads
+                    eprintln!("wheezper: no Ollama server ({e}); using built-in llama.cpp");
+                    match llm::Builtin::new(&cli.ollama_model, threads) {
+                        Ok(b) => Some(llm::Llm::Builtin(b)),
+                        Err(e2) => {
+                            eprintln!("wheezper: warning: built-in LLM unavailable: {e2:#}");
+                            None
+                        }
+                    }
+                }
             }
-            o
-        });
+        } else {
+            None
+        };
 
         let partial_tx = if cli.partial {
             let (tx, rx) = std::sync::mpsc::sync_channel::<PartialMsg>(1);
@@ -266,7 +281,7 @@ impl Engine {
             None
         };
 
-        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx, ollama, polish: cli.polish && cli.ollama.is_some() })
+        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx, llm, polish: cli.polish && cli.ollama.is_some() })
     }
 
     /// Queue a live-caption preview (never blocks; drops when busy).
@@ -291,7 +306,7 @@ impl Engine {
         match self.transcriber.transcribe(samples, prompt.as_deref()) {
             Ok(raw) => {
                 // optional LLM cleanup per utterance (keeps raw text on failure)
-                let text = match (&self.ollama, self.polish) {
+                let text = match (&self.llm, self.polish) {
                     (Some(o), true) => o.polish(&raw).unwrap_or(raw),
                     _ => raw,
                 };
@@ -481,13 +496,13 @@ impl Channel {
 
 /// Append an LLM (Ollama) summary of the whole session to the notepad.
 fn summarize_session(engine: &mut Engine) -> Result<()> {
-    let Some(ollama) = &engine.ollama else { return Ok(()) };
+    let Some(llm) = &engine.llm else { return Ok(()) };
     let transcript = engine.notepad.read_content().unwrap_or_default();
     if transcript.trim().is_empty() {
         return Ok(());
     }
-    eprintln!("wheezper: summarizing session with Ollama ({})…", ollama.model);
-    let summary = match ollama.summarize(&transcript) {
+    eprintln!("wheezper: summarizing session with {}…", llm.describe());
+    let summary = match llm.summarize(&transcript) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wheezper: summary failed (transcript kept as-is): {e:#}");

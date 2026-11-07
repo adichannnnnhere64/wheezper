@@ -1,12 +1,73 @@
-//! Ollama integration: post-process the session transcript with a local LLM
-//! (any model the Ollama server hosts — gemma3, llama3.2, qwen, ...).
+//! LLM post-processing of the transcript. Two interchangeable backends:
 //!
-//! Never fatal: if the server is down or the model is missing, wheezper
-//! warns on stderr and the raw transcript stays untouched.
+//! - [`Ollama`]: talk to an Ollama server (localhost or remote) with any
+//!   model it hosts.
+//! - [`Builtin`]: llama.cpp in an embedded helper process — no server, no
+//!   installs. whisper.cpp and llama.cpp both bundle their own ggml, so they
+//!   cannot live in one executable; wheezper.exe carries `wheezper-llm`
+//!   inside itself and extracts it to the cache dir on first use. The GGUF
+//!   model (default Google gemma3-1b) auto-downloads like the whisper models.
+//!
+//! Both implement the same [`Llm`] interface (summary + polish) and are
+//! never fatal: on failure the raw transcript stays untouched.
 
+use crate::models;
 use anyhow::{anyhow, Context, Result};
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// unified interface
+// ---------------------------------------------------------------------------
+
+pub enum Llm {
+    Server(Ollama),
+    Builtin(Builtin),
+}
+
+impl Llm {
+    pub fn describe(&self) -> String {
+        match self {
+            Llm::Server(o) => format!("{} @ {}", o.model, o.url),
+            Llm::Builtin(b) => format!("{} (built-in llama.cpp)", b.model_name),
+        }
+    }
+
+    pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
+        match self {
+            Llm::Server(o) => o.generate(system, prompt, max_tokens),
+            Llm::Builtin(b) => b.generate(system, prompt, max_tokens),
+        }
+    }
+
+    /// Summarize a meeting transcript (one-paragraph + key points + actions).
+    pub fn summarize(&self, transcript: &str) -> Result<String> {
+        let system = "You summarize meeting transcripts. Reply in markdown with: a one-paragraph summary, then a '## Key points' bullet list, then a '## Action items' bullet list with owners if mentioned. Be concise and factual; never invent facts.";
+        let prompt = format!("Transcript:\n{transcript}");
+        let out = self.generate(system, &prompt, 512)?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Polish one transcribed utterance: punctuation, casing, filler removal.
+    /// Keeps the wording otherwise intact; falls back to raw text if the
+    /// model goes off-script.
+    pub fn polish(&self, text: &str) -> Result<String> {
+        let system = "You fix raw speech-to-text output: add punctuation and capitalization, remove filler words (um, uh) and stutters. Keep the wording otherwise EXACTLY the same. Reply with the corrected sentence only, nothing else.";
+        let prompt = format!("Raw text: {text}");
+        let out = self.generate(system, &prompt, 256)?;
+        let out = out.trim().trim_matches('"').to_string();
+        if out.is_empty() || out.len() > text.len() * 3 {
+            return Ok(text.to_string());
+        }
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama server backend
+// ---------------------------------------------------------------------------
 
 pub struct Ollama {
     pub url: String,
@@ -85,31 +146,149 @@ impl Ollama {
         extract_json_string(&body, "content")
             .ok_or_else(|| anyhow!("could not parse Ollama response: {}", body.chars().take(200).collect::<String>()))
     }
+}
 
-    /// Summarize a meeting transcript (one-paragraph + key points + actions).
-    pub fn summarize(&self, transcript: &str) -> Result<String> {
-        let system = "You summarize meeting transcripts. Reply in markdown with: a one-paragraph summary, then a '## Key points' bullet list, then a '## Action items' bullet list with owners if mentioned. Be concise and factual; never invent facts.";
-        let prompt = format!("Transcript:\n{transcript}");
-        let out = self.generate(system, &prompt, 1024)?;
-        Ok(out.trim().to_string())
+// ---------------------------------------------------------------------------
+// built-in backend: llama.cpp in an embedded helper process
+// ---------------------------------------------------------------------------
+
+pub struct Builtin {
+    model_name: String,
+    model_path: PathBuf,
+    threads: i32,
+    worker: std::cell::RefCell<Worker>,
+}
+
+impl Builtin {
+    /// `name_or_path`: a known model name (gemma3-1b), an Ollama-style tag
+    /// (gemma3:1b), or a path to an existing .gguf. The model is downloaded
+    /// on first use; the worker process is embedded in wheezper.exe.
+    pub fn new(name_or_path: &str, threads: i32) -> Result<Self> {
+        let model_path = models::resolve_llm(Some(name_or_path))
+            .with_context(|| format!("resolving built-in LLM model '{name_or_path}'"))?;
+        let mut worker = Worker::spawn()?;
+        worker.warm_up(&model_path, threads)?; // load the model once, fail early
+        Ok(Self { model_name: name_or_path.to_string(), model_path, threads, worker: std::cell::RefCell::new(worker) })
     }
 
-    /// Polish one transcribed utterance: punctuation, casing, filler removal.
-    /// Keeps the wording otherwise intact; falls back to the raw text if the
-    /// model goes off-script.
-    pub fn polish(&self, text: &str) -> Result<String> {
-        let system = "You fix raw speech-to-text output: add punctuation and capitalization, remove filler words (um, uh) and stutters. Keep the wording otherwise EXACTLY the same. Reply with the corrected sentence only, nothing else.";
-        let prompt = format!("Raw text: {text}");
-        let out = self.generate(system, &prompt, 256)?;
-        let out = out.trim().trim_matches('"').to_string();
-        if out.is_empty() || out.len() > text.len() * 3 {
-            return Ok(text.to_string());
-        }
-        Ok(out)
+    pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
+        let req = format!(
+            "{{\"model\":{}, \"system\":{}, \"prompt\":{}, \"max_tokens\":{}, \"threads\":{}}}",
+            json_str(&self.model_path.display().to_string()),
+            json_str(system),
+            json_str(prompt),
+            max_tokens,
+            self.threads,
+        );
+        self.worker.borrow_mut().request(&req)
     }
 }
 
-/// Minimal JSON string value extractor for flat Ollama responses
+/// A running `wheezper-llm` helper: JSON lines in, JSON lines out.
+struct Worker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Worker {
+    fn spawn() -> Result<Self> {
+        let path = worker_binary_path()?;
+        let mut child = Command::new(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("spawning {}", path.display()))?;
+        let stdin = child.stdin.take().context("worker stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("worker stdout")?);
+        Ok(Self { child, stdin, stdout })
+    }
+
+    /// Send one request line, read one response line.
+    fn request(&mut self, req_json: &str) -> Result<String> {
+        writeln!(self.stdin, "{req_json}").context("writing to LLM worker")?;
+        self.stdin.flush().ok();
+        let mut line = String::new();
+        self.stdout
+            .read_line(&mut line)
+            .context("reading from LLM worker")?;
+        if line.trim().is_empty() {
+            return Err(anyhow!("LLM worker closed unexpectedly"));
+        }
+        let text = extract_json_string(line.trim(), "text")
+            .ok_or_else(|| anyhow!("bad LLM worker response: {}", line.chars().take(200).collect::<String>()))?;
+        if let Some(err) = extract_json_string(line.trim(), "error") {
+            return Err(anyhow!("LLM worker: {err}"));
+        }
+        Ok(text)
+    }
+
+    /// Load the model (empty prompt probe) so failures surface at startup.
+    fn warm_up(&mut self, model_path: &std::path::Path, threads: i32) -> Result<()> {
+        let req = format!(
+            "{{\"model\":{}, \"system\":\"\", \"prompt\":\"\", \"max_tokens\":1, \"threads\":{}}}",
+            json_str(&model_path.display().to_string()),
+            threads,
+        );
+        self.request(&req)?;
+        Ok(())
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Where to find the wheezper-llm worker binary:
+/// 1. $WHEEZPER_LLM_WORKER (dev builds)
+/// 2. next to the wheezper executable (same target dir / same zip)
+/// 3. embedded copy, extracted once into the model cache dir
+fn worker_binary_path() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("WHEEZPER_LLM_WORKER")
+        && PathBuf::from(&p).exists()
+    {
+        return Ok(PathBuf::from(p));
+    }
+
+    let exe = std::env::current_exe().context("locating wheezper executable")?;
+    let exe_dir = exe.parent().context("executable has no parent dir")?.to_path_buf();
+    let sibling = if cfg!(windows) { "wheezper-llm.exe" } else { "wheezper-llm" };
+    let sibling_path = exe_dir.join(sibling);
+    if sibling_path.exists() {
+        return Ok(sibling_path);
+    }
+
+    // embedded copy (build.rs puts it in OUT_DIR; empty when not provided)
+    const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wheezper-llm.bin"));
+    if EMBEDDED.is_empty() {
+        return Err(anyhow!(
+            "wheezper-llm worker not found (not embedded, not next to {}). \
+             Use an Ollama server instead: --ollama http://<server>:11434",
+            exe_dir.display()
+        ));
+    }
+    let dir = models::cache_dir()?.join("bin");
+    std::fs::create_dir_all(&dir).ok();
+    let dest = dir.join(sibling);
+    if !dest.exists() || std::fs::metadata(&dest).map(|m| m.len() as usize).ok() != Some(EMBEDDED.len()) {
+        std::fs::write(&dest, EMBEDDED).with_context(|| format!("extracting {}", dest.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+    }
+    Ok(dest)
+}
+
+// ---------------------------------------------------------------------------
+
+/// Minimal JSON string value extractor for flat JSON responses
 /// (no serde dependency needed for this).
 fn extract_json_string(body: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":\"");
