@@ -4,3 +4,4 @@
 /test/*.f32
 /test/*.wav
 /result
+target-xwin/

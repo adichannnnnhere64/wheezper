@@ -26,6 +26,7 @@ llama-cpp-2 = "0.1.161"
 # exe runs with zero redistributable installs
 [patch.crates-io]
 whisper-rs-sys = { path = "vendor/whisper-rs-sys" }
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }
 
 [profile.release]
 lto = "thin"
