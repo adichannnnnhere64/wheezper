@@ -42,6 +42,7 @@ jobs:
     env:
       RUSTFLAGS: "-C target-feature=+crt-static"
       LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
+      LLAMA_STATIC_CRT: "1"   # llama.cpp /MT — match the static CRT link
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

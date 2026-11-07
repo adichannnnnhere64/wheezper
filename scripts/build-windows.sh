@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 export PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$HOME/.cargo/bin:$PATH"
 
 rustup target add x86_64-pc-windows-msvc
+export LLAMA_STATIC_CRT=1  # llama.cpp /MT — match the static CRT link
 
 # 1) the LLM worker (llama.cpp only — no whisper conflict)
 RUSTFLAGS="-C target-feature=+crt-static" \
