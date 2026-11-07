@@ -1,0 +1,16 @@
+[package]
+name = "wheezper"
+version = "0.1.0"
+edition = "2024"
+description = "Live audio transcription to a notepad. stdin PCM -> whisper -> markdown."
+license = "MIT"
+
+[dependencies]
+whisper-rs = "0.16"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+lto = "thin"
+strip = true
