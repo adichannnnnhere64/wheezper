@@ -10,6 +10,8 @@ whisper-rs = "0.16"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+cpal = { version = "0.18", features = ["pulseaudio"] }
+ctrlc = "3"
 
 [profile.release]
 lto = "thin"

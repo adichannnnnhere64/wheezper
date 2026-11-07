@@ -1,30 +1,37 @@
+mod capture;
+mod dsp;
 mod notepad;
 mod segmenter;
 mod transcribe;
 
 use anyhow::Result;
+use capture::{Capture, Pop, SourceMode, TARGET_RATE};
 use chrono::Local;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use dsp::{Framer, Resampler};
 use notepad::Notepad;
 use segmenter::Segmenter;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 use transcribe::Transcriber;
 
 /// wheezper — live audio transcription into a notepad.
 ///
-/// Reads raw mono f32le PCM from stdin and appends transcribed utterances to
-/// a markdown notepad. Feed it from anything:
+/// Captures your microphone (or system loopback audio) and appends transcribed
+/// utterances to a markdown notepad. Local whisper.cpp inference: the audio
+/// never leaves your machine.
 ///
-///   ffmpeg -f pulse -i default -ar 16000 -ac 1 -f f32le - | wheezper -m model.bin
-///   pw-cat --format f32 ...  | wheezper -m model.bin
-///   cat recording.f32        | wheezper -m model.bin
+/// Examples:
+///   wheezper -m models/ggml-base-q5_1.bin                 # default microphone
+///   wheezper --source loopback -m model.bin               # system audio (calls)
+///   ffmpeg -i call.wav -ar 16000 -ac 1 -f f32le - | wheezper --source stdin -m model.bin
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to the ggml whisper model (.bin)
     #[arg(short, long, env = "WHEEZPER_MODEL")]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// Notepad output file [default: notes/YYYY-MM-DD.md]
     #[arg(short, long)]
@@ -34,11 +41,28 @@ struct Cli {
     #[arg(short, long, default_value = "auto")]
     language: String,
 
-    /// Input sample rate (Hz); input must be mono f32le
+    /// Audio source: mic, loopback (system audio), or stdin (f32le mono PCM).
+    /// Default: stdin if stdin is piped, else mic.
+    #[arg(long)]
+    source: Option<SourceArg>,
+
+    /// Pick device by case-insensitive substring (see --list-devices)
+    #[arg(long)]
+    device: Option<String>,
+
+    /// Audio host override, e.g. pulseaudio, wasapi, alsa
+    #[arg(long)]
+    host: Option<String>,
+
+    /// List available audio devices and exit
+    #[arg(long)]
+    list_devices: bool,
+
+    /// stdin input sample rate (Hz); stdin must be mono f32le
     #[arg(long, default_value_t = 16000)]
     rate: u32,
 
-    /// Frames of silence below this RMS level (dBFS) count as silence
+    /// RMS level (dBFS) below which audio counts as silence
     #[arg(long, default_value_t = -40.0)]
     threshold_db: f32,
 
@@ -59,11 +83,36 @@ struct Cli {
     threads: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SourceArg {
+    Stdin,
+    Mic,
+    Loopback,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // whisper.cpp is extremely chatty on stderr; silence it (we own the output)
     whisper_rs::install_logging_hooks();
+
+    if cli.list_devices {
+        let host = capture::resolve_host(cli.host.as_deref())?;
+        return capture::list_devices(&host);
+    }
+
+    // source default: piped stdin, else microphone
+    let source = cli.source.unwrap_or({
+        if std::io::stdin().is_terminal() {
+            SourceArg::Mic
+        } else {
+            SourceArg::Stdin
+        }
+    });
+
+    let notes_path = cli.notes.clone().unwrap_or_else(|| {
+        PathBuf::from("notes").join(format!("{}.md", Local::now().format("%Y-%m-%d")))
+    });
 
     let threads = if cli.threads == 0 {
         std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4)
@@ -71,74 +120,158 @@ fn main() -> Result<()> {
         cli.threads
     };
 
-    let notes_path = cli.notes.clone().unwrap_or_else(|| {
-        PathBuf::from("notes").join(format!("{}.md", Local::now().format("%Y-%m-%d")))
-    });
-
-    let mut notepad = Notepad::open(&notes_path)?;
-    let mut transcriber = Transcriber::new(&cli.model, &cli.language, threads)?;
-    let mut segmenter = Segmenter::new(cli.rate, cli.threshold_db, cli.min_silence, cli.min_segment, cli.max_segment);
-
+    let pipeline = Pipeline::new(&cli, &notes_path, threads)?;
     eprintln!(
-        "wheezper: model={}, lang={}, rate={} Hz -> {}",
-        cli.model.display(),
-        cli.language,
-        cli.rate,
-        notepad.path().display()
+        "wheezper: model={}, lang={}",
+        cli.model.as_ref().map(|m| m.display().to_string()).unwrap_or_default(),
+        cli.language
     );
 
-    let frame_bytes = segmenter.frame_len() * 4; // f32le
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let mut byte_buf = vec![0u8; frame_bytes];
-    let mut sample_buf = vec![0f32; frame_bytes / 4];
+    match source {
+        SourceArg::Stdin => run_stdin(&cli, pipeline),
+        SourceArg::Mic | SourceArg::Loopback => {
+            let mode = if source == SourceArg::Loopback { SourceMode::Loopback } else { SourceMode::Mic };
+            run_capture(&cli, mode, pipeline)
+        }
+    }
+}
 
-    loop {
-        match read_exact_or_eof(&mut reader, &mut byte_buf) {
-            Ok(false) => break, // EOF
-            Ok(true) => {
-                for (i, chunk) in byte_buf.as_chunks::<4>().0.iter().enumerate() {
-                    sample_buf[i] = f32::from_le_bytes(*chunk);
-                }
-                if let Some(segment) = segmenter.feed(&sample_buf) {
-                    handle_segment(&mut transcriber, &mut notepad, &segment);
-                }
+// --- pipeline --------------------------------------------------------------
+
+struct Pipeline {
+    segmenter: Segmenter,
+    framer: Framer,
+    transcriber: Transcriber,
+    notepad: Notepad,
+}
+
+impl Pipeline {
+    fn new(cli: &Cli, notes_path: &std::path::Path, threads: i32) -> Result<Self> {
+        let model = cli
+            .model
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--model <PATH> (or env WHEEZPER_MODEL) is required"))?;
+        let notepad = Notepad::open(notes_path)?;
+        let transcriber = Transcriber::new(model, &cli.language, threads)?;
+        let segmenter = Segmenter::new(
+            TARGET_RATE,
+            cli.threshold_db,
+            cli.min_silence,
+            cli.min_segment,
+            cli.max_segment,
+        );
+        let framer = Framer::new(segmenter.frame_len());
+        eprintln!("wheezper: notes -> {}", notepad.path().display());
+        Ok(Self { segmenter, framer, transcriber, notepad })
+    }
+
+    /// Push a chunk of 16 kHz mono samples.
+    fn push(&mut self, samples: &[f32]) {
+        self.framer.push(samples);
+        while let Some(frame) = self.framer.next_frame() {
+            if let Some(segment) = self.segmenter.feed(&frame) {
+                self.handle(&segment);
             }
-            Err(e) => return Err(e.context("reading stdin")),
         }
     }
 
-    if let Some(segment) = segmenter.flush() {
-        handle_segment(&mut transcriber, &mut notepad, &segment);
+    /// Final flush (EOF or Ctrl-C): pad the partial frame, close the segment.
+    fn finish(&mut self) {
+        if let Some(frame) = self.framer.finish()
+            && let Some(segment) = self.segmenter.feed(&frame)
+        {
+            self.handle(&segment);
+        }
+        if let Some(segment) = self.segmenter.flush() {
+            self.handle(&segment);
+        }
     }
+
+    fn handle(&mut self, samples: &[f32]) {
+        match self.transcriber.transcribe(samples) {
+            Ok(text) => match self.notepad.append(&text) {
+                Ok(true) => {
+                    let ts = Local::now().format("%H:%M:%S");
+                    println!("[{ts}] {text}");
+                }
+                Ok(false) => {} // dropped: empty or duplicate
+                Err(e) => eprintln!("wheezper: notepad write failed: {e:#}"),
+            },
+            Err(e) => eprintln!("wheezper: transcription failed: {e:#}"),
+        }
+    }
+}
+
+// --- stdin source -----------------------------------------------------------
+
+fn run_stdin(cli: &Cli, mut pipeline: Pipeline) -> Result<()> {
+    eprintln!("wheezper: source=stdin ({} Hz, mono f32le)", cli.rate);
+    let mut resampler = Resampler::new(cli.rate, TARGET_RATE);
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut byte_buf = vec![0u8; 16384];
+    let mut samples = Vec::new();
+    let mut out = Vec::new();
+
+    loop {
+        let n = reader.read(&mut byte_buf)?;
+        if n == 0 {
+            break;
+        }
+        samples.clear();
+        for chunk in byte_buf.as_chunks::<4>().0.iter() {
+            samples.push(f32::from_le_bytes(*chunk));
+        }
+        out.clear();
+        resampler.push_slice(&samples, &mut out);
+        pipeline.push(&out);
+    }
+    pipeline.finish();
     eprintln!("wheezper: done.");
     Ok(())
 }
 
-fn handle_segment(transcriber: &mut Transcriber, notepad: &mut Notepad, samples: &[f32]) {
-    match transcriber.transcribe(samples) {
-        Ok(text) => match notepad.append(&text) {
-            Ok(true) => {
-                let ts = Local::now().format("%H:%M:%S");
-                println!("[{ts}] {text}");
-            }
-            Ok(false) => {} // dropped: empty or duplicate
-            Err(e) => eprintln!("wheezper: notepad write failed: {e:#}"),
-        },
-        Err(e) => eprintln!("wheezper: transcription failed: {e:#}"),
-    }
-}
+// --- live capture source ------------------------------------------------------
 
-/// Read exactly `buf.len()` bytes; Ok(false) means clean EOF before any byte.
-fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = reader.read(&mut buf[filled..])?;
-        if n == 0 {
-            // EOF; drop any partial trailing frame (< 30 ms)
-            return Ok(false);
+fn run_capture(cli: &Cli, mode: SourceMode, mut pipeline: Pipeline) -> Result<()> {
+    let host = capture::resolve_host(cli.host.as_deref())?;
+    let cap: Capture = capture::open(mode, cli.device.as_deref(), &host)?;
+    eprintln!(
+        "wheezper: source={} device=\"{}\" ({} Hz, {} ch) — Ctrl-C to stop",
+        match mode {
+            SourceMode::Mic => "mic",
+            SourceMode::Loopback => "loopback",
+        },
+        cap.device_name,
+        cap.sample_rate,
+        cap.channels
+    );
+
+    let running = capture::ctrl_c_flag()?;
+    let mut resampler = Resampler::new(cap.sample_rate, TARGET_RATE);
+    let mut out = Vec::new();
+
+    let result: Result<()> = loop {
+        match cap.receiver.pop_timeout(Duration::from_millis(250)) {
+            Pop::Data(chunk) => {
+                out.clear();
+                resampler.push_slice(&chunk, &mut out);
+                pipeline.push(&out);
+            }
+            Pop::Timeout => {}
+            Pop::Closed => break Ok(()),
         }
-        filled += n;
+        if !running.load(std::sync::atomic::Ordering::SeqCst) {
+            break Ok(());
+        }
+    };
+
+    let dropped = cap.receiver.dropped_chunks();
+    if dropped > 0 {
+        eprintln!("wheezper: warning: {dropped} audio chunks dropped (transcription fell behind)");
     }
-    Ok(true)
+    result?;
+    pipeline.finish();
+    eprintln!("wheezper: done.");
+    Ok(())
 }
