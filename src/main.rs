@@ -98,7 +98,7 @@ fn main() -> Result<()> {
             Ok(false) => break, // EOF
             Ok(true) => {
                 for (i, chunk) in byte_buf.chunks_exact(4).enumerate() {
-                    sample_buf[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    sample_buf[i] = f32::from_le_bytes(chunk.try_into().unwrap());
                 }
                 if let Some(segment) = segmenter.feed(&sample_buf) {
                     handle_segment(&mut transcriber, &mut notepad, &segment);
@@ -135,10 +135,8 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool> {
     while filled < buf.len() {
         let n = reader.read(&mut buf[filled..])?;
         if n == 0 {
-            if filled == 0 {
-                return Ok(false);
-            }
-            return Ok(false); // partial trailing frame: drop it (< 30 ms)
+            // EOF; drop any partial trailing frame (< 30 ms)
+            return Ok(false);
         }
         filled += n;
     }
