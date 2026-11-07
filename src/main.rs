@@ -97,8 +97,8 @@ fn main() -> Result<()> {
         match read_exact_or_eof(&mut reader, &mut byte_buf) {
             Ok(false) => break, // EOF
             Ok(true) => {
-                for (i, chunk) in byte_buf.chunks_exact(4).enumerate() {
-                    sample_buf[i] = f32::from_le_bytes(chunk.try_into().unwrap());
+                for (i, chunk) in byte_buf.as_chunks::<4>().0.iter().enumerate() {
+                    sample_buf[i] = f32::from_le_bytes(*chunk);
                 }
                 if let Some(segment) = segmenter.feed(&sample_buf) {
                     handle_segment(&mut transcriber, &mut notepad, &segment);

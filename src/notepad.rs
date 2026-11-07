@@ -15,11 +15,11 @@ pub struct Notepad {
 
 impl Notepad {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating notes dir {}", parent.display()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating notes dir {}", parent.display()))?;
         }
         let existed = path.exists();
         let file = OpenOptions::new()
