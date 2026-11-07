@@ -47,6 +47,7 @@ impl Transcriber {
 
     /// Transcribe one segment (16 kHz mono f32). Returns the joined text.
     /// Filters no-speech segments (whisper's main hallucination path).
+    /// Finals use beam search (better word choice); previews stay greedy.
     pub fn transcribe(&mut self, samples: &[f32], prompt: Option<&str>) -> Result<String> {
         transcribe_state(
             &mut self.state,
@@ -54,6 +55,19 @@ impl Transcriber {
             self.threads,
             samples,
             prompt,
+            true,
+        )
+    }
+
+    /// Cheap greedy variant for live-caption previews.
+    pub fn transcribe_greedy(&mut self, samples: &[f32], prompt: Option<&str>) -> Result<String> {
+        transcribe_state(
+            &mut self.state,
+            self.language.as_deref(),
+            self.threads,
+            samples,
+            prompt,
+            false,
         )
     }
 }
@@ -61,15 +75,22 @@ impl Transcriber {
 /// Core inference, usable from any state (main engine or caption workers).
 /// Note: whisper.cpp pads every call to 30 s internally, so each call costs
 /// roughly the same wall time regardless of sample count — callers should
-/// batch rather than ping.
+/// batch rather than ping. Encoding dominates that fixed cost, so beam-search
+/// decoding on finals is nearly free and measurably better at word choice.
 pub fn transcribe_state(
     state: &mut WhisperState,
     language: Option<&str>,
     threads: i32,
     samples: &[f32],
     prompt: Option<&str>,
+    beam: bool,
 ) -> Result<String> {
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
+    let strategy = if beam {
+        SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 }
+    } else {
+        SamplingStrategy::Greedy { best_of: 5 }
+    };
+    let mut params = FullParams::new(strategy);
     params.set_language(language);
     params.set_n_threads(threads);
     params.set_translate(false);
@@ -100,6 +121,10 @@ pub fn transcribe_state(
             .trim()
             .to_string();
         if text.is_empty() {
+            continue;
+        }
+        // whisper's silence placeholder — never a real utterance
+        if text == "[BLANK_AUDIO]" {
             continue;
         }
         if !out.is_empty() {

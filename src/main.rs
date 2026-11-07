@@ -6,7 +6,9 @@ mod models;
 mod notepad;
 mod segmenter;
 mod sink;
+mod stream;
 mod transcribe;
+mod vad;
 
 use anyhow::{Context, Result};
 use capture::{Capture, Pop, SourceMode, TARGET_RATE};
@@ -18,8 +20,9 @@ use notepad::Notepad;
 use segmenter::Segmenter;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use transcribe::Transcriber;
+use vad::Vad;
 
 /// wheezper — live audio transcription into a notepad.
 ///
@@ -32,7 +35,7 @@ use transcribe::Transcriber;
 ///   wheezper --source loopback                      # system audio (calls)
 ///   wheezper --source dual                          # mic = "me", loopback = "them"
 ///   ffmpeg -i call.wav -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
-#[derive(Parser)]
+#[derive(Clone, Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to a ggml whisper model (.bin), or a model name that is
@@ -58,6 +61,19 @@ struct Cli {
     #[arg(long)]
     device: Option<String>,
 
+    /// --source dual only: substring for the mic ("me") device
+    #[arg(long)]
+    device_me: Option<String>,
+
+    /// --source dual only: substring for the loopback ("them") device
+    #[arg(long)]
+    device_them: Option<String>,
+
+    /// Loopback/"them": capture EVERY sink monitor, not just the default
+    /// sink's — audio playing on any output device gets recorded
+    #[arg(long)]
+    all_monitors: bool,
+
     /// Audio host override, e.g. pulseaudio, wasapi, alsa
     #[arg(long)]
     host: Option<String>,
@@ -71,16 +87,29 @@ struct Cli {
     #[arg(long)]
     partial: bool,
 
+    /// Disable the Silero voice-activity gate (not recommended: without it
+    /// whisper hallucinates on call comfort-noise and quiet system audio)
+    #[arg(long)]
+    no_vad: bool,
+
+    /// Disable incremental streaming for live capture and fall back to
+    /// segment-then-transcribe (wait for silence, one final per segment)
+    #[arg(long)]
+    no_stream: bool,
+
     /// Post-process the transcript with a local LLM:
     /// uses an Ollama server if one is running at the URL (default
     /// http://localhost:11434) — otherwise falls back to llama.cpp compiled
     /// INTO wheezper (no Ollama install needed; the LLM model auto-downloads
     /// on first use). A session summary is appended to the notepad on stop.
+    /// Ollama Cloud (premium models): --ollama https://ollama.com/api with
+    /// OLLAMA_API_KEY set in the environment, e.g. --ollama-model gemma4:31b
     #[arg(long, num_args = 0..=1, default_missing_value = "http://localhost:11434")]
     ollama: Option<String>,
 
     /// LLM model for summary/polish. Server: anything it hosts.
     /// Built-in: gemma3-1b [default, Google's, ~800 MB GGUF] or a .gguf path
+    /// Cloud: names from https://ollama.com/api/tags (e.g. gemma4:31b)
     #[arg(long, default_value = "gemma3:1b")]
     ollama_model: String,
 
@@ -106,19 +135,21 @@ struct Cli {
     #[arg(long, default_value_t = -40.0)]
     threshold_db: f32,
 
-    /// Seconds of silence that close a segment
-    #[arg(long, default_value_t = 0.6)]
+    /// Seconds of silence that close a segment. Lower = final text appears
+    /// sooner after you stop talking
+    #[arg(long, default_value_t = 0.25)]
     min_silence: f32,
 
     /// Minimum segment length in seconds
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.2)]
     min_segment: f32,
 
-    /// Maximum segment length in seconds (whisper natively handles 30 s)
-    #[arg(long, default_value_t = 25.0)]
+    /// Maximum segment length in seconds (whisper natively handles 30 s).
+    /// Shorter = final text appears sooner during continuous speech (calls)
+    #[arg(long, default_value_t = 10.0)]
     max_segment: f32,
 
-    /// CPU threads for whisper (0 = all)
+    /// CPU threads for whisper (0 = auto, capped at 4)
     #[arg(long, default_value_t = 0)]
     threads: i32,
 }
@@ -161,7 +192,13 @@ fn main() -> Result<()> {
     });
 
     let threads = if cli.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4)
+        // whisper.cpp pads every call to a 30 s window, so more threads only
+        // shorten bursts — and we run two inference pools (finals + captions).
+        // Capping keeps CPU sane on big machines.
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4)
+            .min(4)
     } else {
         cli.threads
     };
@@ -170,7 +207,17 @@ fn main() -> Result<()> {
         .with_context(|| format!("resolving model '{}'", cli.model))?;
     eprintln!("wheezper: model={}", model_path.display());
 
-    let engine = Engine::new(&cli, &notes_path, &model_path, threads)?;
+    let engine = {
+        // streaming mode prints live committed words itself; skip the
+        // caption-worker thread (and its duplicate whisper model)
+        let mut ecli = cli.clone();
+        if !cli.no_stream
+            && matches!(source, SourceArg::Mic | SourceArg::Loopback | SourceArg::Dual)
+        {
+            ecli.partial = false;
+        }
+        Engine::new(&ecli, &notes_path, &model_path, threads)?
+    };
     eprintln!("wheezper: lang={}", cli.language);
 
     let mut engine = match source {
@@ -197,6 +244,13 @@ struct PartialMsg {
 
 struct Engine {
     transcriber: Transcriber,
+    /// Neural VAD gate: blocks noise/music (hallucination bait) from
+    /// reaching whisper. None = disabled or failed to load (fail open).
+    vad: Option<Vad>,
+    /// Last written line per channel label: (text, consecutive repeats).
+    /// 3+ identical lines in a row are suppressed (hallucination loops);
+    /// a genuine repeat is kept.
+    last: std::collections::HashMap<String, (String, u32)>,
     notepad: Notepad,
     webhook: Option<sink::Webhook>,
     partial: bool,
@@ -240,17 +294,36 @@ impl Engine {
             None
         };
 
+        let vad = if cli.no_vad {
+            None
+        } else {
+            match Vad::new(2) {
+                Ok(v) => {
+                    eprintln!("wheezper: vad=silero (noise gate on)");
+                    Some(v)
+                }
+                Err(e) => {
+                    eprintln!("wheezper: warning: VAD unavailable, transcripts may hallucinate: {e:#}");
+                    None
+                }
+            }
+        };
+
         let partial_tx = if cli.partial {
             let (tx, rx) = std::sync::mpsc::sync_channel::<PartialMsg>(1);
             let model = model.to_path_buf();
             let lang = cli.language.clone();
+            let use_vad = !cli.no_vad;
             std::thread::Builder::new()
                 .name("caption-worker".into())
                 .spawn(move || {
                     // its own model instance: whisper.cpp states sharing one
                     // context are NOT safely concurrent (empirically corrupt
-                    // each other); the extra weights cost ~30-60 MB
-                    let mut worker = match Transcriber::new(&model, &lang, threads) {
+                    // each other); the extra weights cost ~30-60 MB.
+                    // Half the threads: previews must never starve the main
+                    // (final-transcript) inference pool.
+                    let caption_threads = (threads / 2).max(1);
+                    let mut worker = match Transcriber::new(&model, &lang, caption_threads) {
                         Ok(w) => w,
                         Err(e) => {
                             eprintln!("wheezper: caption worker failed to start: {e:#}");
@@ -258,8 +331,16 @@ impl Engine {
                         }
                     };
                     let mut last_text = String::new();
+                    // its own VAD instance: previews of noise are dropped
+                    // before spending a full 30 s-window inference
+                    let mut vader = if use_vad { Vad::new(1).ok() } else { None };
                     while let Ok(msg) = rx.recv() {
-                        let Ok(text) = worker.transcribe(&msg.samples, msg.prompt.as_deref())
+                        if let Some(v) = &mut vader
+                            && !v.has_speech(&msg.samples, 0.05)
+                        {
+                            continue;
+                        }
+                        let Ok(text) = worker.transcribe_greedy(&msg.samples, msg.prompt.as_deref())
                         else { continue };
                         let text = text.trim().to_string();
                         if text.is_empty() || text == last_text {
@@ -281,7 +362,7 @@ impl Engine {
             None
         };
 
-        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx, llm, polish: cli.polish && cli.ollama.is_some() })
+        Ok(Self { transcriber, vad, last: Default::default(), notepad, webhook, partial: cli.partial, partial_tx, llm, polish: cli.polish && cli.ollama.is_some() })
     }
 
     /// Queue a live-caption preview (never blocks; drops when busy).
@@ -302,6 +383,13 @@ impl Engine {
     /// Transcribe one segment and write it to every sink.
     /// `tail` carries per-channel prompt continuity between calls.
     fn handle(&mut self, samples: &[f32], label: Option<&str>, tail: &mut Option<String>) {
+        // neural VAD gate: call comfort-noise / loopback dither that passed
+        // the RMS gate is dropped here, before it can hallucinate a line
+        if let Some(v) = &mut self.vad
+            && !v.has_speech(samples, 0.1)
+        {
+            return;
+        }
         let prompt = tail.clone();
         match self.transcriber.transcribe(samples, prompt.as_deref()) {
             Ok(raw) => {
@@ -310,9 +398,25 @@ impl Engine {
                     (Some(o), true) => o.polish(&raw).unwrap_or(raw),
                     _ => raw,
                 };
+                // consecutive-duplicate suppression: whisper's classic
+                // failure mode is looping the same hallucinated line. Real
+                // speech does repeat ("I love you" twice!), so keep the first
+                // two occurrences and only choke off from the third onward.
+                let key = label.unwrap_or("");
+                if !text.is_empty() {
+                    let entry = self.last.entry(key.to_string()).or_default();
+                    if entry.0 == text {
+                        entry.1 += 1;
+                        if entry.1 >= 2 {
+                            return; // 3rd+ identical line in a row: hallucination
+                        }
+                    } else {
+                        *entry = (text.clone(), 0);
+                    }
+                }
                 match self.notepad.append(label, &text) {
                     Ok(true) => {
-                        *tail = Some(last_words(&text, 8));
+                        *tail = Some(last_words(&text, 12));
                         self.clear_partial();
                         let ts = Local::now().format("%H:%M:%S");
                         match label {
@@ -363,6 +467,16 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
     {
         cli.device = Some(v.to_string());
     }
+    if !given("device_me")
+        && let Some(v) = get("device_me").and_then(|v| v.as_str())
+    {
+        cli.device_me = Some(v.to_string());
+    }
+    if !given("device_them")
+        && let Some(v) = get("device_them").and_then(|v| v.as_str())
+    {
+        cli.device_them = Some(v.to_string());
+    }
     if !given("host")
         && let Some(v) = get("host").and_then(|v| v.as_str())
     {
@@ -410,6 +524,16 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
     {
         cli.partial = v;
     }
+    if !given("all_monitors")
+        && let Some(v) = get("all_monitors").and_then(|v| v.as_bool())
+    {
+        cli.all_monitors = v;
+    }
+    if !given("no_vad")
+        && let Some(v) = get("no_vad").and_then(|v| v.as_bool())
+    {
+        cli.no_vad = v;
+    }
 }
 
 /// Last `n` words of `s`, for whisper's initial prompt.
@@ -438,9 +562,14 @@ struct Channel {
     last_partial: std::time::Instant,
 }
 
-const PARTIAL_INTERVAL: Duration = Duration::from_millis(3000);
-const PARTIAL_MIN: usize = TARGET_RATE as usize * 2; // need 2 s before previewing
-const PARTIAL_WINDOW: usize = TARGET_RATE as usize * 6; // preview last 6 s
+// Live-caption cadence. whisper.cpp pads every inference to a 30 s window,
+// so each preview costs a full-window pass. The 0.8 s floor is below the
+// inference time itself: the sync_channel(1) + try_send pair drops previews
+// while the worker is busy, so captions effectively self-pace back-to-back —
+// a fresh line lands as soon as the previous inference finishes.
+const PARTIAL_INTERVAL: Duration = Duration::from_millis(800);
+const PARTIAL_MIN: usize = TARGET_RATE as usize / 2; // preview after 0.5 s of speech
+const PARTIAL_WINDOW: usize = TARGET_RATE as usize * 4; // preview last 4 s
 
 impl Channel {
     /// `in_rate`: sample rate of the incoming mono chunks.
@@ -548,35 +677,57 @@ fn run_stdin(cli: &Cli, engine: Engine) -> Result<Engine> {
 
 fn run_capture(cli: &Cli, mode: SourceMode, label: Option<&'static str>, engine: Engine) -> Result<Engine> {
     let host = capture::resolve_host(cli.host.as_deref())?;
-    let cap: Capture = capture::open(mode, cli.device.as_deref(), &host)?;
-    eprintln!(
-        "wheezper: source={} device=\"{}\" ({} Hz, {} ch) — Ctrl-C to stop",
-        match mode {
-            SourceMode::Mic => "mic",
-            SourceMode::Loopback => "loopback",
-        },
-        cap.device_name,
-        cap.sample_rate,
-        cap.channels
-    );
+    let caps: Vec<Capture> = if mode == SourceMode::Loopback && cli.all_monitors {
+        capture::open_all_monitors(&host)?
+    } else {
+        vec![capture::open(mode, cli.device.as_deref(), &host)?]
+    };
+    for cap in &caps {
+        eprintln!(
+            "wheezper: source={} device=\"{}\" ({} Hz, {} ch){} — Ctrl-C to stop",
+            match mode {
+                SourceMode::Mic => "mic",
+                SourceMode::Loopback => "loopback",
+            },
+            cap.device_name,
+            cap.sample_rate,
+            cap.channels,
+            if caps.len() > 1 { " [+monitor]" } else { "" },
+        );
+    }
+    if !cli.no_stream {
+        let chans = caps.into_iter().map(|c| (c, label)).collect();
+        return run_stream(cli, chans, engine);
+    }
 
-    let (mut engine, mut channel) = (engine, Channel::new(label, cap.sample_rate, cli));
+    let (mut engine, mut channels): (_, Vec<Channel>) =
+        (engine, caps.iter().map(|c| Channel::new(label, c.sample_rate, cli)).collect());
     let running = capture::ctrl_c_flag()?;
+    // 25 ms per empty channel: condvar pops return immediately when data is
+    // queued, so this only bounds how long a silent channel can hold the
+    // loop — every channel gets its chunks within ~25 ms of arrival.
+    let step = Duration::from_millis(25);
 
     let result: Result<()> = loop {
-        match cap.receiver.pop_timeout(Duration::from_millis(250)) {
-            Pop::Data(chunk) => channel.push(&chunk, &mut engine),
-            Pop::Timeout => {}
-            Pop::Closed => break Ok(()),
+        for (cap, channel) in caps.iter().zip(channels.iter_mut()) {
+            match cap.receiver.pop_timeout(step) {
+                Pop::Data(chunk) => channel.push(&chunk, &mut engine),
+                Pop::Timeout => {}
+                Pop::Closed => break,
+            }
         }
         if !running.load(std::sync::atomic::Ordering::SeqCst) {
             break Ok(());
         }
     };
 
-    warn_dropped(&cap.receiver);
+    for cap in &caps {
+        warn_dropped(&cap.receiver);
+    }
     result?;
-    channel.finish(&mut engine);
+    for channel in channels.iter_mut() {
+        channel.finish(&mut engine);
+    }
     eprintln!("wheezper: done.");
     Ok(engine)
 }
@@ -587,18 +738,30 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
     let host = capture::resolve_host(cli.host.as_deref())?;
     // open loopback first: the far side of the call is the thing you least
     // want to miss while streams negotiate
-    let them: Capture = capture::open(SourceMode::Loopback, None, &host)?;
-    let mic: Capture = capture::open(SourceMode::Mic, None, &host)?;
+    let them_caps: Vec<Capture> = if cli.all_monitors && cli.device_them.is_none() {
+        capture::open_all_monitors(&host)?
+    } else {
+        vec![capture::open(SourceMode::Loopback, cli.device_them.as_deref(), &host)?]
+    };
+    let mic: Capture = capture::open(SourceMode::Mic, cli.device_me.as_deref(), &host)?;
     eprintln!(
-        "wheezper: source=dual  me=\"{}\" ({}, {} ch) them=\"{}\" ({}, {} ch) — Ctrl-C to stop",
+        "wheezper: source=dual  me=\"{}\" ({}, {} ch) them=\"{}\"{} — Ctrl-C to stop",
         mic.device_name, mic.sample_rate, mic.channels,
-        them.device_name, them.sample_rate, them.channels
+        them_caps.iter().map(|c| c.device_name.as_str()).collect::<Vec<_>>().join("\", \""),
+        if them_caps.len() > 1 { format!(" ({} monitors)", them_caps.len()) } else { String::new() },
     );
+    if !cli.no_stream {
+        let mut chans: Vec<(Capture, Option<&'static str>)> =
+            them_caps.into_iter().map(|c| (c, Some("them"))).collect();
+        chans.push((mic, Some("me")));
+        return run_stream(cli, chans, engine);
+    }
 
     let (mut engine, mut me) = (engine, Channel::new(Some("me"), mic.sample_rate, cli));
-    let mut others = Channel::new(Some("them"), them.sample_rate, cli);
+    let mut others: Vec<Channel> =
+        them_caps.iter().map(|c| Channel::new(Some("them"), c.sample_rate, cli)).collect();
     let running = capture::ctrl_c_flag()?;
-    let step = Duration::from_millis(125);
+    let step = Duration::from_millis(25); // see run_capture
 
     let result: Result<()> = loop {
         match mic.receiver.pop_timeout(step) {
@@ -606,10 +769,12 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
             Pop::Timeout => {}
             Pop::Closed => break Ok(()),
         }
-        match them.receiver.pop_timeout(step) {
-            Pop::Data(chunk) => others.push(&chunk, &mut engine),
-            Pop::Timeout => {}
-            Pop::Closed => break Ok(()),
+        for (cap, channel) in them_caps.iter().zip(others.iter_mut()) {
+            match cap.receiver.pop_timeout(step) {
+                Pop::Data(chunk) => channel.push(&chunk, &mut engine),
+                Pop::Timeout => {}
+                Pop::Closed => break,
+            }
         }
         if !running.load(std::sync::atomic::Ordering::SeqCst) {
             break Ok(());
@@ -617,12 +782,146 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
     };
 
     warn_dropped(&mic.receiver);
-    warn_dropped(&them.receiver);
+    for cap in &them_caps {
+        warn_dropped(&cap.receiver);
+    }
     result?;
     me.finish(&mut engine);
-    others.finish(&mut engine);
+    for channel in others.iter_mut() {
+        channel.finish(&mut engine);
+    }
     eprintln!("wheezper: done.");
     Ok(engine)
+}
+
+// --- incremental streaming: words committed once, as soon as stable -------
+
+/// Unified live loop: sliding-window inference, two-pass word commit,
+/// append-only output. One shared worker thread does all inference.
+fn run_stream(
+    cli: &Cli,
+    chans: Vec<(Capture, Option<&'static str>)>,
+    mut engine: Engine,
+) -> Result<Engine> {
+    let threads = if cli.threads == 0 {
+        std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4).min(4)
+    } else {
+        cli.threads
+    };
+    let model_path = models::resolve(Some(&cli.model))
+        .with_context(|| format!("resolving model '{}'", cli.model))?;
+    let (tx, rx) = stream::spawn_worker(&model_path, &cli.language, threads, !cli.no_vad)?;
+    eprintln!("wheezper: stream: sliding-window incremental transcription (words committed once)");
+
+    let mut caps: Vec<Capture> = Vec::with_capacity(chans.len());
+    let mut streams: Vec<stream::StreamChannel> = Vec::with_capacity(chans.len());
+    for (cap, label) in chans {
+        streams.push(stream::StreamChannel::new(label, cap.sample_rate));
+        caps.push(cap);
+    }
+    let running = capture::ctrl_c_flag()?;
+    let step = Duration::from_millis(25);
+
+    let print_open = |sc: &stream::StreamChannel, first: bool| {
+        if first {
+            let ts = Local::now().format("%H:%M:%S");
+            match sc.label {
+                Some(ch) => print!("\n[{ts}] {ch}: "),
+                None => print!("\n[{ts}] "),
+            }
+        }
+    };
+
+    'live: loop {
+        let mut all_closed = true;
+        for (_i, (cap, sc)) in caps.iter().zip(streams.iter_mut()).enumerate() {
+            match cap.receiver.pop_timeout(step) {
+                Pop::Data(chunk) => sc.push(&chunk),
+                Pop::Timeout => {}
+                Pop::Closed => sc.mark_closed(),
+            }
+            all_closed &= sc.closed();
+        }
+        if all_closed {
+            break;
+        }
+
+        // collect worker hypotheses
+        while let Ok(res) = rx.try_recv() {
+            if let Some(sc) = streams.get_mut(res.chan) {
+                let was_open = sc.line_open();
+                let delta = sc.on_result(&res.text);
+                if !delta.is_empty() {
+                    print_open(sc, !was_open);
+                    print!("{delta} ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+        }
+
+        // dispatch new windows; flush completed lines
+        for (i, sc) in streams.iter_mut().enumerate() {
+            let prompt = sc.prompt_tail();
+            sc.maybe_send(i, &tx, &prompt);
+            if sc.line_ready()
+                && let Some(line) = sc.take_line()
+            {
+                commit_line(&mut engine, sc.label, &line);
+            }
+        }
+
+        if !running.load(std::sync::atomic::Ordering::SeqCst) {
+            break 'live;
+        }
+    }
+
+    // shutdown: drain in-flight windows, commit remaining hypotheses
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(res) => {
+                if let Some(sc) = streams.get_mut(res.chan) {
+                    let was_open = sc.line_open();
+                    let delta = sc.on_result(&res.text);
+                    if !delta.is_empty() {
+                        print_open(sc, !was_open);
+                        print!("{delta} ");
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    for sc in streams.iter_mut() {
+        let was_open = sc.line_open();
+        let delta = sc.finish();
+        if !delta.is_empty() {
+            print_open(sc, !was_open);
+            print!("{delta} ");
+        }
+        if sc.line_open()
+            && let Some(line) = sc.take_line()
+        {
+            commit_line(&mut engine, sc.label, &line);
+        }
+    }
+    for cap in &caps {
+        warn_dropped(&cap.receiver);
+    }
+    eprintln!("\nwheezper: done.");
+    Ok(engine)
+}
+
+/// Write one completed streaming line to the notepad + webhook and close
+/// the terminal line.
+fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str) {
+    println!();
+    if let Err(e) = engine.notepad.append(label, line) {
+        eprintln!("wheezper: notepad write failed: {e:#}");
+    }
+    if let Some(hook) = &engine.webhook {
+        hook.post(label.unwrap_or(""), line);
+    }
 }
 
 fn warn_dropped(rx: &capture::AudioReceiver) {

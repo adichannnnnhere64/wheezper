@@ -5,3 +5,5 @@
 /test/*.wav
 /result
 target-xwin/
+target-linux-portable/
+wheezper-linux-amd64.tar.gz

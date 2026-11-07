@@ -102,7 +102,12 @@ pub struct Capture {
 /// Build and start an input stream on `device`, delivering mono chunks.
 pub fn open(mode: SourceMode, device_substr: Option<&str>, host: &Host) -> Result<Capture> {
     let device = pick_device(host, mode, device_substr)?;
-    let device_name = dev_name(&device);
+    open_on(&device)
+}
+
+/// Build and start an input stream on an already-chosen `device`.
+fn open_on(device: &Device) -> Result<Capture> {
+    let device_name = dev_name(device);
 
     let mut ranges = device
         .supported_input_configs()
@@ -129,6 +134,26 @@ pub fn open(mode: SourceMode, device_substr: Option<&str>, host: &Host) -> Resul
     stream.play().context("starting input stream")?;
 
     Ok(Capture { stream, receiver, sample_rate: rate, channels, device_name })
+}
+
+/// Open an input stream on EVERY loopback monitor source in the system.
+///
+/// Silent sinks deliver silence (their monitors still run), so nothing
+/// spurious is transcribed — but no output device can escape capture,
+/// whichever sink an application happens to play to.
+pub fn open_all_monitors(host: &Host) -> Result<Vec<Capture>> {
+    let mut monitors = Vec::new();
+    for d in host.devices().context("listing devices")? {
+        if dev_id(&d).to_ascii_lowercase().ends_with(".monitor")
+            && d.supported_input_configs().is_ok()
+        {
+            monitors.push(d);
+        }
+    }
+    if monitors.is_empty() {
+        bail!("no loopback monitor sources found (PulseAudio/PipeWire server has no sinks?)");
+    }
+    monitors.iter().map(open_on).collect()
 }
 
 fn pick_device(host: &Host, mode: SourceMode, substr: Option<&str>) -> Result<Device> {

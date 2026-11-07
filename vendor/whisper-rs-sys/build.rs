@@ -190,6 +190,29 @@ fn main() {
         .very_verbose(true)
         .pic(true);
 
+    // Portable build: ggml defaults to GGML_NATIVE=ON, which adds
+    // -march=native/-mtune=native and bakes in the *build machine's* CPU
+    // features — that SIGILLs ("illegal hardware instruction") on CPUs that
+    // lack them. Force OFF so the binary runs on any x86-64; callers can still
+    // set GGML_NATIVE=ON to opt back into a native build.
+    if env::var("GGML_NATIVE").is_err() {
+        config.define("GGML_NATIVE", "OFF");
+    }
+    // With GGML_NATIVE=OFF, ggml compiles its SIMD kernels as runtime-
+    // dispatched code. Explicitly enable the portable x86-64 set (SSE4.2 up
+    // through AVX2/FMA/F16C/BMI2) so it's fast on modern CPUs yet still falls
+    // back to scalar on old ones. AVX-512 stays OFF for portability. Mirrors
+    // llama-cpp-sys-2, and avoids ggml's cmake `option()` stale-cache trap
+    // (these get stuck OFF if a native build populated the cache first).
+    if target.contains("x86_64") || target.contains("i686") {
+        config.define("GGML_SSE42", "ON");
+        config.define("GGML_AVX", "ON");
+        config.define("GGML_AVX2", "ON");
+        config.define("GGML_FMA", "ON");
+        config.define("GGML_F16C", "ON");
+        config.define("GGML_BMI2", "ON");
+    }
+
     if target.contains("windows") {
         config.cxxflag("/utf-8");
         println!("cargo:rustc-link-lib=advapi32");

@@ -72,6 +72,9 @@ impl Llm {
 pub struct Ollama {
     pub url: String,
     pub model: String,
+    /// Set when OLLAMA_API_KEY is present: cloud inference (ollama.com)
+    /// requires "Authorization: Bearer <key>" on every request.
+    api_key: Option<String>,
     agent: ureq::Agent,
 }
 
@@ -80,18 +83,31 @@ impl Ollama {
         let config = ureq::config::Config::builder()
             .timeout_global(Some(Duration::from_secs(300)))
             .build();
+        // accept both a plain base ("http://localhost:11434", used for
+        // /api/chat etc.) and the cloud form ending in "/api"
+        let mut url = url.trim_end_matches('/').to_string();
+        if url.ends_with("/api") {
+            url.truncate(url.len() - "/api".len());
+        }
         Self {
-            url: url.trim_end_matches('/').to_string(),
+            url,
             model: model.to_string(),
+            api_key: std::env::var("OLLAMA_API_KEY").ok().filter(|k| !k.is_empty()),
             agent: ureq::Agent::new_with_config(config),
+        }
+    }
+
+    fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        match &self.api_key {
+            Some(key) => req.header("Authorization", &format!("Bearer {key}")),
+            None => req,
         }
     }
 
     /// Is the server reachable and the model available?
     pub fn check(&self) -> Result<()> {
         let resp = self
-            .agent
-            .get(format!("{}/api/tags", self.url))
+            .auth(self.agent.get(format!("{}/api/tags", self.url)))
             .call()
             .map_err(|e| anyhow!("Ollama server unreachable at {}: {e}", self.url))?;
         let mut body = String::new();
@@ -128,9 +144,11 @@ impl Ollama {
             max_tokens,
         );
         let resp = self
-            .agent
-            .post(format!("{}/api/chat", self.url))
-            .header("Content-Type", "application/json")
+            .auth(
+                self.agent
+                    .post(format!("{}/api/chat", self.url))
+                    .header("Content-Type", "application/json"),
+            )
             .send(body.as_str())
             .map_err(|e| anyhow!("Ollama generate failed: {e}"))?;
         if !resp.status().is_success() {

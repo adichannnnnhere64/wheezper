@@ -19,7 +19,12 @@ jobs:
       - run: cargo test --release --workspace
 
   build-linux:
-    runs-on: ubuntu-latest
+    # Pin to 22.04 (glibc 2.35) so the artifact's glibc baseline stays low and
+    # predictable. "ubuntu-latest" drifts to newer glibc over time and would
+    # silently raise the minimum distro version the binary runs on.
+    runs-on: ubuntu-22.04
+    env:
+      GGML_NATIVE: "OFF"   # whisper.cpp/ggml must not use -march=native (portability)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,6 +35,22 @@ jobs:
       - run: cargo build --release
         env:
           WHEEZPER_LLM_WORKER: ${{ github.workspace }}/target/release/wheezper-llm
+      - name: Verify portability (standard interpreter, old glibc baseline)
+        run: |
+          set -euo pipefail
+          BIN=target/release/wheezper
+          # must use the standard loader path, not a builder-specific one
+          readelf -l "$BIN" | grep -q 'interpreter: /lib64/ld-linux-x86-64.so.2' \
+            || { echo "unexpected ELF interpreter:"; readelf -l "$BIN" | grep -i interpreter; exit 1; }
+          if readelf -d "$BIN" | grep -q '/nix/store'; then
+            echo "ERROR: nix-store path leaked into the binary"; exit 1
+          fi
+          MAX_GLIBC=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 | sed 's/GLIBC_//')
+          echo "max required glibc: ${MAX_GLIBC:-none}"
+          if [ -n "$MAX_GLIBC" ] && [ "$(printf '2.35\n%s\n' "$MAX_GLIBC" | sort -V | tail -1)" != "2.35" ]; then
+            echo "ERROR: glibc baseline $MAX_GLIBC exceeds the 2.35 target"; exit 1
+          fi
+          echo "runtime deps (DT_NEEDED):"; readelf -d "$BIN" | grep NEEDED
       - name: Package
         run: tar czf wheezper-linux-amd64.tar.gz -C target/release wheezper
       - uses: actions/upload-artifact@v4
@@ -43,6 +64,7 @@ jobs:
       RUSTFLAGS: "-C target-feature=+crt-static"
       LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
       LLAMA_STATIC_CRT: "1"   # llama.cpp /MT — match the static CRT link
+      GGML_NATIVE: "OFF"      # whisper.cpp/ggml must not use -march=native (portability)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

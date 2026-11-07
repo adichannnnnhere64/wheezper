@@ -26,6 +26,20 @@ pub const MODELS: &[ModelSpec] = &[
 
 const HF_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
+/// The Silero VAD model used to gate segments before whisper (see vad.rs).
+const VAD_MODEL_URL: &str =
+    "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+const VAD_MODEL_FILE: &str = "ggml-silero-v5.1.2.bin";
+
+/// Resolve the Silero VAD model (~0.9 MB, one-time download).
+pub fn resolve_vad() -> Result<PathBuf> {
+    let dest = cache_dir()?.join(VAD_MODEL_FILE);
+    if !dest.exists() {
+        download_to(VAD_MODEL_URL, &dest, 1)?;
+    }
+    Ok(dest)
+}
+
 /// Built-in LLM models (GGUF, run via hardwired llama.cpp — no Ollama needed).
 pub struct LlmModelSpec {
     pub name: &'static str,
