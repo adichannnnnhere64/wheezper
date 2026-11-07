@@ -11,6 +11,13 @@ language = "en"        # or "auto" to detect per segment
 # webhook = "http://192.168.1.20:8399/hook"
 # device = "hdmi"           # substring match, see --list-devices
 # host = "pulseaudio"       # pulseaudio | wasapi | alsa | ...
+
+# local LLM post-processing via an Ollama server (https://ollama.com):
+# a session summary is appended to the notepad when you stop
+ollama = true             # or "http://ollama-server:11434"
+ollama-model = "gemma3:1b"  # any model the server hosts (gemma3 = Google's)
+# polish = true              # LLM-clean each utterance before writing (latency!)
+
 # partial = true            # rolling live captions (stdout only)
 # rate = 16000              # stdin only
 # threshold-db = -40        # silence gate

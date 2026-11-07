@@ -122,6 +122,38 @@ webhook = "http://192.168.1.20:8399/hook"
 notes = "notes/work.md"
 ```
 
+## Ollama: summary + polish (local LLM, no data leaves your machine)
+
+If you run [Ollama](https://ollama.com), wheezper can post-process the
+transcript with any model it hosts — Google's Gemma by default:
+
+```bash
+ollama pull gemma3:1b   # Google's smallest, ~800 MB — good summaries
+
+wheezper --ollama                       # summary appended to notepad on stop
+wheezper --ollama --polish              # also clean each utterance (latency!)
+wheezper --ollama --ollama-model llama3.2   # any hosted model works
+wheezper --ollama http://server:11434        # remote Ollama server
+```
+
+On stop (Ctrl-C), the whole session transcript is sent to the model and a
+summary block (`one-paragraph, Key points, Action items`) is appended:
+
+```markdown
+## Summary — 2026-11-07 21:58
+
+The meeting focused on the Q3 migration timeline... The speakers agreed on ... 
+## Key points:
+*   ...
+## Action items:
+*   ...
+```
+
+`--polish` additionally cleans each utterance (punctuation, filler words)
+before writing — adds a per-line LLM round-trip, so use it when latency
+doesn't matter. If the Ollama server is down or the model missing, wheezper
+warns and keeps the raw transcript untouched.
+
 ## Termux
 
 CPAL has no Android host, so use the stdin path:

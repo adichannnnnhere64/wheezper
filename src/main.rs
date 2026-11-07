@@ -1,6 +1,7 @@
 mod capture;
 mod config;
 mod dsp;
+mod llm;
 mod models;
 mod notepad;
 mod segmenter;
@@ -69,6 +70,22 @@ struct Cli {
     /// extra CPU — best paired with --model tiny on weaker machines)
     #[arg(long)]
     partial: bool,
+
+    /// Use a local Ollama server (https://ollama.com) to post-process the
+    /// transcript: a session summary is appended to the notepad on stop.
+    /// Optionally pass a server URL [default: http://localhost:11434]
+    #[arg(long, num_args = 0..=1, default_missing_value = "http://localhost:11434")]
+    ollama: Option<String>,
+
+    /// Ollama model for summary/polish — anything the server hosts
+    /// [default: gemma3:1b, Google's smallest]
+    #[arg(long, default_value = "gemma3:1b")]
+    ollama_model: String,
+
+    /// Clean up each utterance with the Ollama model before writing it
+    /// (needs --ollama; adds latency per line)
+    #[arg(long)]
+    polish: bool,
 
     /// Config file (TOML). Without this flag, ./wheezper.toml then
     /// ~/.config/wheezper/config.toml (or %APPDATA%\wheezper) are used if present.
@@ -154,15 +171,17 @@ fn main() -> Result<()> {
     let engine = Engine::new(&cli, &notes_path, &model_path, threads)?;
     eprintln!("wheezper: lang={}", cli.language);
 
-    match source {
-        SourceArg::Stdin => run_stdin(&cli, engine),
+    let mut engine = match source {
+        SourceArg::Stdin => run_stdin(&cli, engine)?,
         SourceArg::Mic | SourceArg::Loopback => {
             let mode = if source == SourceArg::Loopback { SourceMode::Loopback } else { SourceMode::Mic };
             let label = (source == SourceArg::Loopback).then_some("them");
-            run_capture(&cli, mode, label, engine)
+            run_capture(&cli, mode, label, engine)?
         }
-        SourceArg::Dual => run_dual(&cli, engine),
-    }
+        SourceArg::Dual => run_dual(&cli, engine)?,
+    };
+    summarize_session(&mut engine)?;
+    Ok(())
 }
 
 // --- engine: transcription + sinks (shared across all channels) -----------
@@ -184,6 +203,9 @@ struct Engine {
     /// every call to 30 s, so each one costs ~3-5 s; previews must never
     /// block finals or audio).
     partial_tx: Option<std::sync::mpsc::SyncSender<PartialMsg>>,
+    /// Local LLM post-processing (Ollama): summary on stop, optional polish.
+    ollama: Option<llm::Ollama>,
+    polish: bool,
 }
 
 impl Engine {
@@ -192,6 +214,16 @@ impl Engine {
         let transcriber = Transcriber::new(model, &cli.language, threads)?;
         eprintln!("wheezper: notes -> {}", notepad.path().display());
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
+
+        let ollama = cli.ollama.as_deref().map(|url| {
+            let o = llm::Ollama::new(url, &cli.ollama_model);
+            if let Err(e) = o.check() {
+                eprintln!("wheezper: warning: {e:#}");
+            } else {
+                eprintln!("wheezper: ollama ok — model {} @ {}", o.model, o.url);
+            }
+            o
+        });
 
         let partial_tx = if cli.partial {
             let (tx, rx) = std::sync::mpsc::sync_channel::<PartialMsg>(1);
@@ -234,7 +266,7 @@ impl Engine {
             None
         };
 
-        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx })
+        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx, ollama, polish: cli.polish && cli.ollama.is_some() })
     }
 
     /// Queue a live-caption preview (never blocks; drops when busy).
@@ -257,22 +289,29 @@ impl Engine {
     fn handle(&mut self, samples: &[f32], label: Option<&str>, tail: &mut Option<String>) {
         let prompt = tail.clone();
         match self.transcriber.transcribe(samples, prompt.as_deref()) {
-            Ok(text) => match self.notepad.append(label, &text) {
-                Ok(true) => {
-                    *tail = Some(last_words(&text, 8));
-                    self.clear_partial();
-                    let ts = Local::now().format("%H:%M:%S");
-                    match label {
-                        Some(ch) => println!("[{ts}] {ch}: {text}"),
-                        None => println!("[{ts}] {text}"),
+            Ok(raw) => {
+                // optional LLM cleanup per utterance (keeps raw text on failure)
+                let text = match (&self.ollama, self.polish) {
+                    (Some(o), true) => o.polish(&raw).unwrap_or(raw),
+                    _ => raw,
+                };
+                match self.notepad.append(label, &text) {
+                    Ok(true) => {
+                        *tail = Some(last_words(&text, 8));
+                        self.clear_partial();
+                        let ts = Local::now().format("%H:%M:%S");
+                        match label {
+                            Some(ch) => println!("[{ts}] {ch}: {text}"),
+                            None => println!("[{ts}] {text}"),
+                        }
+                        if let Some(hook) = &self.webhook {
+                            hook.post(label.unwrap_or(""), &text);
+                        }
                     }
-                    if let Some(hook) = &self.webhook {
-                        hook.post(label.unwrap_or(""), &text);
-                    }
+                    Ok(false) => {} // dropped: empty text
+                    Err(e) => eprintln!("wheezper: notepad write failed: {e:#}"),
                 }
-                Ok(false) => {} // dropped: empty text
-                Err(e) => eprintln!("wheezper: notepad write failed: {e:#}"),
-            },
+            }
             Err(e) => eprintln!("wheezper: transcription failed: {e:#}"),
         }
     }
@@ -440,9 +479,33 @@ impl Channel {
     }
 }
 
+/// Append an LLM (Ollama) summary of the whole session to the notepad.
+fn summarize_session(engine: &mut Engine) -> Result<()> {
+    let Some(ollama) = &engine.ollama else { return Ok(()) };
+    let transcript = engine.notepad.read_content().unwrap_or_default();
+    if transcript.trim().is_empty() {
+        return Ok(());
+    }
+    eprintln!("wheezper: summarizing session with Ollama ({})…", ollama.model);
+    let summary = match ollama.summarize(&transcript) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wheezper: summary failed (transcript kept as-is): {e:#}");
+            return Ok(());
+        }
+    };
+    if summary.is_empty() {
+        return Ok(());
+    }
+    engine.notepad.append_block("Summary", &summary)?;
+    println!("\n{summary}");
+    eprintln!("wheezper: summary appended to notepad.");
+    Ok(())
+}
+
 // --- stdin source -----------------------------------------------------------
 
-fn run_stdin(cli: &Cli, engine: Engine) -> Result<()> {
+fn run_stdin(cli: &Cli, engine: Engine) -> Result<Engine> {
     eprintln!("wheezper: source=stdin ({} Hz, mono f32le)", cli.rate);
     let (mut engine, mut channel) = (engine, Channel::new(None, cli.rate, cli));
     let stdin = std::io::stdin();
@@ -463,12 +526,12 @@ fn run_stdin(cli: &Cli, engine: Engine) -> Result<()> {
     }
     channel.finish(&mut engine);
     eprintln!("wheezper: done.");
-    Ok(())
+    Ok(engine)
 }
 
 // --- live capture (single source) ---------------------------------------------
 
-fn run_capture(cli: &Cli, mode: SourceMode, label: Option<&'static str>, engine: Engine) -> Result<()> {
+fn run_capture(cli: &Cli, mode: SourceMode, label: Option<&'static str>, engine: Engine) -> Result<Engine> {
     let host = capture::resolve_host(cli.host.as_deref())?;
     let cap: Capture = capture::open(mode, cli.device.as_deref(), &host)?;
     eprintln!(
@@ -500,12 +563,12 @@ fn run_capture(cli: &Cli, mode: SourceMode, label: Option<&'static str>, engine:
     result?;
     channel.finish(&mut engine);
     eprintln!("wheezper: done.");
-    Ok(())
+    Ok(engine)
 }
 
 // --- dual source: mic ("me") + loopback ("them") -------------------------------
 
-fn run_dual(cli: &Cli, engine: Engine) -> Result<()> {
+fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
     let host = capture::resolve_host(cli.host.as_deref())?;
     // open loopback first: the far side of the call is the thing you least
     // want to miss while streams negotiate
@@ -544,7 +607,7 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<()> {
     me.finish(&mut engine);
     others.finish(&mut engine);
     eprintln!("wheezper: done.");
-    Ok(())
+    Ok(engine)
 }
 
 fn warn_dropped(rx: &capture::AudioReceiver) {

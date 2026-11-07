@@ -36,6 +36,19 @@ impl Notepad {
         Ok(np)
     }
 
+    /// Append a multi-line block (e.g. an LLM summary) under a heading.
+    pub fn append_block(&mut self, heading: &str, text: &str) -> Result<()> {
+        let ts = Local::now().format("%Y-%m-%d %H:%M");
+        writeln!(self.file, "\n## {heading} — {ts}\n\n{text}\n")?;
+        self.file.flush()?;
+        Ok(())
+    }
+
+    /// Full notepad content so far (for LLM summarization).
+    pub fn read_content(&self) -> Result<String> {
+        std::fs::read_to_string(&self.path).with_context(|| format!("reading {}", self.path.display()))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
