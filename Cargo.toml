@@ -2,8 +2,10 @@
 name = "wheezper"
 version = "0.1.0"
 edition = "2024"
-description = "Live audio transcription to a notepad. stdin PCM -> whisper -> markdown."
+description = "Live meeting/call transcription to a notepad. Single portable binary, local whisper.cpp inference."
 license = "MIT"
+repository = "https://github.com/adichannnnnhere64/wheezper"
+readme = "README.md"
 
 [dependencies]
 whisper-rs = "0.16"

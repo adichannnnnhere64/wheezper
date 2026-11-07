@@ -40,6 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
       - run: cargo build --release
       - name: Check the exe needs no redistributables
         shell: pwsh
