@@ -1,0 +1,142 @@
+//! Model resolution + first-run download.
+//!
+//! The only thing wheezper needs besides its own binary is a whisper ggml
+//! model. `--model` accepts either a path to an existing .bin or a model name
+//! (`base`, `tiny`, ...); named models are downloaded once from
+//! huggingface.co into a cache dir using rustls (no system TLS/CA deps).
+
+use anyhow::{anyhow, bail, Context, Result};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+pub struct ModelSpec {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub approx_mb: u64,
+}
+
+pub const MODELS: &[ModelSpec] = &[
+    ModelSpec { name: "tiny", file: "ggml-tiny-q5_1.bin", approx_mb: 32 },
+    ModelSpec { name: "base", file: "ggml-base-q5_1.bin", approx_mb: 57 },
+    ModelSpec { name: "small", file: "ggml-small-q5_1.bin", approx_mb: 181 },
+    ModelSpec { name: "medium", file: "ggml-medium-q5_1.bin", approx_mb: 513 },
+    ModelSpec { name: "turbo", file: "ggml-large-v3-turbo-q5_1.bin", approx_mb: 574 },
+];
+
+const HF_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+
+/// Resolve `--model` (or default `base`) into a local model path,
+/// downloading on first use. Accepts:
+///   - a path to an existing .bin file (used as-is)
+///   - a model name from MODELS
+///   - an exact ggml file name from the huggingface repo
+pub fn resolve(arg: Option<&str>) -> Result<PathBuf> {
+    let arg = arg.unwrap_or("base");
+    let path = Path::new(arg);
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let spec = lookup(arg).ok_or_else(|| {
+        let names: Vec<&str> = MODELS.iter().map(|m| m.name).collect();
+        anyhow!(
+            "model '{arg}' is neither an existing file nor a known model name ({}). \
+             Or point --model at a .bin file.",
+            names.join(", ")
+        )
+    })?;
+    let dest = cache_dir()?.join(&spec.file);
+    if !dest.exists() {
+        download(&spec, &dest)?;
+    }
+    Ok(dest)
+}
+
+/// Owned download spec (a repo file name + size hint).
+struct DownloadSpec {
+    file: String,
+    approx_mb: u64,
+}
+
+fn lookup(name: &str) -> Option<DownloadSpec> {
+    let n = name.to_ascii_lowercase();
+    if let Some(m) = MODELS.iter().find(|m| m.name == n) {
+        return Some(DownloadSpec { file: m.file.to_string(), approx_mb: m.approx_mb });
+    }
+    if n.starts_with("ggml-") && n.ends_with(".bin") {
+        return Some(DownloadSpec { file: n, approx_mb: 0 });
+    }
+    None
+}
+
+/// Platform-appropriate cache dir (never needs installing anything):
+/// Windows: %APPDATA%\wheezper | Unix: $XDG_DATA_HOME/wheezper or ~/.local/share/wheezper
+pub fn cache_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("WHEEZPER_MODEL_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return Ok(PathBuf::from(appdata).join("wheezper"));
+        }
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return Ok(PathBuf::from(home).join(".wheezper"));
+        }
+        bail!("could not determine model cache dir (set WHEEZPER_MODEL_DIR)");
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .ok_or_else(|| anyhow!("could not determine model cache dir (set WHEEZPER_MODEL_DIR)"))?;
+        Ok(data.join("wheezper"))
+    }
+}
+
+fn download(spec: &DownloadSpec, dest: &Path) -> Result<()> {
+    let url = format!("{HF_BASE}/{}", spec.file);
+    eprintln!("wheezper: model not cached, downloading (~{} MB)…", spec.approx_mb);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating model dir {}", parent.display()))?;
+    }
+    let tmp = dest.with_extension("part");
+
+    let resp = ureq::get(&url).call().context("starting model download")?;
+    if !resp.status().is_success() {
+        bail!("download failed: HTTP {}", resp.status());
+    }
+    let total: u64 = resp
+        .headers()
+        .iter()
+        .find(|(name, _)| name.as_str() == "content-length")
+        .and_then(|(_, v)| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(spec.approx_mb * 1_000_000);
+
+    let mut reader = resp.into_parts().1.into_reader();
+    let mut file = std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut done = 0u64;
+    let start = Instant::now();
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        done += n as u64;
+        let total_mb = total / 1_000_000;
+        let done_mb = done / 1_000_000;
+        let speed = done as f64 / start.elapsed().as_secs_f64().max(0.1) / 1_000_000.0;
+        eprint!("\rwheezper: {done_mb}/{total_mb} MB ({speed:.1} MB/s)…  ");
+    }
+    eprintln!();
+    file.sync_all().ok();
+    drop(file);
+    std::fs::rename(&tmp, dest).with_context(|| format!("finalising {}", dest.display()))?;
+    eprintln!("wheezper: model saved to {}", dest.display());
+    Ok(())
+}

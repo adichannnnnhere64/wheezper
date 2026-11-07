@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 pub struct Notepad {
     file: File,
     path: PathBuf,
-    last_line: Option<String>,
 }
 
 impl Notepad {
@@ -27,7 +26,7 @@ impl Notepad {
             .append(true)
             .open(path)
             .with_context(|| format!("opening notepad {}", path.display()))?;
-        let mut np = Self { file, path: path.to_path_buf(), last_line: None };
+        let mut np = Self { file, path: path.to_path_buf() };
         if !existed {
             let now = Local::now();
             let header = format!("# Meeting — {}\n\n", now.format("%Y-%m-%d %H:%M"));
@@ -41,16 +40,12 @@ impl Notepad {
         &self.path
     }
 
-    /// Append one utterance. Returns false if it was dropped as a duplicate.
+    /// Append one utterance. Empty text is ignored.
     pub fn append(&mut self, text: &str) -> Result<bool> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(false);
         }
-        if self.last_line.as_deref() == Some(text) {
-            return Ok(false); // consecutive repeat: whisper hallucination guard
-        }
-        self.last_line = Some(text.to_string());
 
         let ts = Local::now().format("%H:%M:%S");
         writeln!(self.file, "- [{ts}] {text}")?;

@@ -1,10 +1,11 @@
 mod capture;
 mod dsp;
+mod models;
 mod notepad;
 mod segmenter;
 mod transcribe;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use capture::{Capture, Pop, SourceMode, TARGET_RATE};
 use chrono::Local;
 use clap::{Parser, ValueEnum};
@@ -29,9 +30,10 @@ use transcribe::Transcriber;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Path to the ggml whisper model (.bin)
-    #[arg(short, long, env = "WHEEZPER_MODEL")]
-    model: Option<PathBuf>,
+    /// Path to a ggml whisper model (.bin), or a model name that is
+    /// auto-downloaded on first use: tiny, base, small, medium, turbo
+    #[arg(short, long, env = "WHEEZPER_MODEL", default_value = "base")]
+    model: String,
 
     /// Notepad output file [default: notes/YYYY-MM-DD.md]
     #[arg(short, long)]
@@ -67,15 +69,15 @@ struct Cli {
     threshold_db: f32,
 
     /// Seconds of silence that close a segment
-    #[arg(long, default_value_t = 0.4)]
+    #[arg(long, default_value_t = 0.6)]
     min_silence: f32,
 
     /// Minimum segment length in seconds
     #[arg(long, default_value_t = 0.5)]
     min_segment: f32,
 
-    /// Maximum segment length in seconds
-    #[arg(long, default_value_t = 12.0)]
+    /// Maximum segment length in seconds (whisper natively handles 30 s)
+    #[arg(long, default_value_t = 25.0)]
     max_segment: f32,
 
     /// CPU threads for whisper (0 = all)
@@ -120,12 +122,12 @@ fn main() -> Result<()> {
         cli.threads
     };
 
-    let pipeline = Pipeline::new(&cli, &notes_path, threads)?;
-    eprintln!(
-        "wheezper: model={}, lang={}",
-        cli.model.as_ref().map(|m| m.display().to_string()).unwrap_or_default(),
-        cli.language
-    );
+    let model_path = models::resolve(Some(&cli.model))
+        .with_context(|| format!("resolving model '{}'", cli.model))?;
+    eprintln!("wheezper: model={}", model_path.display());
+
+    let pipeline = Pipeline::new(&cli, &notes_path, &model_path, threads)?;
+    eprintln!("wheezper: lang={}", cli.language);
 
     match source {
         SourceArg::Stdin => run_stdin(&cli, pipeline),
@@ -143,14 +145,13 @@ struct Pipeline {
     framer: Framer,
     transcriber: Transcriber,
     notepad: Notepad,
+    /// Tail of the last transcribed segment, fed as whisper's initial prompt
+    /// so force-cut segments continue mid-sentence instead of hallucinating.
+    last_tail: Option<String>,
 }
 
 impl Pipeline {
-    fn new(cli: &Cli, notes_path: &std::path::Path, threads: i32) -> Result<Self> {
-        let model = cli
-            .model
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--model <PATH> (or env WHEEZPER_MODEL) is required"))?;
+    fn new(cli: &Cli, notes_path: &std::path::Path, model: &std::path::Path, threads: i32) -> Result<Self> {
         let notepad = Notepad::open(notes_path)?;
         let transcriber = Transcriber::new(model, &cli.language, threads)?;
         let segmenter = Segmenter::new(
@@ -162,7 +163,7 @@ impl Pipeline {
         );
         let framer = Framer::new(segmenter.frame_len());
         eprintln!("wheezper: notes -> {}", notepad.path().display());
-        Ok(Self { segmenter, framer, transcriber, notepad })
+        Ok(Self { segmenter, framer, transcriber, notepad, last_tail: None })
     }
 
     /// Push a chunk of 16 kHz mono samples.
@@ -188,18 +189,32 @@ impl Pipeline {
     }
 
     fn handle(&mut self, samples: &[f32]) {
-        match self.transcriber.transcribe(samples) {
+        let prompt = self.last_tail.clone();
+        match self.transcriber.transcribe(samples, prompt.as_deref()) {
             Ok(text) => match self.notepad.append(&text) {
                 Ok(true) => {
+                    self.last_tail = Some(last_words(&text, 8));
                     let ts = Local::now().format("%H:%M:%S");
                     println!("[{ts}] {text}");
                 }
-                Ok(false) => {} // dropped: empty or duplicate
+                Ok(false) => {} // dropped: empty text
                 Err(e) => eprintln!("wheezper: notepad write failed: {e:#}"),
             },
             Err(e) => eprintln!("wheezper: transcription failed: {e:#}"),
         }
     }
+}
+
+/// Last `n` words of `s`, for whisper's initial prompt.
+fn last_words(s: &str, n: usize) -> String {
+    s.split_whitespace()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // --- stdin source -----------------------------------------------------------

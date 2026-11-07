@@ -31,8 +31,9 @@ impl Transcriber {
 
     /// Transcribe one segment (16 kHz mono f32). Returns the joined text.
     /// Filters no-speech segments (whisper's main hallucination path).
-    pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    pub fn transcribe(&mut self, samples: &[f32], prompt: Option<&str>) -> Result<String> {
+        // best_of=5 greedy: noticeably better than greedy-1 at negligible cost
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
         params.set_language(self.language.as_deref());
         params.set_n_threads(self.threads);
         params.set_translate(false);
@@ -40,6 +41,11 @@ impl Transcriber {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_special(false);
+        // continuity: after a force-cut mid-utterance, seed the decoder with
+        // the tail of the previous segment so it doesn't restart a sentence
+        if let Some(p) = prompt {
+            params.set_initial_prompt(p);
+        }
 
         self.state
             .full(params, samples)

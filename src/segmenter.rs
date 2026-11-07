@@ -98,6 +98,7 @@ impl Segmenter {
         self.silent_run = 0;
         // silence still trailing inside buf counts toward the next silent_run
         self.silent_run = self.keep_frames.min(self.min_silence_frames.saturating_sub(1));
+        self.speech_seen = false;
         seg
     }
 
@@ -107,6 +108,7 @@ impl Segmenter {
         let boundary = self.buf.len() - lead;
         let seg = self.buf.drain(..boundary).collect::<Vec<f32>>();
         self.silent_run = 0;
+        self.speech_seen = true; // still mid-utterance: force-cut, not silence
         seg
     }
 
@@ -124,7 +126,7 @@ mod tests {
     use super::*;
 
     fn seg(rate: u32) -> Segmenter {
-        Segmenter::new(rate, -40.0, 0.4, 0.5, 12.0)
+        Segmenter::new(rate, -40.0, 0.6, 0.5, 12.0)
     }
 
     fn frame(s: &mut Segmenter, amplitude: f32) -> Option<Vec<f32>> {

@@ -14,6 +14,10 @@ pkgs.mkShell {
     pkg-config
     alsa-lib
     libpulseaudio
+    rustup
+    ninja
+    # cross-build to Windows (cargo xwin build --target x86_64-pc-windows-msvc)
+    llvmPackages.llvm # provides llvm-lib / llvm-ar / llvm-rc
   ];
   env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 }
