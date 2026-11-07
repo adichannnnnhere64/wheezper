@@ -20,6 +20,9 @@ VC++ redistributable needed).
   best-of-5 decoding, initial-prompt continuity across force-cuts.
 - **M4 (Windows)**: cross-builds to a portable `wheezper.exe` (static CRT,
   system DLLs only), model auto-download built in.
+- **Calls**: `--source dual` transcribes mic ("me") + system loopback
+  ("them") into speaker-labeled notes; `--webhook` pushes each utterance
+  as JSON.
 
 ## Usage
 
@@ -29,6 +32,12 @@ wheezper
 
 # system/loopback audio — the other side of a call, videos, etc.
 wheezper --source loopback
+
+# calls: mic + loopback at once, labeled me/them
+wheezper --source dual
+
+# push every utterance somewhere (phone->PC relay, bots, ...)
+wheezper --source dual --webhook https://example.com/hook
 
 # pick a model: tiny, base (default), small, medium, turbo
 wheezper --model small
@@ -109,12 +118,13 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
                           [default: base] (or env WHEEZPER_MODEL)
 -n, --notes <PATH>     notepad file [default: notes/YYYY-MM-DD.md]
 -l, --language <LANG>  language code, or "auto" [default: auto]
-    --source <SRC>     mic | loopback | stdin [default: stdin if piped, else mic]
+    --source <SRC>     mic | loopback | dual | stdin [default: stdin if piped, else mic]
     --device <NAME>    pick device by substring (see --list-devices)
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
+    --webhook <URL>   POST each utterance to this URL as JSON
     --list-devices    list audio devices and exit
     --rate <HZ>       stdin sample rate [default: 16000, mono f32le]
-    --threshold-db    silence gate in dBFS [default: -40]
+    --threshold-db    silence gate in dBFS (adaptive noise floor on top) [default: -40]
     --min-silence     seconds of silence that close a segment [default: 0.6]
     --min-segment     minimum segment seconds [default: 0.5]
     --max-segment     maximum segment seconds [default: 25]

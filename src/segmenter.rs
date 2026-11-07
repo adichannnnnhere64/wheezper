@@ -8,7 +8,7 @@
 
 pub struct Segmenter {
     frame_len: usize,          // samples per 30 ms frame
-    gate_rms: f32,             // RMS above this counts as speech
+    gate_rms: f32,             // RMS at or above this counts as speech
     min_silence_frames: usize, // trailing silence to close a segment
     min_samples: usize,        // minimum segment length (speech content)
     max_samples: usize,        // force-close threshold
@@ -73,13 +73,16 @@ impl Segmenter {
         None
     }
 
-    /// EOF: emit whatever is pending if it holds real speech.
+    /// EOF: emit whatever is pending, but only if it ever got loud. A buffer
+    /// of marginal noise (system loopback dither, a decork pop) can hold a
+    /// few above-gate frames — flushing it just feeds whisper garbage.
     pub fn flush(&mut self) -> Option<Vec<f32>> {
         let pending = std::mem::take(&mut self.buf);
         let had_speech = self.speech_seen;
         self.silent_run = 0;
         self.speech_seen = false;
-        if had_speech && !pending.is_empty() && pending.len() >= self.min_samples {
+        let loud_enough = pending.iter().fold(0f32, |p, &x| p.max(x.abs())) >= self.gate_rms * 4.0;
+        if had_speech && loud_enough && pending.len() >= self.min_samples {
             return Some(pending);
         }
         None
@@ -188,6 +191,27 @@ mod tests {
         }
         assert_eq!(cuts, 1);
         assert!(s.flush().is_some(), "remaining speech must flush at EOF");
+    }
+
+    #[test]
+    fn flush_drops_marginal_noise_buffer() {
+        // system loopback dither/decork noise: a few frames barely above the
+        // gate accumulate for seconds; flushing them must not feed whisper.
+        let mut s = seg(16000);
+        for _ in 0..300 {
+            // 9 s of dither straddling the gate (peak 0.015 < 4x gate)
+            let _ = frame(&mut s, 0.012);
+        }
+        assert!(s.flush().is_none(), "marginal-noise buffer must not flush as speech");
+    }
+
+    #[test]
+    fn flush_keeps_real_speech() {
+        let mut s = seg(16000);
+        for _ in 0..60 {
+            let _ = frame(&mut s, 0.2);
+        }
+        assert!(s.flush().is_some(), "real speech pending at EOF must flush");
     }
 
     #[test]

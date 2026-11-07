@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libasound2-dev
+      - run: cargo test --release
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libasound2-dev
+      - run: cargo build --release
+      - name: Package
+        run: tar czf wheezper-linux-amd64.tar.gz -C target/release wheezper
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-linux-amd64
+          path: wheezper-linux-amd64.tar.gz
+
+  build-windows:
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - name: Check the exe needs no redistributables
+        shell: pwsh
+        run: |
+          $imports = & dumpbin /dependents target\release\wheezper.exe | Select-String "DLL"
+          $imports | ForEach-Object { Write-Host $_ }
+          $bad = $imports | Where-Object { $_ -match "VCRUNTIME|MSVCP140|api-ms-win-crt" }
+          if ($bad) { Write-Error "dynamic CRT import found: $bad"; exit 1 }
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive target\release\wheezper.exe wheezper-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-windows-x64
+          path: wheezper-windows-x64.zip
+
+  release:
+    needs: [test, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            wheezper-linux-amd64.tar.gz
+            wheezper-windows-x64.zip

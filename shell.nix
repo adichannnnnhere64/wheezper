@@ -8,6 +8,7 @@ pkgs.mkShell {
   packages = with pkgs; [
     rustc
     cargo
+    clippy
     cmake
     llvmPackages.libclang
     clang

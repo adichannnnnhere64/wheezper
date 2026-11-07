@@ -40,15 +40,19 @@ impl Notepad {
         &self.path
     }
 
-    /// Append one utterance. Empty text is ignored.
-    pub fn append(&mut self, text: &str) -> Result<bool> {
+    /// Append one utterance, optionally attributed to a channel ("me"/"them").
+    /// Empty text is ignored.
+    pub fn append(&mut self, channel: Option<&str>, text: &str) -> Result<bool> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(false);
         }
 
         let ts = Local::now().format("%H:%M:%S");
-        writeln!(self.file, "- [{ts}] {text}")?;
+        match channel {
+            Some(ch) => writeln!(self.file, "- [{ts}] **{ch}:** {text}")?,
+            None => writeln!(self.file, "- [{ts}] {text}")?,
+        }
         self.file.flush()?;
         Ok(true)
     }
