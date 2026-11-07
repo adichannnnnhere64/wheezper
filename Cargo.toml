@@ -13,6 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = { version = "0.18", features = ["pulseaudio"] }
 ctrlc = "3"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+toml = "1.2.1"
 
 # vendored to pin whisper.cpp and force /MT (static CRT) on Windows so the
 # exe runs with zero redistributable installs

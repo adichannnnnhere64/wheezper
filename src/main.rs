@@ -1,4 +1,5 @@
 mod capture;
+mod config;
 mod dsp;
 mod models;
 mod notepad;
@@ -9,7 +10,8 @@ mod transcribe;
 use anyhow::{Context, Result};
 use capture::{Capture, Pop, SourceMode, TARGET_RATE};
 use chrono::Local;
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use dsp::{Framer, Resampler};
 use notepad::Notepad;
 use segmenter::Segmenter;
@@ -63,6 +65,16 @@ struct Cli {
     #[arg(long)]
     webhook: Option<String>,
 
+    /// Show rolling live captions of the utterance in progress (stdout only,
+    /// extra CPU — best paired with --model tiny on weaker machines)
+    #[arg(long)]
+    partial: bool,
+
+    /// Config file (TOML). Without this flag, ./wheezper.toml then
+    /// ~/.config/wheezper/config.toml (or %APPDATA%\wheezper) are used if present.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// List available audio devices and exit
     #[arg(long)]
     list_devices: bool,
@@ -101,10 +113,15 @@ enum SourceArg {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
     // whisper.cpp is extremely chatty on stderr; silence it (we own the output)
     whisper_rs::install_logging_hooks();
+
+    if let Some(cfg) = config::load(cli.config.as_deref())? {
+        apply_config(&mut cli, &matches, &cfg.table);
+        eprintln!("wheezper: config <- {}", cfg.path.display());
+    }
 
     if cli.list_devices {
         let host = capture::resolve_host(cli.host.as_deref())?;
@@ -150,10 +167,23 @@ fn main() -> Result<()> {
 
 // --- engine: transcription + sinks (shared across all channels) -----------
 
+/// Message for the live-caption worker thread.
+struct PartialMsg {
+    samples: Vec<f32>,
+    label: Option<&'static str>,
+    prompt: Option<String>,
+}
+
 struct Engine {
     transcriber: Transcriber,
     notepad: Notepad,
     webhook: Option<sink::Webhook>,
+    partial: bool,
+    /// Live-caption channel: Some when --partial. try_send only — if the
+    /// worker is still inferring, this preview is dropped (whisper pads
+    /// every call to 30 s, so each one costs ~3-5 s; previews must never
+    /// block finals or audio).
+    partial_tx: Option<std::sync::mpsc::SyncSender<PartialMsg>>,
 }
 
 impl Engine {
@@ -162,7 +192,64 @@ impl Engine {
         let transcriber = Transcriber::new(model, &cli.language, threads)?;
         eprintln!("wheezper: notes -> {}", notepad.path().display());
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
-        Ok(Self { transcriber, notepad, webhook })
+
+        let partial_tx = if cli.partial {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PartialMsg>(1);
+            let model = model.to_path_buf();
+            let lang = cli.language.clone();
+            std::thread::Builder::new()
+                .name("caption-worker".into())
+                .spawn(move || {
+                    // its own model instance: whisper.cpp states sharing one
+                    // context are NOT safely concurrent (empirically corrupt
+                    // each other); the extra weights cost ~30-60 MB
+                    let mut worker = match Transcriber::new(&model, &lang, threads) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("wheezper: caption worker failed to start: {e:#}");
+                            return;
+                        }
+                    };
+                    let mut last_text = String::new();
+                    while let Ok(msg) = rx.recv() {
+                        let Ok(text) = worker.transcribe(&msg.samples, msg.prompt.as_deref())
+                        else { continue };
+                        let text = text.trim().to_string();
+                        if text.is_empty() || text == last_text {
+                            continue;
+                        }
+                        last_text = text.clone();
+                        let ts = Local::now().format("%H:%M:%S");
+                        let prefix = match msg.label {
+                            Some(ch) => format!("{ch}: "),
+                            None => String::new(),
+                        };
+                        print!("\r[{ts}] {prefix}{text}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                })
+                .context("spawning caption worker")?;
+            Some(tx)
+        } else {
+            None
+        };
+
+        Ok(Self { transcriber, notepad, webhook, partial: cli.partial, partial_tx })
+    }
+
+    /// Queue a live-caption preview (never blocks; drops when busy).
+    fn partial(&self, samples: &[f32], label: Option<&'static str>, tail: &Option<String>) {
+        let Some(tx) = &self.partial_tx else { return };
+        let msg = PartialMsg { samples: samples.to_vec(), label, prompt: tail.clone() };
+        let _ = tx.try_send(msg);
+    }
+
+    /// Clear any partial-caption line before a final line is printed.
+    fn clear_partial(&self) {
+        if self.partial {
+            print!("\r{}\r", " ".repeat(90));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
     }
 
     /// Transcribe one segment and write it to every sink.
@@ -173,6 +260,7 @@ impl Engine {
             Ok(text) => match self.notepad.append(label, &text) {
                 Ok(true) => {
                     *tail = Some(last_words(&text, 8));
+                    self.clear_partial();
                     let ts = Local::now().format("%H:%M:%S");
                     match label {
                         Some(ch) => println!("[{ts}] {ch}: {text}"),
@@ -187,6 +275,86 @@ impl Engine {
             },
             Err(e) => eprintln!("wheezper: transcription failed: {e:#}"),
         }
+    }
+}
+
+/// Apply config-file values to args the user did NOT pass on the command line.
+fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let get = |key: &str| cfg.get(key);
+
+    if !given("model")
+        && let Some(v) = get("model").and_then(|v| v.as_str())
+    {
+        cli.model = v.to_string();
+    }
+    if !given("notes")
+        && let Some(v) = get("notes").and_then(|v| v.as_str())
+    {
+        cli.notes = Some(PathBuf::from(v));
+    }
+    if !given("language")
+        && let Some(v) = get("language").and_then(|v| v.as_str())
+    {
+        cli.language = v.to_string();
+    }
+    if !given("source")
+        && let Some(v) = get("source").and_then(|v| v.as_str())
+        && let Ok(mode) = SourceArg::from_str(v, true)
+    {
+        cli.source = Some(mode);
+    }
+    if !given("device")
+        && let Some(v) = get("device").and_then(|v| v.as_str())
+    {
+        cli.device = Some(v.to_string());
+    }
+    if !given("host")
+        && let Some(v) = get("host").and_then(|v| v.as_str())
+    {
+        cli.host = Some(v.to_string());
+    }
+    if !given("webhook")
+        && let Some(v) = get("webhook").and_then(|v| v.as_str())
+    {
+        cli.webhook = Some(v.to_string());
+    }
+    if !given("rate")
+        && let Some(v) = get("rate").and_then(|v| v.as_integer())
+        && let Ok(v) = u32::try_from(v)
+    {
+        cli.rate = v;
+    }
+    if !given("threshold-db")
+        && let Some(v) = get("threshold-db").or_else(|| get("threshold_db")).and_then(|v| v.as_float())
+    {
+        cli.threshold_db = v as f32;
+    }
+    if !given("min-silence")
+        && let Some(v) = get("min-silence").or_else(|| get("min_silence")).and_then(|v| v.as_float())
+    {
+        cli.min_silence = v as f32;
+    }
+    if !given("min-segment")
+        && let Some(v) = get("min-segment").or_else(|| get("min_segment")).and_then(|v| v.as_float())
+    {
+        cli.min_segment = v as f32;
+    }
+    if !given("max-segment")
+        && let Some(v) = get("max-segment").or_else(|| get("max_segment")).and_then(|v| v.as_float())
+    {
+        cli.max_segment = v as f32;
+    }
+    if !given("threads")
+        && let Some(v) = get("threads").and_then(|v| v.as_integer())
+        && let Ok(v) = i32::try_from(v)
+    {
+        cli.threads = v;
+    }
+    if !given("partial")
+        && let Some(v) = get("partial").and_then(|v| v.as_bool())
+    {
+        cli.partial = v;
     }
 }
 
@@ -212,7 +380,13 @@ struct Channel {
     scratch: Vec<f32>,
     /// Tail of the last transcribed segment (per-channel prompt continuity)
     tail: Option<String>,
+    partial: bool,
+    last_partial: std::time::Instant,
 }
+
+const PARTIAL_INTERVAL: Duration = Duration::from_millis(3000);
+const PARTIAL_MIN: usize = TARGET_RATE as usize * 2; // need 2 s before previewing
+const PARTIAL_WINDOW: usize = TARGET_RATE as usize * 6; // preview last 6 s
 
 impl Channel {
     /// `in_rate`: sample rate of the incoming mono chunks.
@@ -226,7 +400,7 @@ impl Channel {
         );
         let framer = Framer::new(segmenter.frame_len());
         let resampler = Resampler::new(in_rate, TARGET_RATE);
-        Self { label, segmenter, framer, resampler, scratch: Vec::new(), tail: None }
+        Self { label, segmenter, framer, resampler, scratch: Vec::new(), tail: None, partial: cli.partial, last_partial: std::time::Instant::now() }
     }
 
     /// Push a chunk of mono samples at the channel's input rate.
@@ -239,6 +413,17 @@ impl Channel {
             if let Some(segment) = self.segmenter.feed(&frame) {
                 engine.handle(&segment, self.label, &mut self.tail);
             }
+        }
+        // rolling live caption of the utterance in progress
+        if self.partial
+            && self.last_partial.elapsed() >= PARTIAL_INTERVAL
+            && self.segmenter.pending().len() >= PARTIAL_MIN
+        {
+            let pending = self.segmenter.pending();
+            let start = pending.len().saturating_sub(PARTIAL_WINDOW);
+            let window = pending[start..].to_vec();
+            self.last_partial = std::time::Instant::now();
+            engine.partial(&window, self.label, &self.tail);
         }
     }
 
@@ -271,7 +456,7 @@ fn run_stdin(cli: &Cli, engine: Engine) -> Result<()> {
             break;
         }
         samples.clear();
-        for chunk in byte_buf.as_chunks::<4>().0.iter() {
+        for chunk in byte_buf[..n].as_chunks::<4>().0.iter() {
             samples.push(f32::from_le_bytes(*chunk));
         }
         channel.push(&samples, &mut engine);

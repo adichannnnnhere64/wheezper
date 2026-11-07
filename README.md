@@ -39,6 +39,9 @@ wheezper --source dual
 # push every utterance somewhere (phone->PC relay, bots, ...)
 wheezper --source dual --webhook https://example.com/hook
 
+# rolling live captions while you speak (stdout only; pairs well with --model tiny)
+wheezper --partial --model tiny
+
 # pick a model: tiny, base (default), small, medium, turbo
 wheezper --model small
 
@@ -102,6 +105,23 @@ pkg install rust binutils cmake clang
 cargo build --release
 ```
 
+## Config file
+
+Avoid typing flags: keys mirror CLI flags, command-line flags always win.
+Loaded from `--config PATH`, else `./wheezper.toml`, else
+`~/.config/wheezper/config.toml` (Linux) or `%APPDATA%\wheezper\config.toml`
+(Windows). See [`wheezper.example.toml`](wheezper.example.toml):
+
+```toml
+# daily meeting setup
+source = "dual"      # mic | loopback | dual | stdin
+model = "base"       # tiny | base | small | medium | turbo | /path/to/model.bin
+language = "en"     # or "auto"
+partial = true       # rolling live captions (stdout only)
+webhook = "http://192.168.1.20:8399/hook"
+notes = "notes/work.md"
+```
+
 ## Termux
 
 CPAL has no Android host, so use the stdin path:
@@ -122,6 +142,8 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --device <NAME>    pick device by substring (see --list-devices)
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
     --webhook <URL>   POST each utterance to this URL as JSON
+    --partial         rolling live captions of the utterance in progress
+    --config <PATH>   config file [default: ./wheezper.toml, then config dir]
     --list-devices    list audio devices and exit
     --rate <HZ>       stdin sample rate [default: 16000, mono f32le]
     --threshold-db    silence gate in dBFS (adaptive noise floor on top) [default: -40]

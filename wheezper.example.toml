@@ -1,0 +1,20 @@
+# wheezper configuration — copy to ./wheezper.toml (or your config dir).
+# Keys mirror CLI flags; command-line flags always win.
+# Loaded from: --config PATH, ./wheezper.toml, then
+#   Linux:   ~/.config/wheezper/config.toml
+#   Windows: %APPDATA%\wheezper\config.toml
+
+source = "dual"        # mic | loopback | dual | stdin
+model = "base"         # tiny | base | small | medium | turbo | /path/to/model.bin
+language = "en"        # or "auto" to detect per segment
+# notes = "notes/work.md"
+# webhook = "http://192.168.1.20:8399/hook"
+# device = "hdmi"           # substring match, see --list-devices
+# host = "pulseaudio"       # pulseaudio | wasapi | alsa | ...
+# partial = true            # rolling live captions (stdout only)
+# rate = 16000              # stdin only
+# threshold-db = -40        # silence gate
+# min-silence = 0.6         # seconds of silence that close a segment
+# min-segment = 0.5
+# max-segment = 25
+# threads = 6               # 0 = all

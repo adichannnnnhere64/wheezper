@@ -44,6 +44,11 @@ impl Segmenter {
         self.frame_len
     }
 
+    /// The segment currently accumulating (for live caption previews).
+    pub fn pending(&self) -> &[f32] {
+        &self.buf
+    }
+
     /// Feed one 30 ms frame. Returns a completed segment when one closes.
     pub fn feed(&mut self, frame: &[f32]) -> Option<Vec<f32>> {
         debug_assert_eq!(frame.len(), self.frame_len);
