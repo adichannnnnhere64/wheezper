@@ -162,7 +162,8 @@ struct Cli {
     #[arg(long, default_value_t = 10.0)]
     max_segment: f32,
 
-    /// CPU threads for whisper (0 = auto, capped at 4)
+    /// CPU threads for whisper (0 = auto: the live-preview tier gets the
+    /// share that is left after the notes tier and the capture loop)
     #[arg(long, default_value_t = 0)]
     threads: i32,
 }
@@ -1019,34 +1020,130 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
     Ok(engine)
 }
 
-// --- incremental streaming: words committed once, as soon as stable -------
+// --- incremental streaming: two tiers, words committed once ----------------
 
-/// Unified live loop: sliding-window inference, per-word commit by
-/// timestamp, append-only output. One shared worker thread does all
-/// inference.
+/// Conservative preview width: works in an 80-column terminal without
+/// querying the terminal size. The preview keeps the *tail* of the text.
+const PREVIEW_COLS: usize = 72;
+
+/// Bottom-line live preview of the provisional tier. Rewrites itself in
+/// place with CR + clear-line — deliberately no cursor-up tricks, which
+/// break the moment a row wraps. `hide` before any other output, `show`
+/// after; the one cosmetic artifact is a blank row whenever a caption line
+/// completes while the preview is up (it acts as a block separator).
+struct LiveView {
+    enabled: bool,
+    shown: bool,
+}
+
+impl LiveView {
+    fn new(enabled: bool) -> Self {
+        Self { enabled, shown: false }
+    }
+
+    /// Erase the preview row so other output can print cleanly.
+    fn hide(&mut self) {
+        if self.enabled && self.shown {
+            print!("\r\x1b[2K");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            self.shown = false;
+        }
+    }
+
+    /// (Re)draw the preview on its own row at the bottom.
+    fn show(&mut self, label: Option<&str>, text: &str) {
+        if !self.enabled || text.is_empty() {
+            return;
+        }
+        if self.shown {
+            print!("\r\x1b[2K");
+        } else {
+            println!();
+        }
+        let mut line = String::new();
+        if let Some(l) = label {
+            line.push_str(l);
+            line.push_str(": ");
+        }
+        line.push_str(text);
+        if line.chars().count() > PREVIEW_COLS {
+            // keep the tail: what is being said right now matters most
+            let skip = line.chars().count() - PREVIEW_COLS;
+            line = format!("…{}", line.chars().skip(skip).collect::<String>());
+        }
+        print!("▍{line}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        self.shown = true;
+    }
+}
+
+/// Unified live loop, two tiers per channel. The final tier is the Phase-1
+/// engine — generous windows, words committed exactly once by timestamp,
+/// append-only, the only thing that reaches the notes. The provisional tier
+/// decodes the live edge to put words on screen in ~0.5 s; its text is
+/// display-only and superseded word-by-word as the final tier confirms.
 fn run_stream(
     cli: &Cli,
     chans: Vec<(Capture, Option<&'static str>)>,
     mut engine: Engine,
 ) -> Result<Engine> {
-    let threads = if cli.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4).min(4)
-    } else {
-        cli.threads
+    // Split the core budget between the tiers: the provisional tier is the
+    // latency-critical one (the 0.5 s budget); the final tier's lag is
+    // invisible behind the preview, so it runs on the leftovers, with one
+    // core always reserved for the capture/main loop — oversubscribing the
+    // box makes the ggml spin barriers convoy and doubles every pass time
+    // (measured: 2+4 misses the p90 budget, 2+3 clears it with margin).
+    // Piped output spawns no preview tier, so the final tier is alone and
+    // keeps the Phase-1 thread share.
+    let cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
+    let live = std::io::stdout().is_terminal();
+    let (threads, prov_threads) = match cli.threads {
+        n if n > 0 => (n, (n / 2).max(1)),
+        _ if live => stream::split_threads(cores, 0),
+        _ => (cores.min(4), 0),
     };
     let model_path = models::resolve(Some(&cli.model))
         .with_context(|| format!("resolving model '{}'", cli.model))?;
-    let (tx, rx) = stream::spawn_worker(&model_path, &cli.language, threads, !cli.no_vad)?;
-    eprintln!("wheezper: stream: sliding-window incremental transcription (words committed once)");
+    let (tx, rx) = stream::spawn_worker(
+        &model_path,
+        &cli.language,
+        threads,
+        !cli.no_vad,
+        transcribe::Profile::Final,
+    )?;
+    // the provisional tier only pays off when someone is watching stdout
+    // live: piped output skips the extra worker (and its CPU) entirely and
+    // behaves exactly like Phase 1
+    let prov = if live {
+        let (ptx, prx) = stream::spawn_worker(
+            &model_path,
+            &cli.language,
+            prov_threads,
+            !cli.no_vad,
+            transcribe::Profile::Provisional,
+        )?;
+        eprintln!("wheezper: stream: live preview tier on — words appear in ~0.5 s and firm up as the final pass confirms");
+        Some((ptx, prx))
+    } else {
+        None
+    };
+    eprintln!("wheezper: stream: two-tier incremental transcription (append-only notes)");
 
     let mut caps: Vec<Capture> = Vec::with_capacity(chans.len());
+    let mut feeds: Vec<stream::ChannelFeed> = Vec::with_capacity(chans.len());
     let mut streams: Vec<stream::StreamChannel> = Vec::with_capacity(chans.len());
+    let mut provs: Vec<stream::ProvisionalTier> = Vec::with_capacity(chans.len());
     for (cap, label) in chans {
-        streams.push(stream::StreamChannel::new(label, cap.sample_rate));
+        feeds.push(stream::ChannelFeed::new(cap.sample_rate));
+        streams.push(stream::StreamChannel::new(label, stream::Tuning::final_default()));
+        if live {
+            provs.push(stream::ProvisionalTier::new());
+        }
         caps.push(cap);
     }
     let running = capture::ctrl_c_flag()?;
     let step = Duration::from_millis(25);
+    let mut view = LiveView::new(live);
 
     let print_open = |sc: &stream::StreamChannel, first: bool| {
         if first {
@@ -1060,29 +1157,67 @@ fn run_stream(
 
     'live: loop {
         let mut all_closed = true;
-        for (_i, (cap, sc)) in caps.iter().zip(streams.iter_mut()).enumerate() {
+        for (i, (cap, feed)) in caps.iter().zip(feeds.iter_mut()).enumerate() {
             match cap.receiver.pop_timeout(step) {
-                Pop::Data(chunk) => sc.push(&chunk),
+                Pop::Data(chunk) => {
+                    let mono = feed.resample(&chunk);
+                    streams[i].push_16k(mono);
+                    if live {
+                        provs[i].push_16k(mono);
+                    }
+                }
                 Pop::Timeout => {}
-                Pop::Closed => sc.mark_closed(),
+                Pop::Closed => {
+                    streams[i].mark_closed();
+                    if live {
+                        provs[i].mark_closed();
+                    }
+                }
             }
-            all_closed &= sc.closed();
+            all_closed &= streams[i].closed();
         }
         if all_closed {
             break;
         }
 
-        // collect worker hypotheses
+        // final tier: append-only stream + notes (words committed exactly
+        // once, by timestamp — Phase-1 behaviour, just slower than the
+        // preview nobody waits on)
         while let Ok(res) = rx.try_recv() {
             if let Some(sc) = streams.get_mut(res.chan) {
                 let was_open = sc.line_open();
-                let delta = sc.on_result(res.start_s, res.dur_s, &res.segs);
-                if !delta.trim().is_empty() {
-                    engine.lyric_advance(&delta);
-                    engine.lyric_remember(&delta);
+                let d = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                if live {
+                    provs[res.chan].advance_final_boundary(sc.last_commit_s());
+                }
+                if !d.text.trim().is_empty() {
+                    view.hide();
+                    engine.lyric_advance(&d.text);
+                    engine.lyric_remember(&d.text);
                     print_open(sc, !was_open);
-                    print!("{} ", delta.trim());
+                    print!("{} ", d.text.trim());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
+        }
+
+        // provisional tier: live preview line (display-only, revisable)
+        if let Some((_, prx)) = &prov {
+            let mut updated: Option<usize> = None;
+            while let Ok(res) = prx.try_recv() {
+                if let Some(p) = provs.get_mut(res.chan)
+                    && !p.on_result(res.start_s, res.dur_s, &res.segs).is_empty()
+                {
+                    updated = Some(res.chan);
+                }
+            }
+            if let Some(idx) = updated {
+                let text = provs[idx].preview();
+                let label = streams[idx].label;
+                if text.is_empty() {
+                    view.hide();
+                } else {
+                    view.show(label, &text);
                 }
             }
         }
@@ -1092,9 +1227,13 @@ fn run_stream(
         for (i, sc) in streams.iter_mut().enumerate() {
             let prompt = lyric_prompt.clone().unwrap_or_else(|| sc.prompt_tail());
             sc.maybe_send(i, &tx, &prompt);
+            if let Some((ptx, _)) = &prov {
+                provs[i].maybe_send(i, ptx);
+            }
             if sc.line_ready()
                 && let Some(line) = sc.take_line()
             {
+                view.hide();
                 commit_line(&mut engine, sc.label, &line);
             }
         }
@@ -1104,27 +1243,40 @@ fn run_stream(
         }
     }
 
-    // shutdown: give every channel one last pass for the audio still in its
-    // buffer (the tail of the utterance), then commit what is left
+    // shutdown: give every channel one last pass per tier (the tail of the
+    // utterance), then commit what is left
     for (i, sc) in streams.iter_mut().enumerate() {
         sc.flush();
         let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
         sc.maybe_send(i, &tx, &prompt);
     }
-    // a pass can take seconds (whisper pads to 30 s); wait it out instead of
-    // abandoning the last line the moment the channel goes momentarily quiet
+    for (i, p) in provs.iter_mut().enumerate() {
+        p.flush();
+        if let Some((ptx, _)) = &prov {
+            p.maybe_send(i, ptx);
+        }
+    }
+    // a final pass can take seconds (whisper pads to 30 s); wait it out
+    // instead of abandoning the last line the moment the channel goes
+    // momentarily quiet
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && streams.iter().any(|sc| sc.busy()) {
+    while Instant::now() < deadline
+        && (streams.iter().any(|sc| sc.busy()) || provs.iter().any(|p| p.busy()))
+    {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(res) => {
                 if let Some(sc) = streams.get_mut(res.chan) {
                     let was_open = sc.line_open();
-                    let delta = sc.on_result(res.start_s, res.dur_s, &res.segs);
-                    if !delta.trim().is_empty() {
-                        engine.lyric_advance(&delta);
-                        engine.lyric_remember(&delta);
+                    let d = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                    if live {
+                        provs[res.chan].advance_final_boundary(sc.last_commit_s());
+                    }
+                    if !d.text.trim().is_empty() {
+                        view.hide();
+                        engine.lyric_advance(&d.text);
+                        engine.lyric_remember(&d.text);
                         print_open(sc, !was_open);
-                        print!("{} ", delta.trim());
+                        print!("{} ", d.text.trim());
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                 }
@@ -1132,14 +1284,29 @@ fn run_stream(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if let Some((_, prx)) = &prov {
+            match prx.recv_timeout(Duration::from_millis(500)) {
+                Ok(res) => {
+                    if let Some(p) = provs.get_mut(res.chan) {
+                        p.on_result(res.start_s, res.dur_s, &res.segs);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        }
     }
     for sc in streams.iter_mut() {
         sc.finish();
         if sc.line_open()
             && let Some(line) = sc.take_line()
         {
+            view.hide();
             commit_line(&mut engine, sc.label, &line);
         }
+    }
+    for p in provs.iter_mut() {
+        p.finish();
     }
     for cap in &caps {
         warn_dropped(&cap.receiver);

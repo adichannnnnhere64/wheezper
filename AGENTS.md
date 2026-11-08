@@ -1,0 +1,333 @@
+# AGENTS.md — wheezper
+
+Guidance for coding agents working in this repository. Read this before touching
+code; it records what is finished, what the numbers are, and which invariants
+must not regress.
+
+**wheezper** is a single-binary CLI that listens to a meeting/call and writes a
+timestamped markdown transcript as it happens: local whisper.cpp inference, no
+cloud, no install, Linux / Windows / Android(Termux). Version `0.3.0`.
+
+---
+
+## Status: phases
+
+### Phase 1 — DONE (shipped)
+
+**Goal: transcribe *everything* — your microphone and the other side (speaker /
+headphones / system audio) — live, into a notes file.**
+
+Implemented and in daily use:
+
+- `--source mic` — microphone only.
+- `--source loopback` — system audio only (the far side of a call).
+- `--source dual` — **both at once**, transcribed on separate channels and
+  labelled in the notes as `**me:**` (mic) and `**them:**` (loopback).
+  - Linux: PulseAudio/PipeWire sink monitor sources (`--all-monitors` captures
+    every sink's monitor).
+  - Windows: WASAPI loopback, i.e. an *output* device opened as an input stream.
+- Live streaming engine (default): committed words are printed as they become
+  stable and appended per line to `notes/YYYY-MM-DD.md`:
+  ```
+  - [14:02:11] **them:** So the migration window is Tuesday, is that still fine?
+  - [14:02:18] **me:** Yes, but we need the sign-off from security first.
+  ```
+- Session summary / action items via `--ollama` are appended **on stop**, not
+  live. Per-line LLM cleanup exists (`--polish`) but is too slow for live use.
+- Also shipped, beyond the phase-1 bar: music/lyrics mode (`--lyrics`,
+  `--lyric-sync`), webhook sink, config file, CI/CD with artifact + VM tests.
+
+Evidence (measured, see "Baseline numbers"):
+`stream::tests::replays_audio_through_stream_loop` (streaming commit),
+`scripts/vmtest-capture.sh` (real capture: loopback + dual labels),
+`bench/run.sh` (file-path accuracy ≥ 90 % gate in CI).
+
+### Phase 2 — DONE (shipped). Two-tier streaming: 0.2–0.35 s on screen
+
+Baseline (measured, `CHANNELS=2`): median **4.23 s**, p90 5.13 s; single
+channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
+**0.46–0.62 s** dual-channel — inside the 0.5 s / 0.8 s budget with margin.
+
+**Design.** Each channel runs two tiers (`src/stream.rs`):
+
+- **Final tier** = the Phase-1 engine, byte-for-byte: 8 s windows, 30 s-padded
+  mel, temperature-fallback ladder, rolling decode context, continuity
+  prompt. Words commit exactly once by timestamp, append-only. **The notes are
+  built only from this tier.** Its lag (~4 s single / ~7 s dual) is invisible:
+  the preview already showed the words.
+- **Provisional tier** = live-edge preview: tail windows ≤ 0.8 s
+  (`audio_ctx=40`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
+  `max_tokens=6`, no prompt or rolling context. Passes cost ~0.10 s; words
+  reach stdout in ~0.2–0.4 s and are revised in place as the final tier
+  confirms (single bottom-line rewrite, `▍`-prefixed, ANSI CR+clear — no
+  cursor-up, which breaks on wrapped rows). Display-only: never written to
+  the notes. Only spawned when stdout is a TTY — piped output skips the
+  worker and behaves exactly like Phase 1.
+
+Acceptance (gated, run it after touching the streaming engine):
+
+```bash
+CHANNELS=2 MODEL=base WZ_ACCEPT=1 LATENCY_SECONDS=40 nix-shell --run \
+  'cargo test --release stream::tests::measures_commit_latency -- --ignored --nocapture'
+```
+
+**What made it work** (all measured; the naive configs are instructive):
+
+1. `audio_ctx` kills the 30 s-padding cost: pass 1.6 s → 0.10 s. But it
+   silently truncates audio beyond `audio_ctx × 20 ms` — the provisional
+   window cap must stay within it.
+2. The temperature-fallback ladder × `best_of=5` = up to **21 decodes per
+   window**. Short windows score low confidence, so they trigger it
+   constantly: audio_ctx=100 without the fix measured an 8.7 s median pass.
+   The final tier keeps the ladder (it is real quality); the provisional
+   tier sets `temperature_inc=0`.
+3. `max_tokens` bounds runaway decoding on fragmented tail windows (hitting
+   the cap still emits the words decoded so far). Without it, fragment
+   windows decode to the 220-token cap, costing ~0.7–2.6 s per pass.
+4. **Thread budget decides the tail.** Two ggml workers oversubscribing the
+   box spin-barrier convoy and double every pass: 4+4 measured p90 > 1 s.
+   The shipped split on 6 cores is 2 (final) + 3 (provisional) + 1 (capture/
+   main loop) — see `stream::split_threads`. When stdout is piped the final
+   tier is alone and gets the old full share (`cores.min(4)`).
+5. Append-only whisper cannot reach 0.5 s at acceptable quality: stable
+   decode needs ≥ ~2 s of window, and every fast small-window config
+   measured (0.86–1.22 s median) commits permanent garbage ("Esk not",
+   duplicated words). That is why the preview tier revises on stdout and the
+   notes stay append-only — the human approved exactly that split.
+
+Accuracy preserved: fixture gate 100 %, song bench byte-identical
+(Backburner, base 25 s noctx: 51.79 % — same as `bench/RESULTS.md`),
+vmtest-capture 90.9 % loopback + dual labels, notes format unchanged,
+Windows cross-build and Termux `--no-default-features` build green.
+
+### Phase 3 — NOT STARTED. Context prompt + AI annotation agent
+
+Two new capabilities, specced here so the shape is agreed before coding.
+
+**3a. `--prompt="This is a meeting about google"`**
+
+- Domain/context hint from the human: names, jargon, products, the topic.
+- Used in two places: prepended (bounded, ~40 words) to whisper's
+  `initial_prompt` on every call, and included in the annotation agent's system
+  prompt.
+- whisper's prompt budget is ~224 tokens and the per-line tail prompt already
+  uses it; combine as `<domain prompt>. <last 12 words of the line>` and never
+  let the domain hint evict the local context entirely.
+- Note: prompt bias helped meetings and *hurt* music (it makes the decoder read
+  words that are not in the audio, see `bench/RESULTS.md`). Keep it opt-in.
+
+**3b. `--with-agent="PROVIDER:MODEL[:BUDGET]"`**
+
+- Example from the human: `--with-agent="ollama-cloud:deepseek-v4.1-flash:1017"`
+  → provider `ollama-cloud`, model `deepseek-v4.1-flash`, output budget `1017`
+  tokens. Grammar: split on `:`; if the **last** field parses as a positive
+  integer, it is the token budget (model names themselves may contain `:`).
+  Providers: `ollama` (local server, default `http://localhost:11434`),
+  `ollama-cloud` (needs `OLLAMA_API_KEY`, reuse the existing cloud path in
+  `src/llm.rs`), `builtin` (embedded llama.cpp, `llm` feature). Unknown
+  provider/model must fail loudly at startup, not silently disable the feature.
+- Behaviour: after each committed **line** (not each word), send the line plus a
+  short rolling context (previous ~3 lines + `--prompt`) to the agent and write
+  its answer as an indented annotation under the transcript line:
+  ```
+  - [14:02:11] **them:** So the migration window is Tuesday, is that still fine?
+    ↳ 🤖 deepseek-v4.1-flash: concrete date (Tuesday) with no owner; ask who signs off.
+  ```
+- Hard requirements:
+  - **Never block transcription.** Agent calls run on their own thread with a
+    bounded queue; drop (with a one-time warning) rather than delay. Phase 2's
+    latency budget wins over annotations.
+  - Annotations are opt-in, and `bench/score.py` must ignore anything that is
+    not a `- [HH:MM:SS] …` transcript line (it currently scores every word in
+    the file, so annotations would count as insertions).
+  - Cheap defaults: skip lines shorter than ~3 words, cap calls per minute, and
+    print the model/endpoint once at startup. Failures are non-fatal and
+    reported once.
+  - `--with-agent` must work with `--source dual` (annotations say which channel
+    the line came from).
+
+---
+
+## Repository map
+
+```
+src/main.rs        CLI (clap), config merge, Engine (transcribe → sinks), the
+                   live loops: run_stream (default) and segmenter fallback
+src/capture.rs     cpal capture: device pick, sample-format conversion, queues,
+                   WASAPI loopback, PulseAudio monitors, Ctrl-C flag
+src/dsp.rs         resampler (arbitrary rate → 16 kHz), mix-down, framer,
+                   integer→f32 sample conversion (SampleConv)
+src/segmenter.rs   RMS-gated utterance chunking (used by --no-stream)
+src/vad.rs         Silero VAD gate via whisper.cpp (speech vs noise/music)
+src/transcribe.rs  whisper-rs wrapper; per-word timestamps (Seg/Word);
+                   Profile::Final (Phase-1 decode) vs Profile::Provisional
+                   (audio_ctx-capped single-pass preview decode)
+src/stream.rs      two-tier streaming engine: final tier (commit-once rule,
+                   line breaks, notes) + provisional live-edge preview tier
+                   (tail windows, revisable on stdout only); thread split;
+                   also the replay + latency benchmarks
+src/llm.rs         LLM backends: Ollama server/cloud and embedded llama.cpp
+                   worker (feature `llm`)
+src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
+src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
+llm-worker/        helper binary for the embedded LLM (separate ggml)
+vendor/            pinned whisper-rs-sys / llama-cpp-sys-2 sources
+bench/             score.py (WER/CER), run.sh, RESULTS.md, fixtures, song sweep
+scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
+                   windows}, termux-build.sh
+.github/workflows/ ci.yml (gates), termux.yml, release.yml
+PLAN.md            original design intent (partly diverged; this file wins)
+```
+
+## Build, test, run
+
+```bash
+# NixOS dev shell (cmake/libclang/alsa/pulse present)
+nix-shell --run 'cargo build --release'          # -> target/release/wheezper
+nix-shell --run 'cargo test  --release'          # 17 tests; +1 ignored benchmark
+nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
+
+# plain Linux with deps installed
+cargo test --release --workspace
+
+# portable Linux artifact (docker, glibc 2.35) / Windows cross-build
+nix-shell --run 'scripts/build-linux.sh'
+nix-shell --run 'scripts/build-windows.sh'
+```
+
+Fast iteration on the engine without hardware:
+
+```bash
+# file path (segmenter + beam search), scored against a reference
+MIN_ACCURACY=90 ./bench/run.sh bench/fixtures/jfk.f32 bench/fixtures/jfk.txt \
+    --model base --language en --no-vad
+
+# real capture through a virtual sink (loopback + dual labels)
+nix-shell -p pulseaudio python3 --run './scripts/vmtest-capture.sh'
+
+# live-latency benchmark (the Phase 2 acceptance test; WZ_ACCEPT gates
+# the 0.5 s median / 0.8 s p90 budget on the provisional tier)
+CHANNELS=2 MODEL=base WZ_ACCEPT=1 LATENCY_SECONDS=40 nix-shell --run \
+  'cargo test --release stream::tests::measures_commit_latency -- --ignored --nocapture'
+# provisional-tier sweeps (no rebuild needed): WZ_AUDIOCTX, WZ_MAXTOK,
+# WZ_WINDOW_S, WZ_MIN_WINDOW_S, WZ_NEW_AUDIO_S, WZ_HOLD_S, WZ_THREADS,
+# WZ_PROV_THREADS — they apply to the provisional tier only, by design
+```
+
+## Numbers (reference machine: 6-core desktop)
+
+Phase 1 single-tier (kept as the piped/`--no-stream`-free behaviour when
+stdout is not a TTY):
+
+| setup | median | p90 | pass cost |
+|---|---|---|---|
+| loopback, base, 1 ch | 2.60 s | 3.00 s | 1.80 s |
+| dual, base, 2 ch | 4.23 s | 5.13 s | 1.70 s |
+| loopback, small, 1 ch | 6.86 s | 7.70 s | 6.40 s |
+
+Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
+
+| tier | 1 ch | 2 ch | pass cost |
+|---|---|---|---|
+| provisional (on screen) | 0.22 s median / 0.46 s p90 | 0.22–0.33 s / 0.46–0.62 s | 0.10 s |
+| final (into notes) | 4.11 s median | 6.6–7.4 s | 3.1–3.3 s (2 threads) |
+
+Accuracy (word, `bench/RESULTS.md`): fixture 100 %; sung lyrics `base` 39–51 %,
+`small` 79–81 %, `turbo` 89–93 % (turbo is 3.8× slower than real time → batch
+only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
+
+## Traps — facts that are easy to get wrong
+
+- **whisper.cpp timestamps are centiseconds**, not milliseconds. `Seg`/`Word`
+  already divide by 100 (`src/transcribe.rs`); the old bug produced times 10×
+  too small.
+- Every `whisper_full` call is padded to a 30 s window: cost is ~fixed regardless
+  of the chunk length — unless `audio_ctx` caps the encoder (provisional tier
+  only). `audio_ctx` **silently truncates** audio beyond `N × 20 ms`.
+- **whisper's temperature-fallback ladder**: a "failed" first decode retries
+  at higher temperatures, and at temp > 0 greedy runs `best_of` decoders in
+  parallel — up to **21 decodes** per window. Short/fragmented windows score
+  low confidence and trigger it constantly (8.7 s median pass at
+  `audio_ctx=100` without the fix). The provisional tier sets
+  `temperature_inc=0`; the final tier keeps the ladder (it is real quality).
+- **Two ggml workers must not oversubscribe the box**: their spin barriers
+  convoy and double every pass time (4+4 threads on 6 cores → p90 > 1 s).
+  Always leave one core for the capture/main loop — see `split_threads`.
+- **Sweep knobs are provisional-only.** `WZ_*` timing knobs reaching the final
+  tier silently cripple notes quality (measured: 22 s final lag). The final
+  tier is frozen at Phase-1 tuning everywhere.
+- **The streaming buffer only holds *uncommitted* audio.** Every window starts
+  exactly at that tier's commit boundary (provisional windows start *within*
+  it, at the live edge); committed audio is dropped. Never reintroduce a
+  sliding window over committed audio (it silently loses words).
+- A word is committed **exactly once**, by timestamp, not by text matching —
+  true for both tiers; provisional words beyond the final boundary are shed
+  from the preview by the same rule as the final boundary advances.
+  Text-overlap anchors were tried and fail the moment the window start moves.
+- `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
+  conditioning; without it whisper loops on music (143 inserted words vs 6).
+  The explicit `initial_prompt` still applies.
+- Silero VAD is a **speech** gate: it deletes singing and quiet far-side audio.
+  Meetings: keep it on. Music: `--no-vad`.
+- Windows/WASAPI: an *output* device reports **zero** input configs
+  (`supported_input_configs()`), and shared-mode loopback only accepts the
+  device's **mix format** — hence the `default_output_config()` fallback in
+  `capture.rs`. cpal asks for the `eConsole` default role; Teams uses
+  `eCommunications`, so `--device-them` is often required.
+- PulseAudio: a sink and its monitor share a name; device ranking is
+  mode-aware (mic vs loopback) for that reason.
+- Model files: `turbo`/`medium` are `-q5_0` on HuggingFace, not `-q5_1`
+  (`-q5_1` 404s — fixed in `models.rs`).
+- The embedded LLM worker needs the `llm` feature and, in CI, the
+  `WHEEZPER_LLM_WORKER` env var; without it `build.rs` embeds an empty
+  placeholder and `--ollama` falls back to a server.
+
+## Conventions
+
+- Rust 2024, no new heavyweight dependencies without saying why in the PR/commit.
+- Errors: `anyhow` with actionable messages; user-facing chatter is prefixed
+  `wheezper: `. Never panic on runtime data (device lists, model output, files).
+- Comments explain *why* (the non-obvious constraint), not what the line does.
+- Logic goes next to the thing it belongs to, with a unit test when it is
+  testable without hardware/models; hardware paths get a script in `scripts/`
+  and a CI job.
+- Keep `main.rs` the orchestrator; new engines/sinks are modules with an
+  explicit interface.
+- Formatting/`clippy` clean-ish is expected; do not reformat unrelated code.
+
+## Do not break (CI gates)
+
+1. `cargo test --release --workspace` — includes the streaming replay test and
+   the DSP sample-format tests.
+2. Accuracy gate ≥ 90 % (`bench/run.sh` on `bench/fixtures/jfk.*`) on Linux and
+   Windows, on the **built** binary and on the **packaged** artifact.
+3. The Linux artifact must run from a scratch dir with only `libasound2`, no
+   nix-store RPATH, max glibc 2.35.
+4. The Windows zip must contain exactly `wheezper.exe`, import no
+   MSVC/VCRUNTIME DLLs, and pass `scripts/vmtest-windows.ps1` as a **standard,
+   non-admin user** from a user-writable dir (no installer, no PATH changes).
+5. `scripts/vmtest-capture.sh` must keep passing (real recording, loopback +
+   `me`/`them` labels).
+6. Termux: `cargo build --release --no-default-features` must keep working
+   (no llama.cpp, no Android NDK; `libaaudio` only exists on real devices).
+7. Notes format stays parseable: `- [HH:MM:SS] **label:** text`, one line per
+   utterance, flushed per line. Only **final-tier** text may reach the notes;
+   provisional preview text is stdout-only (TTY).
+8. Do not commit song audio or lyrics: `*.opus`, `*.lyrics`, `*.lyeics`,
+   `bench/out/` are gitignored and not redistributable.
+9. Phase 2 budget (manual, reference machine):
+   `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
+   must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s.
+
+## Open questions for the human
+
+- ~~Phase 2: is *replacing* already-shown words acceptable?~~ **Answered**:
+  the notepad stays append-only; only the stdout preview revises (TTY only).
+- ~~Phase 2: may a different streaming engine be added?~~ **Moot**: the
+  two-tier design hit the 0.5 s budget inside whisper.cpp; revisit only if
+  the provisional tier needs to get cheaper still (e.g. `tiny.en`).
+- Phase 3: does `1017` in `--with-agent="ollama-cloud:deepseek-v4.1-flash:1017"`
+  mean output-token budget (current assumption), or something else (port,
+  context size, rate limit)?
+- Phase 3: are annotations allowed to go to the notepad only, or also to stdout
+  (they interleave with live text and the Phase-2 preview line)?

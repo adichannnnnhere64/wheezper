@@ -79,31 +79,48 @@ output device as an input stream. On hosts without loopback, pipe via ffmpeg.
 
 ## Live latency (measured, not estimated)
 
+Live capture runs **two tiers per channel** (Phase 2):
+
+- a **provisional** tier decodes just the live edge (≤0.8 s windows, capped
+  encoder context, one greedy pass) and puts words on screen as a revisable
+  `▍` preview line — **~0.2–0.35 s** after they are spoken;
+- the **final** tier is the quality engine (8 s windows, full decode with the
+  temperature-fallback ladder): words commit exactly once, append-only, and
+  only this text reaches the notes file. It runs a few seconds behind — you
+  already read the words in the preview — so the notes stay clean.
+
+When stdout is piped (not a terminal) the preview tier is skipped entirely and
+wheezper behaves like the single-tier Phase-1 engine.
+
 `stream::tests::measures_commit_latency` feeds real audio in real time and
 stamps every committed word, so "word finished being spoken → word on screen"
-is measured end to end (6-core desktop, 4 whisper threads, models local):
+is measured end to end (6-core desktop, models local):
 
-| setup | median | p90 | max | one inference pass |
-|---|---|---|---|---|
-| `--source loopback`, `--model base` | **2.60 s** | 3.00 s | 3.29 s | 1.80 s |
-| `--source dual`, `--model base` (both sides talking) | **4.23 s** | 5.13 s | 6.16 s | 1.70 s |
-| `--source loopback`, `--model small` | **6.86 s** | 7.70 s | 7.72 s | 6.40 s |
+| setup | median | p90 | one pass |
+|---|---|---|---|
+| preview tier, `base`, 1 ch | **0.22 s** | 0.46 s | 0.10 s |
+| preview tier, `base`, dual (both sides talking) | **0.22–0.33 s** | 0.46–0.62 s | 0.10 s |
+| final tier (into notes), `base`, 1 ch | 4.11 s | 5.50 s | 3.1 s (2 threads) |
+| final tier (into notes), `base`, dual | 6.6–7.4 s | 7.6 s | 3.3 s |
+| Phase-1 single tier (piped stdout), `base`, 1 ch | 2.60 s | 3.00 s | 1.80 s (4 threads) |
+| Phase-1 single tier (piped stdout), `base`, dual | 4.23 s | 5.13 s | 1.70 s |
+| Phase-1 single tier (piped stdout), `small`, 1 ch | 6.86 s | 7.70 s | 6.40 s |
 
-Reproduce:
+Reproduce (add `WZ_ACCEPT=1` to gate the 0.5 s median / 0.8 s p90 budget on
+the preview tier):
 
 ```bash
-MODEL=base LATENCY_SECONDS=40 cargo test --release \
-  stream::tests::measures_commit_latency -- --ignored --nocapture
-CHANNELS=2 MODEL=base ...   # dual-channel worst case
+CHANNELS=2 MODEL=base WZ_ACCEPT=1 LATENCY_SECONDS=40 nix-shell --run \
+  'cargo test --release stream::tests::measures_commit_latency -- --ignored --nocapture'
 ```
 
-Reading it: latency ≈ 1.5 s (first window) + 0.5 s (unstable tail) + one
-inference pass. It only stays bounded while **one pass is faster than the audio
-it covers** — `base` has ~2× headroom on this box, `small` is at its limit
-(6.4 s per pass, ~7 s window), and `turbo` is 3.8× *slower* than real time, so it
-is a batch/file model, not a live one. On a slower laptop, watch the transcript:
-if text drifts further and further behind the speaker, drop to `base` or lower
-`--threads` so other apps still get CPU.
+Reading it: preview latency ≈ 0.1 s (hold) + one cheap pass + scheduling. The
+final tier only stays bounded while **one pass is faster than the audio it
+covers** — `base` has headroom on this box, `small` is at its limit
+(6.4 s per pass at 4 threads, ~7 s window), and `turbo` is 3.8× *slower* than
+real time, so it is a batch/file model, not a live one. On a slower laptop,
+watch the transcript: if text drifts further and further behind the speaker,
+drop to `base` or lower `--threads` so other apps still get CPU.
 
 For a meeting, `--source dual` also means the mic hears the speakers unless you
 use headphones — that transcribes the clients twice (once as `them`, once as
