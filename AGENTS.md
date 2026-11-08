@@ -321,6 +321,15 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   later end, so "Ask not!" was followed by "not …" (duplicates score as
   insertions). `leading_repeat` compares the pass's first words with the last
   four committed ones (punctuation-only tokens excluded).
+- **"Quiet" is two questions, not one.** A capture device can hand over audio in
+  lumps (a PulseAudio monitor on a busy runner delivers 1-2 s at a time), so
+  "no chunk for 1.5 s" says nothing about whether the speaker paused — that
+  made every pass look like an utterance end and wrote fragments ("not watch
+  your", "your country.") into the notes, which is exactly what CI kept
+  failing on while local runs were fine. `quiet()` (wall-clock, only trusted
+  when chunks are small) decides when to *dispatch* a pass; `speech_ended()`
+  (in audio time, from `last_speech_s`) decides whether the unstable tail may
+  be *committed*.
 - **The streaming tier does not use the continuity prompt** (`prompt_tail` is
   empty unless `WZ_PROMPT_WORDS=n`). A 12-word tail is text the decoder tries to
   *complete*: measured 2 words committed for 3 s of audio, plus invented

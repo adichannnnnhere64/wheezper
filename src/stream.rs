@@ -284,7 +284,14 @@ pub struct StreamChannel {
     line: String,
     unprocessed: usize,
     in_flight: bool,
+    /// Wall-clock time of the last chunk that carried speech energy.
     last_audio: Instant,
+    /// Consecutive chunks of >= 0.5 s: the device is batching its audio, which
+    /// makes wall-clock silence meaningless as a "did the speaker pause" signal.
+    big_chunks: u8,
+    /// Shutdown drain: no more audio will arrive, so the buffered tail is the
+    /// end of the utterance even if it has speech right up to the last sample.
+    draining: bool,
     closed: bool,
     /// Channel-timeline position (seconds) where the last committed word ended.
     last_commit_s: f64,
@@ -309,6 +316,8 @@ impl StreamChannel {
             unprocessed: 0,
             in_flight: false,
             last_audio: Instant::now(),
+            big_chunks: 0,
+            draining: false,
             closed: false,
             last_commit_s: 0.0,
             last_speech_s: 0.0,
@@ -323,6 +332,14 @@ impl StreamChannel {
         self.unprocessed += chunk.len();
         // silence from an idle monitor must not look like fresh speech: only
         // audible chunks count as activity (≈ -45 dBFS energy floor)
+        // three big chunks in a row = the device is delivering in lumps (a
+        // PulseAudio monitor on a busy box hands over 1-2 s at a time); one
+        // stray big chunk is just a startup or backlog flush
+        if chunk.len() as f32 / TARGET_RATE as f32 > 0.5 {
+            self.big_chunks = (self.big_chunks + 1).min(4);
+        } else {
+            self.big_chunks = 0;
+        }
         let energy = chunk.iter().map(|x| x * x).sum::<f32>() / chunk.len().max(1) as f32;
         if energy > SPEECH_ENERGY {
             self.last_audio = Instant::now();
@@ -347,8 +364,35 @@ impl StreamChannel {
         }
     }
 
+    /// End of the buffered audio, on the channel timeline.
+    fn audio_end_s(&self) -> f64 {
+        self.buf_start_s + self.buf.len() as f64 / TARGET_RATE as f64
+    }
+
+    /// No speech for `idle_after_s`, so the utterance *may* be over and a pass
+    /// should fire now instead of waiting for more audio. Wall-clock based —
+    /// but only when the device delivers audio in small chunks. A PulseAudio
+    /// monitor on a busy runner hands over ~1-2 s at a time, and then "no chunk
+    /// for 1.5 s" is a property of the delivery, not of the speech: every pass
+    /// looked like an utterance end, which commits the unstable tail without
+    /// right-context and wrote fragments ("not watch your", "your country.")
+    /// into the notes. `speech_ended` covers that case.
     fn quiet(&self) -> bool {
-        self.last_audio.elapsed() >= Duration::from_secs_f32(self.tuning.idle_after_s)
+        self.draining
+            || (self.big_chunks < 3
+                && self.last_audio.elapsed() >= Duration::from_secs_f32(self.tuning.idle_after_s))
+    }
+
+    /// Did the audio itself go quiet? Measured on the channel timeline, not by
+    /// wall-clock: a capture device hands its audio over in lumps (a PulseAudio
+    /// monitor on a busy runner delivers ~2 s at a time), so a delivery gap is
+    /// not a pause. Only this decides whether the unstable tail may be
+    /// committed without right-context — getting it wrong writes garbage
+    /// ("not watch your", "your country.") into the notes.
+    fn speech_ended(&self) -> bool {
+        self.quiet()
+            || self.draining
+            || self.audio_end_s() - self.last_speech_s >= self.tuning.idle_after_s as f64
     }
 
     /// Send the uncommitted window to the worker when there is enough new
@@ -391,10 +435,11 @@ impl StreamChannel {
     /// their audio, return the text appended to the line.
     pub fn on_result(&mut self, start_s: f64, dur_s: f32, segs: &[Seg]) -> CommitDelta {
         self.in_flight = false;
-        // on a quiet channel the window's tail IS the end of the utterance:
-        // no later pass will give it right-context, so commit it as-is
+        // when the audio itself ended, the window's tail IS the end of the
+        // utterance: no later pass will give it right-context, so commit it
+        let ended = self.speech_ended();
         let quiet = self.quiet();
-        let cutoff = (if quiet { dur_s } else { dur_s - self.tuning.hold_s }).max(0.0) as f64;
+        let cutoff = (if ended { dur_s } else { dur_s - self.tuning.hold_s }).max(0.0) as f64;
 
         // stable words of this pass, in order: (channel-time end, text)
         let mut cand: Vec<(f64, &str)> = Vec::new();
@@ -453,7 +498,7 @@ impl StreamChannel {
         // Retrying is bounded: a window whisper refuses to decode twice would
         // otherwise spin forever and the shutdown drain would never finish.
         if upto == start_s {
-            if quiet && self.last_speech_s <= start_s + 0.1 {
+            if ended && self.last_speech_s <= start_s + 0.1 {
                 upto = start_s + cutoff;
             } else if self.retries >= MAX_EMPTY_RETRIES {
                 upto = start_s + cutoff;
@@ -506,7 +551,7 @@ impl StreamChannel {
     /// Send the last uncommitted audio at shutdown (no new audio will come,
     /// so the caller should treat `on_result` as quiet).
     pub fn flush(&mut self) {
-        self.last_audio = Instant::now() - Duration::from_secs_f32(self.tuning.idle_after_s);
+        self.draining = true;
     }
 
     /// Drop buffered audio before channel-time `upto_s` (seconds). Used by
@@ -548,7 +593,7 @@ impl StreamChannel {
         if line.split_whitespace().count() >= LINE_FLUSH_WORDS {
             return true;
         }
-        self.last_audio.elapsed() > IDLE_FLUSH && !self.in_flight
+        self.speech_ended() && self.audio_end_s() - self.last_speech_s > IDLE_FLUSH.as_secs_f64() && !self.in_flight
     }
 
     /// Take the completed line, clearing state for the next one.
@@ -910,6 +955,29 @@ mod tests {
         assert!(!prov_commits.is_empty(), "no provisional words were committed");
     }
 
+    /// A device that hands over seconds of audio at a time must not look like
+    /// a speaker who stopped talking: wall-clock silence there is a property of
+    /// the delivery, and treating it as an utterance end commits whisper's
+    /// unstable tail without right-context.
+    #[test]
+    fn lumpy_delivery_is_not_an_utterance_end() {
+        let mut sc = StreamChannel::new(None, Tuning::final_default());
+        let speech = vec![0.1f32; TARGET_RATE as usize]; // 1 s of audible audio
+        let silence = vec![0.0f32; TARGET_RATE as usize]; // 1 s of digital silence
+        // smooth delivery: 100 chunks of 10 ms, so the device is not "lumpy"
+        for part in speech.chunks(160) {
+            sc.push_16k(part);
+        }
+        assert!(!sc.quiet(), "a channel that just received audio is not quiet");
+        assert!(!sc.speech_ended(), "speech is still arriving");
+        // then the device starts batching: three 1 s silent chunks
+        for _ in 0..3 {
+            sc.push_16k(&silence);
+        }
+        assert!(sc.speech_ended(), "1.5 s of silent audio means the speech ended");
+        assert!(!sc.quiet(), "but lumpy delivery must not fake a wall-clock pause");
+    }
+
     /// Replays a 16 kHz f32 file through the exact main-loop logic of
     /// `run_stream`, so stream-mode regressions are reproducible without
     /// audio hardware. Drives both tiers; asserts on *final* text (the
@@ -1072,7 +1140,11 @@ mod tests {
         // "8 runs in a row at 95%" only measures one lucky alignment.
         let offset_ms: usize = std::env::var("OFFSET_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let offset = vec![0.0f32; rate as usize * offset_ms / 1000];
-        let chunk = rate as usize / 100; // 10 ms, like a cpal callback
+        // LUMP_MS delivers the audio the way a loaded PulseAudio monitor does
+        // (a second or two per callback) instead of 10 ms at a time. The engine
+        // must behave the same both ways; CI only ever sees the lumpy case.
+        let lump_ms: usize = std::env::var("LUMP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let chunk = if lump_ms > 0 { rate as usize * lump_ms / 1000 } else { rate as usize / 100 };
         let started = Instant::now();
         let mut fed_samples = 0usize;
         sc.push_16k(feed.resample(&offset));
