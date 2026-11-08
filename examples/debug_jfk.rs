@@ -2,7 +2,7 @@
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 fn main() -> anyhow::Result<()> {
-    let bytes = std::fs::read("test/jfk.f32")?;
+    let bytes = std::fs::read("bench/fixtures/jfk.f32")?;
     let samples: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
