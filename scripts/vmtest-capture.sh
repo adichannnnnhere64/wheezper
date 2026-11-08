@@ -107,6 +107,11 @@ show_diagnostics() {
 [ -s "$notes" ] || { show_diagnostics; fail "nothing was recorded to $notes"; }
 grep -q '^\s*-\s' "$notes" || { show_diagnostics; fail "notepad has no transcript lines"; }
 sed -n '1,8p' "$notes"
+# the pass trace (WZ_STREAM_DEBUG) is what makes a short transcript explainable
+if [ -n "${WZ_STREAM_DEBUG:-}" ]; then
+  echo "--- pass trace ---"
+  grep -E '^pass |^decode ' "$log" | head -40 || true
+fi
 grep -qi 'ask not' "$notes" || { show_diagnostics; fail "no 'ask not' in the live transcript"; }
 grep -qi 'country' "$notes" || { show_diagnostics; fail "no 'country' in the live transcript"; }
 python3 bench/score.py "$ref3" "$notes" --min-accuracy "$min_accuracy" \
