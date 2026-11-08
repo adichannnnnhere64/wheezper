@@ -100,8 +100,8 @@ app=""
 show_diagnostics() {
   # the transcript alone does not say *why* it is short: the engine's stderr
   # says whether it fell behind, dropped audio or never got a window
-  echo "--- wheezper log (tail) ---" >&2
-  tail -30 "$log" >&2 || true
+  echo "--- wheezper log ---" >&2
+  cat "$log" >&2 || true
 }
 
 [ -s "$notes" ] || { show_diagnostics; fail "nothing was recorded to $notes"; }

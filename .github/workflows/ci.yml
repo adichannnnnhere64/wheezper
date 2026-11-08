@@ -356,8 +356,10 @@ jobs:
           ./shipped/wheezper --version
       - name: Record through a virtual device and transcribe it
         run: |
+          # WZ_STREAM_DEBUG: on failure the script dumps the engine log, which
+          # then shows every pass (window, held-back tail, committed text)
           WHEEZPER=./shipped/wheezper MODEL=base MIN_ACCURACY=80 \
-            ./scripts/vmtest-capture.sh
+            WZ_STREAM_DEBUG=1 ./scripts/vmtest-capture.sh
 
   # ---------------------------------------------------------------------------
   # Optional: the song/lyric benchmark (bench/RESULTS.md)
