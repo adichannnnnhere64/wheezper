@@ -11,6 +11,13 @@ build = "build.rs"
 [workspace]
 members = ["llm-worker"]
 
+[features]
+default = ["llm"]
+# Built-in llama.cpp summarizer/polish (embedded wheezper-llm helper). Turn it
+# off for Termux/Android or a much smaller binary: `--ollama <server>` keeps
+# working, only the bundled model runner goes away.
+llm = ["dep:llama-cpp-2"]
+
 [dependencies]
 whisper-rs = "0.16"
 clap = { version = "4", features = ["derive", "env"] }
@@ -20,7 +27,7 @@ cpal = { version = "0.18", features = ["pulseaudio"] }
 ctrlc = { version = "3", features = ["termination"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "1.2.1"
-llama-cpp-2 = "0.1.161"
+llama-cpp-2 = { version = "0.1.161", optional = true }
 
 # vendored to pin whisper.cpp and force /MT (static CRT) on Windows so the
 # exe runs with zero redistributable installs

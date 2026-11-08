@@ -15,6 +15,40 @@ pub fn mix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
     }
 }
 
+/// Device sample formats we can consume: whisper wants f32, but plenty of
+/// devices (and every null/monitor sink) only offer integer formats, so they
+/// are converted to f32 inside the audio callback.
+pub trait SampleConv: Copy {
+    fn to_f32(self) -> f32;
+}
+
+impl SampleConv for f32 {
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+impl SampleConv for i16 {
+    fn to_f32(self) -> f32 {
+        self as f32 / 32768.0
+    }
+}
+impl SampleConv for i32 {
+    fn to_f32(self) -> f32 {
+        self as f32 / 2_147_483_648.0
+    }
+}
+impl SampleConv for u16 {
+    fn to_f32(self) -> f32 {
+        (self as f32 - 32768.0) / 32768.0
+    }
+}
+
+/// Convert any supported interleaved device format to mono f32.
+pub fn to_mono<T: SampleConv>(samples: &[T], channels: usize) -> Vec<f32> {
+    let converted: Vec<f32> = samples.iter().map(|s| s.to_f32()).collect();
+    mix_to_mono(&converted, channels)
+}
+
 /// Incremental linear resampler (mono, arbitrary in/out rates).
 ///
 /// Emits output samples at fractional positions between input samples,
@@ -106,6 +140,20 @@ mod tests {
         let stereo = [0.0, 1.0, 0.5, -0.5, 1.0, 1.0];
         assert_eq!(mix_to_mono(&stereo, 2), vec![0.5, 0.0, 1.0]);
         assert_eq!(mix_to_mono(&stereo[..3], 1), stereo[..3].to_vec());
+    }
+
+    #[test]
+    fn integer_formats_convert_to_f32() {
+        let i16s = [0i16, 16384, -32768];
+        assert_eq!(to_mono(&i16s, 1), vec![0.0, 0.5, -1.0]);
+        let stereo = [0i16, 16384i16];
+        assert_eq!(to_mono(&stereo, 2), vec![0.25]);
+        let u16s = [32768u16, 65535u16];
+        let u = to_mono(&u16s, 1);
+        assert!((u[0] - 0.0).abs() < 1e-6);
+        assert!((u[1] - 1.0).abs() < 1e-3); // 32767/32768
+        let i32s = [0i32, 1_073_741_824];
+        assert_eq!(to_mono(&i32s, 1), vec![0.0, 0.5]);
     }
 
     #[test]

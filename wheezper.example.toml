@@ -26,3 +26,16 @@ ollama-model = "gemma3:1b"  # Google's gemma3 (default) | .gguf path
 # min-segment = 0.5
 # max-segment = 25
 # threads = 6               # 0 = all
+
+# --- Teams / Zoom call: both sides, labelled me/them ------------------------
+# Teams follows the Windows *communications* default devices, wheezper follows
+# the *console* ones, so on a laptop with a headset they are often different.
+# Name both explicitly (substrings from `wheezper --list-devices`):
+#   device_me   = "Microphone Array"   # a capture device: your voice
+#   device_them = "Headphones"         # an OUTPUT device: Teams' audio, captured
+#                                      # via WASAPI loopback / a PulseAudio monitor
+# Use headphones, otherwise the mic also hears the far side and every remote
+# sentence is transcribed twice (once as "them", once as "me").
+# threads = 3   # leave a core for Teams; --model base keeps up, small is tighter
+# no_vad = false  # keep the speech gate on for meetings (blocks typing/room noise)
+

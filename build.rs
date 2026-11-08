@@ -18,6 +18,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WHEEZPER_LLM_WORKER");
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("wheezper-llm.bin");
+    // `--no-default-features` drops the built-in LLM entirely: never embed.
+    if env::var_os("CARGO_FEATURE_LLM").is_none() {
+        std::fs::write(&dest, b"").unwrap();
+        return;
+    }
     match env::var("WHEEZPER_LLM_WORKER") {
         Ok(src) if Path::new(&src).exists() => {
             let bytes = std::fs::read(&src)

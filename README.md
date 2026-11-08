@@ -77,6 +77,38 @@ Loopback notes: on Linux it captures the default sink's PulseAudio monitor
 source (works under PipeWire). On Windows, WASAPI loopback opens the default
 output device as an input stream. On hosts without loopback, pipe via ffmpeg.
 
+## Live latency (measured, not estimated)
+
+`stream::tests::measures_commit_latency` feeds real audio in real time and
+stamps every committed word, so "word finished being spoken → word on screen"
+is measured end to end (6-core desktop, 4 whisper threads, models local):
+
+| setup | median | p90 | max | one inference pass |
+|---|---|---|---|---|
+| `--source loopback`, `--model base` | **2.60 s** | 3.00 s | 3.29 s | 1.80 s |
+| `--source dual`, `--model base` (both sides talking) | **4.23 s** | 5.13 s | 6.16 s | 1.70 s |
+| `--source loopback`, `--model small` | **6.86 s** | 7.70 s | 7.72 s | 6.40 s |
+
+Reproduce:
+
+```bash
+MODEL=base LATENCY_SECONDS=40 cargo test --release \
+  stream::tests::measures_commit_latency -- --ignored --nocapture
+CHANNELS=2 MODEL=base ...   # dual-channel worst case
+```
+
+Reading it: latency ≈ 1.5 s (first window) + 0.5 s (unstable tail) + one
+inference pass. It only stays bounded while **one pass is faster than the audio
+it covers** — `base` has ~2× headroom on this box, `small` is at its limit
+(6.4 s per pass, ~7 s window), and `turbo` is 3.8× *slower* than real time, so it
+is a batch/file model, not a live one. On a slower laptop, watch the transcript:
+if text drifts further and further behind the speaker, drop to `base` or lower
+`--threads` so other apps still get CPU.
+
+For a meeting, `--source dual` also means the mic hears the speakers unless you
+use headphones — that transcribes the clients twice (once as `them`, once as
+`me`).
+
 ## Songs and lyrics
 
 Speech-tuned defaults fight music: the Silero VAD gate classifies singing as
@@ -142,10 +174,101 @@ cargo build --release        # -> wheezper.exe, no installer, no extra DLLs
 # or cross-build the Windows exe from Linux
 nix-shell --run 'scripts/build-windows.sh'
 
-# Termux
+# Termux / Android (no llama.cpp: that needs the Android NDK)
 pkg install rust binutils cmake clang
-cargo build --release
+cargo build --release --no-default-features
+
+# anywhere, if you do not want the embedded LLM (≈4 MB smaller binary; a
+# --ollama <server> still works, only the bundled model runner goes away)
+cargo build --release --no-default-features
 ```
+
+## CI / CD: tested artifacts only
+
+`.github/workflows/ci.yml` builds, tests and then tests *the packaged artifact*
+again, on Linux and on real Windows VMs. `.github/workflows/release.yml` calls
+that workflow and publishes only what passed, with SHA256 checksums.
+
+What every run gates on:
+
+| gate | where | fails the build when |
+|---|---|---|
+| unit tests | Linux + Windows | `cargo test --release --workspace` fails (incl. the streaming replay test) |
+| accuracy gate | Linux + Windows | the built binary scores < 90% word accuracy on `bench/fixtures/jfk.f32` |
+| Linux artifact | fresh Ubuntu 22.04 *and* 24.04 VMs | the tarball, unpacked in a scratch dir, does not run or score 90% (no compilers, no `target/` — only `libasound2`, the documented runtime dep) |
+| Linux **capture** | fresh Ubuntu 22.04 *and* 24.04 VMs | the shipped binary cannot *record*: a PulseAudio null sink + `paplay` feed real audio into the monitor source, the transcript must match (≥70%) and a `--source dual` run must produce both `me` and `them` lines |
+| Windows artifact | fresh `windows-2022` and `windows-2025` VMs, as a **standard user** | the zip needs admin rights, DLLs, an installer, PATH changes, or fails to transcribe |
+| song benchmark (optional) | Ubuntu, when `BENCH_FIXTURES_URL` is set | pure-ASR < 85% or lyric-sync < 95% word accuracy (`bench/RESULTS.md`) |
+
+### The Windows VM test
+
+GitHub-hosted `windows-*` runners are Hyper-V VMs booted per job, so the job
+only ever sees the uploaded zip. It then:
+
+1. creates a local **standard user** (`New-LocalUser`, not in Administrators),
+2. unpacks the zip into `C:\Users\Public\wheezper-vmtest` (user-writable,
+   nothing installed, PATH untouched),
+3. launches `scripts/vmtest-windows.ps1` **as that user**
+   (`Start-Process -Credential` → `CreateProcessWithLogonW`: own token, own
+   `%APPDATA%`, no admin group membership),
+4. which asserts it is unelevated, runs `--version`/`--help`, enumerates audio
+   devices on a deviceless VM, downloads the whisper model into `%APPDATA%`,
+   converts the committed WAV to the f32le stdin stream and transcribes it,
+   checks the transcript words, checks nothing was written to `Program Files`
+   or `ProgramData`, then repeats with the cached model.
+
+The same script runs in Windows Sandbox or any Hyper-V/VMware VM:
+
+```powershell
+# as a standard user, next to wheezper.exe
+powershell -ExecutionPolicy Bypass -File scripts\vmtest-windows.ps1 -Wav jfk.wav
+```
+
+Linux equivalent (also usable locally):
+
+```bash
+MODEL=base MIN_ACCURACY=90 scripts/vmtest-linux.sh wheezper-linux-amd64.tar.gz
+```
+
+### What "records" means here
+
+`scripts/vmtest-capture.sh` is not a mock: it loads `module-null-sink` on a real
+PulseAudio server, plays the fixture into it in real time, and lets the shipped
+binary open the sink's **monitor source** through cpal — the same path a call or
+video takes (capture callbacks → resampler → streaming engine → notepad). It
+then runs the app again in `--source dual` and asserts both channels are
+labelled. Locally:
+
+```bash
+MODEL=base MIN_ACCURACY=70 scripts/vmtest-capture.sh
+```
+
+This gate already paid for itself: it caught that capture hard-required an
+`f32` device format (many monitors only offer `i16`) and that a sink and its
+monitor share a name, so `--device <sink>` picked the un-capturable sink.
+
+### Android / Termux
+
+`.github/workflows/termux.yml` builds inside the official
+`termux/termux-docker` userspace (weekly, on tags, and on demand) and runs
+`scripts/termux-build.sh`: `pkg install rust binutils cmake clang`, build with
+`--no-default-features`, then transcribe the fixture through the binary. It is
+deliberately **not** part of the release gate — the userspace has no Android
+system libraries (`libaaudio` is stubbed there, audio capture needs a real
+device), so it is a signal about Android support rather than a desktop release
+blocker.
+
+### Releasing
+
+```bash
+# version in Cargo.toml must match the tag (checked by the workflow)
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The release job publishes `wheezper-linux-amd64.tar.gz`,
+`wheezper-windows-x64.zip` and `SHA256SUMS` — the *same* artifacts the VM tests
+ran against. `workflow_dispatch` on `release.yml` runs the full validation
+without publishing, for a dry run.
 
 ## Config file
 

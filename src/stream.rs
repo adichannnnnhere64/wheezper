@@ -116,6 +116,8 @@ pub struct StreamChannel {
     in_flight: bool,
     last_audio: Instant,
     closed: bool,
+    /// Channel-timeline position (seconds) where the last committed word ended.
+    last_commit_s: f64,
 }
 
 impl StreamChannel {
@@ -131,6 +133,7 @@ impl StreamChannel {
             in_flight: false,
             last_audio: Instant::now(),
             closed: false,
+            last_commit_s: 0.0,
         }
     }
 
@@ -218,6 +221,9 @@ impl StreamChannel {
         if upto == start_s && (quiet || self.buf.len() >= (WINDOW_S * TARGET_RATE as f32) as usize) {
             upto = start_s + cutoff;
         }
+        if !delta.is_empty() {
+            self.last_commit_s = upto;
+        }
         self.drop_committed(upto);
         delta
     }
@@ -291,20 +297,145 @@ impl StreamChannel {
     pub fn busy(&self) -> bool {
         self.in_flight
     }
+
+    /// End of the audio covered by the words committed so far (seconds on the
+    /// channel timeline). Used by the latency benchmark and diagnostics.
+    pub fn last_commit_s(&self) -> f64 {
+        self.last_commit_s
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn load_f32(path: &str) -> Vec<f32> {
-        let bytes = std::fs::read(path).expect("audio file");
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect()
+    /// 16 kHz mono f32 speech used by the replay test. Committed under
+    /// bench/fixtures so `cargo test` works in a clean checkout (CI).
+    fn load_f32() -> Option<Vec<f32>> {
+        let bytes = std::fs::read("bench/fixtures/jfk.f32").ok()?;
+        Some(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+        )
+    }
+
+    /// Measures live caption latency: word-end -> committed-to-line, end to
+    /// end, with audio fed in real time (what a live meeting looks like).
+    ///
+    ///   MODEL=base LATENCY_SECONDS=40 cargo test --release \
+    ///     stream::tests::measures_commit_latency -- --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark: needs the model + fixture, runs in real time"]
+    fn measures_commit_latency() {
+        let Some(jfk) = load_f32() else {
+            eprintln!("skipping: bench/fixtures/jfk.f32 missing");
+            return;
+        };
+        let model_name = std::env::var("MODEL").unwrap_or_else(|_| "base".into());
+        let seconds: f32 = std::env::var("LATENCY_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+
+        // CHANNELS=2 models --source dual (mic + loopback): both channels share
+        // one inference worker, so they compete for it pass by pass.
+        let n_chans: usize = std::env::var("CHANNELS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let model = crate::models::resolve(Some(&model_name)).expect("model");
+        let threads = 4;
+        let (tx, rx) = spawn_worker(&model, "en", threads, false).expect("worker");
+        let mut chans: Vec<StreamChannel> = (0..n_chans)
+            .map(|_| StreamChannel::new(Some("them"), TARGET_RATE))
+            .collect();
+
+        let mut audio: Vec<f32> = Vec::new();
+        while (audio.len() as f32 / TARGET_RATE as f32) < seconds {
+            audio.extend_from_slice(&jfk);
+        }
+
+        let chunk = TARGET_RATE as usize / 10; // 100 ms, like a cpal callback
+        let feed_start = Instant::now();
+        let mut commits: Vec<(f64, f64)> = Vec::new(); // (audio position, latency)
+        let mut passes: Vec<f64> = Vec::new();
+        let mut sent_at: Option<Instant> = None;
+        let mut i = 0;
+        while i < audio.len() {
+            let end = (i + chunk).min(audio.len());
+            for sc in chans.iter_mut() {
+                sc.push(&audio[i..end]);
+            }
+            i = end;
+
+            while let Ok(res) = rx.try_recv() {
+                if let Some(t) = sent_at.take() {
+                    passes.push(t.elapsed().as_secs_f64());
+                }
+                let now = Instant::now();
+                let Some(sc) = chans.get_mut(res.chan) else { continue };
+                let delta = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                if !delta.trim().is_empty() {
+                    let committed = sc.last_commit_s();
+                    // that audio was handed to the channel at feed_start + committed
+                    let latency = now.duration_since(feed_start).as_secs_f64() - committed;
+                    commits.push((committed, latency));
+                    eprintln!("t=+{:6.2}s commit={:6.2}s latency={:5.2}s  {}", i as f32 / TARGET_RATE as f32, committed, latency, delta.trim());
+                }
+            }
+            for (idx, sc) in chans.iter_mut().enumerate() {
+                let prompt = sc.prompt_tail();
+                sc.maybe_send(idx, &tx, &prompt);
+                if sc.busy() && sent_at.is_none() {
+                    sent_at = Some(Instant::now());
+                }
+                if sc.line_ready()
+                    && let Some(line) = sc.take_line()
+                {
+                    eprintln!("LINE: {line}");
+                }
+            }
+
+            let fed = i as f32 / TARGET_RATE as f32;
+            let spent = feed_start.elapsed().as_secs_f32();
+            if fed > spent {
+                std::thread::sleep(Duration::from_secs_f32(fed - spent));
+            }
+        }
+
+        let mut lat: Vec<f64> = commits.iter().map(|(_, l)| *l).collect();
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |p: f64| -> f64 {
+            if lat.is_empty() { f64::NAN } else { lat[((lat.len() - 1) as f64 * p) as usize] }
+        };
+        let mut pass_sorted = passes.clone();
+        pass_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "\nMODEL={model_name} threads={threads} channels={n_chans} audio={:.1}s commits={} passes={}",
+            audio.len() as f32 / TARGET_RATE as f32,
+            commits.len(),
+            passes.len()
+        );
+        eprintln!(
+            "latency (word end -> on screen): min={:.2}s median={:.2}s p90={:.2}s max={:.2}s",
+            lat.first().copied().unwrap_or(f64::NAN),
+            pct(0.5),
+            pct(0.9),
+            lat.last().copied().unwrap_or(f64::NAN)
+        );
+        if commits.len() >= 6 {
+            eprintln!(
+                "drift: first 3 avg={:.2}s, last 3 avg={:.2}s",
+                commits[..3].iter().map(|c| c.1).sum::<f64>() / 3.0,
+                commits[commits.len() - 3..].iter().map(|c| c.1).sum::<f64>() / 3.0
+            );
+        }
+        eprintln!(
+            "inference pass: median={:.2}s max={:.2}s ({} passes, {:.2}s wall/audio-second)",
+            pass_sorted.get(pass_sorted.len() / 2).copied().unwrap_or(f64::NAN),
+            pass_sorted.last().copied().unwrap_or(f64::NAN),
+            passes.len(),
+            feed_start.elapsed().as_secs_f64() / (audio.len() as f64 / TARGET_RATE as f64)
+        );
+        assert!(!commits.is_empty(), "no words were committed");
     }
 
     /// Replays a 16 kHz f32 file through the exact main-loop logic of
@@ -312,8 +443,11 @@ mod tests {
     /// audio hardware.
     #[test]
     fn replays_audio_through_stream_loop() {
+        let Some(audio) = load_f32() else {
+            eprintln!("skipping: bench/fixtures/jfk.f32 missing");
+            return;
+        };
         let model = crate::models::resolve(Some("base")).expect("model");
-        let audio = load_f32("test/jfk.f32");
         let (tx, rx) = spawn_worker(&model, "en", 4, true).expect("worker");
         let mut sc = StreamChannel::new(Some("them"), TARGET_RATE);
 

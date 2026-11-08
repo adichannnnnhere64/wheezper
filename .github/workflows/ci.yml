@@ -1,0 +1,431 @@
+name: ci
+
+# Build, test and *validate the shipped artifact* on Linux and on real Windows
+# VMs. `release.yml` calls this workflow, so nothing is ever published that has
+# not passed every gate below.
+#
+# Gates
+#   1. unit tests (cargo test, incl. the streaming replay test)
+#   2. accuracy gate: the shipped binary must transcribe the speech fixture at
+#      >= 90% word accuracy (bench/score.py)
+#   3. artifact VM tests: unpack the *packaged* artifact in a fresh VM and run
+#      it from a scratch directory — Linux as a plain user, Windows as a
+#      standard (non-admin) account with no installer and no PATH changes
+#   4. optional song/lyric benchmark (see the last job)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # portable builds: never emit -march=native for whisper.cpp/ggml
+  GGML_NATIVE: "OFF"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux: build, unit tests, accuracy gate, package
+  # ---------------------------------------------------------------------------
+  linux-package:
+    name: linux / build + tests + accuracy gate
+    runs-on: ubuntu-22.04 # glibc 2.35 baseline, see scripts/build-linux.sh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build clang libclang-dev pkg-config \
+            libasound2-dev binutils
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'vendor/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/wheezper
+          key: whisper-models-base
+      - name: Unit tests
+        run: cargo test --release --workspace
+      - name: Build (LLM worker embedded)
+        run: |
+          set -euo pipefail
+          cargo build --release -p llm-worker
+          WHEEZPER_LLM_WORKER="$PWD/target/release/wheezper-llm" cargo build --release
+      - name: Accuracy gate (speech fixture, >= 90% word accuracy)
+        run: |
+          MIN_ACCURACY=90 ./bench/run.sh bench/fixtures/jfk.f32 bench/fixtures/jfk.txt \
+            --model base --language en --no-vad
+      - name: Portability checks
+        run: |
+          set -euo pipefail
+          BIN=target/release/wheezper
+          readelf -l "$BIN" | grep -q 'interpreter: /lib64/ld-linux-x86-64.so.2' \
+            || { echo "unexpected ELF interpreter:"; readelf -l "$BIN" | grep -i interpreter; exit 1; }
+          if readelf -d "$BIN" | grep -q '/nix/store'; then
+            echo "ERROR: nix-store path leaked into the binary"; exit 1
+          fi
+          MAX_GLIBC=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1 | sed 's/GLIBC_//')
+          echo "max required glibc: ${MAX_GLIBC:-none}"
+          if [ -n "$MAX_GLIBC" ] && [ "$(printf '2.35\n%s\n' "$MAX_GLIBC" | sort -V | tail -1)" != "2.35" ]; then
+            echo "ERROR: glibc baseline $MAX_GLIBC exceeds the 2.35 target"; exit 1
+          fi
+          echo "runtime deps (DT_NEEDED):"; readelf -d "$BIN" | grep NEEDED
+      - name: Embedded LLM worker
+        run: |
+          set -euo pipefail
+          size=$(stat -c%s target/release/wheezper)
+          echo "binary size: $size bytes"
+          # ~6 MB without the worker, ~10 MB with llama.cpp embedded
+          if [ "$size" -lt 8000000 ]; then
+            echo "ERROR: the LLM worker is not embedded (single-file promise broken)"; exit 1
+          fi
+      - name: Package + checksum
+        run: |
+          tar czf wheezper-linux-amd64.tar.gz -C target/release wheezper
+          sha256sum wheezper-linux-amd64.tar.gz > wheezper-linux-amd64.tar.gz.sha256
+          cat wheezper-linux-amd64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-linux-amd64
+          path: |
+            wheezper-linux-amd64.tar.gz
+            wheezper-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Linux: the packaged artifact on a clean VM (no build tree, no compilers)
+  # ---------------------------------------------------------------------------
+  linux-artifact-vm:
+    name: linux artifact / clean VM (${{ matrix.os }})
+    needs: linux-package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheezper-linux-amd64
+      - name: Verify artifact checksum
+        run: sha256sum -c wheezper-linux-amd64.tar.gz.sha256
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/wheezper
+          key: whisper-models-base
+      - name: Documented runtime dependency only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 \
+            || sudo apt-get install -y --no-install-recommends libasound2
+      - name: Run the shipped binary from a scratch directory
+        run: MODEL=base MIN_ACCURACY=90 ./scripts/vmtest-linux.sh wheezper-linux-amd64.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # Windows: build, unit tests, package
+  # ---------------------------------------------------------------------------
+  windows-package:
+    name: windows / build + tests + package
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: "-C target-feature=+crt-static"
+      LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
+      LLAMA_STATIC_CRT: "1" # llama.cpp /MT, matches the static CRT link
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'vendor/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~\AppData\Roaming\wheezper
+          key: whisper-models-base-win
+      - name: Unit tests
+        run: cargo test --release --workspace
+      - name: Build (LLM worker embedded)
+        run: |
+          cargo build --release -p llm-worker
+          $env:WHEEZPER_LLM_WORKER = "$pwd\target\release\wheezper-llm.exe"
+          cargo build --release
+      - name: Accuracy gate (speech fixture, >= 90% word accuracy)
+        shell: bash
+        env:
+          PYTHON: python
+        run: |
+          MIN_ACCURACY=90 ./bench/run.sh bench/fixtures/jfk.f32 bench/fixtures/jfk.txt \
+            --model base --language en --no-vad
+      - name: No redistributable DLLs
+        shell: pwsh
+        run: |
+          $imports = & dumpbin /dependents target\release\wheezper.exe | Select-String "DLL"
+          $imports | ForEach-Object { Write-Host $_ }
+          $bad = $imports | Where-Object { $_ -match "VCRUNTIME|MSVCP140|api-ms-win-crt" }
+          if ($bad) { Write-Error "dynamic CRT import found: $bad"; exit 1 }
+      - name: Package + checksum
+        shell: pwsh
+        run: |
+          Compress-Archive target\release\wheezper.exe wheezper-windows-x64.zip -Force
+          $hash = (Get-FileHash wheezper-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  wheezper-windows-x64.zip" | Set-Content -Encoding ascii wheezper-windows-x64.zip.sha256
+          Get-Content wheezper-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-windows-x64
+          path: |
+            wheezper-windows-x64.zip
+            wheezper-windows-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Windows: the packaged zip in a real, fresh Windows VM, as a STANDARD USER
+  #
+  # GitHub-hosted `windows-*` runners are Hyper-V VMs booted per job, so this
+  # job only ever sees the artifact: a user-writable folder, no installer, no
+  # PATH changes, no administrator rights. scripts/vmtest-windows.ps1 asserts
+  # the token is not elevated, renders speech with SAPI, and transcribes it.
+  # ---------------------------------------------------------------------------
+  windows-artifact-vm:
+    name: windows artifact / real VM, standard user (${{ matrix.os }})
+    needs: windows-package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheezper-windows-x64
+          path: dist
+      - name: Verify artifact checksum
+        shell: pwsh
+        run: |
+          $line = Get-Content dist\wheezper-windows-x64.zip.sha256 -Raw
+          $expected = $line.Trim().Split(' ')[0]
+          $actual = (Get-FileHash dist\wheezper-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          Write-Host "expected $expected"
+          Write-Host "actual   $actual"
+          if ($expected -ne $actual) { throw "artifact checksum mismatch" }
+      - name: Create an unprivileged account, unpack the zip, run the test as that user
+        shell: pwsh
+        env:
+          RUNNER_IMAGE: ${{ matrix.os }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # secondary-logon must be available for CreateProcessWithLogonW
+          Start-Service seclogon -ErrorAction SilentlyContinue
+          (Get-Service seclogon).Status
+
+          # a normal Windows machine has the audio stack running; the runner
+          # image has it stopped, which would make device enumeration fail for
+          # reasons that have nothing to do with wheezper
+          foreach ($svc in 'AudioEndpointBuilder', 'Audiosrv') {
+            Set-Service $svc -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service $svc -ErrorAction SilentlyContinue
+            "{0}: {1}" -f $svc, (Get-Service $svc).Status
+          }
+
+          $user    = 'wztest'
+          $pwPlain = 'Wz!' + [guid]::NewGuid().ToString('N').Substring(0, 20) + '9a'
+          $pw      = ConvertTo-SecureString $pwPlain -AsPlainText -Force
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $user }
+          New-LocalUser -Name $user -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Write-Host "created standard user: $user"
+
+          # a directory a standard user can write to; nothing is installed
+          $dir = Join-Path $env:PUBLIC 'wheezper-vmtest'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Expand-Archive dist\wheezper-windows-x64.zip -DestinationPath $dir -Force
+
+          # the release promise is a single portable file: no DLLs, no data dirs
+          $shipped = @(Get-ChildItem $dir -File -Recurse)
+          $shipped | Format-Table Name, Length
+          if ($shipped.Count -ne 1 -or $shipped[0].Name -ne 'wheezper.exe') {
+            throw "zip must contain exactly wheezper.exe, got: $($shipped.Name -join ', ')"
+          }
+
+          $testScript = Join-Path $dir 'vmtest-windows.ps1'
+          $fixture    = Join-Path $dir 'jfk.wav'
+          Copy-Item scripts\vmtest-windows.ps1 $testScript -Force
+          Copy-Item bench\fixtures\jfk.wav $fixture -Force
+          icacls "$dir" /grant "Users:(OI)(CI)M" /T | Out-Null
+
+          Write-Host "==> artifact contents"; Get-ChildItem $dir | Format-Table Name, Length
+
+          $log      = Join-Path $env:TEMP 'vmtest.log'
+          $errLog   = Join-Path $env:TEMP 'vmtest.err.log'
+          $work     = Join-Path $dir 'work'
+          $cred     = New-Object System.Management.Automation.PSCredential($user, $pw)
+          $ps       = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+          $argLine  = "-NoProfile -ExecutionPolicy Bypass -File `"$testScript`" " +
+                      "-Exe `"$(Join-Path $dir 'wheezper.exe')`" -Wav `"$fixture`" " +
+                      "-WorkDir `"$work`" -Model base"
+
+          # -Credential => CreateProcessWithLogonW: a real logon of the standard
+          # user (own token, own %APPDATA%, no administrator group membership)
+          $start = {
+            param($Profile)
+            Start-Process -FilePath $ps -ArgumentList $argLine -Credential $cred `
+              -LoadUserProfile:$Profile -WorkingDirectory $dir `
+              -RedirectStandardOutput $log -RedirectStandardError $errLog `
+              -PassThru -Wait
+          }
+          try {
+            $p = & $start $true
+          } catch {
+            Write-Warning "CreateProcessWithLogonW with a loaded profile failed ($_); retrying with the default profile"
+            $p = & $start $false
+          }
+
+          Write-Host "`n===== test output ====="
+          Get-Content $log -ErrorAction SilentlyContinue
+          Write-Host "`n===== test stderr ====="
+          Get-Content $errLog -ErrorAction SilentlyContinue
+
+          if ($p.ExitCode -ne 0) { throw "the unprivileged VM test failed (exit $($p.ExitCode))" }
+          if (-not (Select-String -Path $log -Pattern '^PASS: ' -Quiet)) {
+            throw "test did not report PASS"
+          }
+          Write-Host "`nPASS: shipped zip works on $env:RUNNER_IMAGE as a standard user" -ForegroundColor Green
+
+  # ---------------------------------------------------------------------------
+  # Linux: does it actually RECORD? A virtual output device is created with
+  # PulseAudio, the speech fixture is played into it in real time, and the
+  # shipped binary transcribes the sink's monitor source — the same code path a
+  # call or a video takes (cpal stream -> resample -> streaming transcribe ->
+  # notepad). Then a --source dual run checks both channels and their labels.
+  # ---------------------------------------------------------------------------
+  linux-capture-vm:
+    name: linux capture / record + transcribe (${{ matrix.os }})
+    needs: linux-package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheezper-linux-amd64
+      - name: Verify artifact checksum
+        run: sha256sum -c wheezper-linux-amd64.tar.gz.sha256
+      - name: Audio stack (virtual device + playback)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pulseaudio pulseaudio-utils libpulse0 python3
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/wheezper
+          key: whisper-models-base
+      - name: Unpack the shipped binary
+        run: |
+          mkdir -p shipped
+          tar -C shipped -xzf wheezper-linux-amd64.tar.gz
+          ./shipped/wheezper --version
+      - name: Record through a virtual device and transcribe it
+        run: |
+          WHEEZPER=./shipped/wheezper MODEL=base MIN_ACCURACY=70 \
+            ./scripts/vmtest-capture.sh
+
+  # ---------------------------------------------------------------------------
+  # Optional: the song/lyric benchmark (bench/RESULTS.md)
+  #
+  # Set the repository variable BENCH_FIXTURES_URL to a tar.gz containing
+  #   <name>.opus + <name>.lyrics      (one pair per song; lyrics = reference)
+  # and this job runs the accuracy ladder on real music. Unset => skipped.
+  # ---------------------------------------------------------------------------
+  song-benchmark:
+    name: song lyric benchmark
+    if: vars.BENCH_FIXTURES_URL != ''
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build clang libclang-dev pkg-config \
+            libasound2-dev ffmpeg
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'vendor/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/wheezper
+          key: whisper-models-turbo # ~574 MB, cached across runs
+      - name: Fetch benchmark fixtures
+        run: |
+          set -euo pipefail
+          mkdir -p bench/data
+          curl -fsSL "${{ vars.BENCH_FIXTURES_URL }}" | tar xz -C bench/data
+          ls -la bench/data
+      - name: Build (LLM worker embedded)
+        run: |
+          set -euo pipefail
+          cargo build --release -p llm-worker
+          WHEEZPER_LLM_WORKER="$PWD/target/release/wheezper-llm" cargo build --release
+      - name: Music benchmark (pure ASR >= 85%, lyric sync >= 95%)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          status=0
+          for song in bench/data/*.opus; do
+            name=$(basename "$song" .opus)
+            lyrics="bench/data/$name.lyrics"
+            [ -f "$lyrics" ] || { echo "no reference for $song"; continue; }
+            echo "================ $name"
+            echo "--- pure ASR (turbo, no VAD, long segments)"
+            WZ_NOCTX=1 MIN_ACCURACY=85 TAG=$name ./bench/run.sh "$song" "$lyrics" \
+              --model turbo --language en --no-vad --max-segment 25 --threads 4 || status=1
+            echo "--- known-song lyric sync"
+            WZ_NOCTX=1 MIN_ACCURACY=95 TAG=$name.sync ./bench/run.sh "$song" "$lyrics" \
+              --model turbo --language en --no-vad --max-segment 40 --threads 4 \
+              --lyrics "$lyrics" --lyric-sync || status=1
+          done
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: song-benchmark
+          path: bench/out/*.md
+          if-no-files-found: warn
+          retention-days: 14

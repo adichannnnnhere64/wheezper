@@ -2,7 +2,7 @@
 """Score a wheezper transcript against reference lyrics (word-level WER).
 
 Usage:
-  python3 bench/score.py REFERENCE_LYRICS TRANSCRIPT [--show N]
+  python3 bench/score.py REFERENCE_LYRICS TRANSCRIPT [--show N] [--min-accuracy PCT]
 
 Prints substitutions/deletions/insertions, WER and accuracy
 (accuracy = 1 - (S+D+I)/N over the normalized reference word count).
@@ -90,6 +90,9 @@ def levenshtein_counts(ref: list[str], hyp: list[str]):
 
 
 def main() -> int:
+    min_acc = 0.0
+    if "--min-accuracy" in sys.argv:
+        min_acc = float(sys.argv[sys.argv.index("--min-accuracy") + 1]) / 100.0
     if len(sys.argv) < 3:
         print(__doc__)
         return 2
@@ -131,6 +134,11 @@ def main() -> int:
         print("--- mismatches ---")
         for _, line in ops[:show]:
             print(" ", line)
+    if min_acc > 0.0:
+        if acc < min_acc:
+            print(f"GATE FAILED: accuracy {acc*100:.2f}% < required {min_acc*100:.2f}%")
+            return 1
+        print(f"GATE OK: accuracy {acc*100:.2f}% >= required {min_acc*100:.2f}%")
     return 0
 
 

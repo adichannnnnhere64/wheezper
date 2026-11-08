@@ -41,6 +41,7 @@ pub fn resolve_vad() -> Result<PathBuf> {
 }
 
 /// Built-in LLM models (GGUF, run via hardwired llama.cpp — no Ollama needed).
+#[cfg(feature = "llm")]
 pub struct LlmModelSpec {
     pub name: &'static str,
     pub file: &'static str,
@@ -48,6 +49,7 @@ pub struct LlmModelSpec {
     pub approx_mb: u64,
 }
 
+#[cfg(feature = "llm")]
 pub const LLM_MODELS: &[LlmModelSpec] = &[LlmModelSpec {
     name: "gemma3-1b",
     file: "gemma-3-1b-it-Q4_K_M.gguf",
@@ -58,6 +60,7 @@ pub const LLM_MODELS: &[LlmModelSpec] = &[LlmModelSpec {
 /// Resolve a built-in LLM model name/path into a local GGUF, downloading on
 /// first use. Accepts an existing path, a known name (gemma3-1b), or an
 /// Ollama-style tag (gemma3:1b -> gemma3-1b).
+#[cfg(feature = "llm")]
 pub fn resolve_llm(arg: Option<&str>) -> Result<PathBuf> {
     let raw = arg.unwrap_or("gemma3-1b");
     let arg = raw.replace(':', "-");

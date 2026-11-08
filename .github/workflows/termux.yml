@@ -1,0 +1,41 @@
+name: termux
+
+# Android/Termux build + smoke test. Kept out of the release gate on purpose:
+# the Termux userspace is a heavy, network-dependent environment (Android
+# system libraries are stubbed inside the container), so a red run here is a
+# signal about Android support, not a reason to hold back a desktop release.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: termux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  termux:
+    name: android/termux build + transcribe
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and smoke-test inside the official Termux userspace
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/scripts/termux-build.sh:/build.sh:ro" \
+            termux/termux-docker:x86_64 bash /build.sh
+      - name: Notes
+        if: always()
+        run: |
+          echo "Termux: build with --no-default-features (no llama.cpp: it needs"
+          echo "the Android NDK). libaaudio is stubbed in the userspace container"
+          echo "because it only exists on real Android >= 8 devices; the app runs"
+          echo "and transcribes via stdin there. Capture (AAudio) needs a device."

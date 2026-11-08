@@ -11,10 +11,17 @@
 //! Both implement the same [`Llm`] interface (summary + polish) and are
 //! never fatal: on failure the raw transcript stays untouched.
 
+#[cfg(feature = "llm")]
 use crate::models;
 use anyhow::{anyhow, Context, Result};
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(feature = "llm")]
+use std::io::{BufRead, BufReader};
+use std::io::Read;
+#[cfg(feature = "llm")]
+use std::io::Write;
+#[cfg(feature = "llm")]
 use std::path::PathBuf;
+#[cfg(feature = "llm")]
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
@@ -24,6 +31,7 @@ use std::time::Duration;
 
 pub enum Llm {
     Server(Ollama),
+    #[cfg(feature = "llm")]
     Builtin(Builtin),
 }
 
@@ -31,6 +39,7 @@ impl Llm {
     pub fn describe(&self) -> String {
         match self {
             Llm::Server(o) => format!("{} @ {}", o.model, o.url),
+            #[cfg(feature = "llm")]
             Llm::Builtin(b) => format!("{} (built-in llama.cpp)", b.model_name),
         }
     }
@@ -38,6 +47,7 @@ impl Llm {
     pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
         match self {
             Llm::Server(o) => o.generate(system, prompt, max_tokens),
+            #[cfg(feature = "llm")]
             Llm::Builtin(b) => b.generate(system, prompt, max_tokens),
         }
     }
@@ -166,146 +176,6 @@ impl Ollama {
     }
 }
 
-// ---------------------------------------------------------------------------
-// built-in backend: llama.cpp in an embedded helper process
-// ---------------------------------------------------------------------------
-
-pub struct Builtin {
-    model_name: String,
-    model_path: PathBuf,
-    threads: i32,
-    worker: std::cell::RefCell<Worker>,
-}
-
-impl Builtin {
-    /// `name_or_path`: a known model name (gemma3-1b), an Ollama-style tag
-    /// (gemma3:1b), or a path to an existing .gguf. The model is downloaded
-    /// on first use; the worker process is embedded in wheezper.exe.
-    pub fn new(name_or_path: &str, threads: i32) -> Result<Self> {
-        let model_path = models::resolve_llm(Some(name_or_path))
-            .with_context(|| format!("resolving built-in LLM model '{name_or_path}'"))?;
-        let mut worker = Worker::spawn()?;
-        worker.warm_up(&model_path, threads)?; // load the model once, fail early
-        Ok(Self { model_name: name_or_path.to_string(), model_path, threads, worker: std::cell::RefCell::new(worker) })
-    }
-
-    pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
-        let req = format!(
-            "{{\"model\":{}, \"system\":{}, \"prompt\":{}, \"max_tokens\":{}, \"threads\":{}}}",
-            json_str(&self.model_path.display().to_string()),
-            json_str(system),
-            json_str(prompt),
-            max_tokens,
-            self.threads,
-        );
-        self.worker.borrow_mut().request(&req)
-    }
-}
-
-/// A running `wheezper-llm` helper: JSON lines in, JSON lines out.
-struct Worker {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl Worker {
-    fn spawn() -> Result<Self> {
-        let path = worker_binary_path()?;
-        let mut child = Command::new(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("spawning {}", path.display()))?;
-        let stdin = child.stdin.take().context("worker stdin")?;
-        let stdout = BufReader::new(child.stdout.take().context("worker stdout")?);
-        Ok(Self { child, stdin, stdout })
-    }
-
-    /// Send one request line, read one response line.
-    fn request(&mut self, req_json: &str) -> Result<String> {
-        writeln!(self.stdin, "{req_json}").context("writing to LLM worker")?;
-        self.stdin.flush().ok();
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .context("reading from LLM worker")?;
-        if line.trim().is_empty() {
-            return Err(anyhow!("LLM worker closed unexpectedly"));
-        }
-        let text = extract_json_string(line.trim(), "text")
-            .ok_or_else(|| anyhow!("bad LLM worker response: {}", line.chars().take(200).collect::<String>()))?;
-        if let Some(err) = extract_json_string(line.trim(), "error") {
-            return Err(anyhow!("LLM worker: {err}"));
-        }
-        Ok(text)
-    }
-
-    /// Load the model (empty prompt probe) so failures surface at startup.
-    fn warm_up(&mut self, model_path: &std::path::Path, threads: i32) -> Result<()> {
-        let req = format!(
-            "{{\"model\":{}, \"system\":\"\", \"prompt\":\"\", \"max_tokens\":1, \"threads\":{}}}",
-            json_str(&model_path.display().to_string()),
-            threads,
-        );
-        self.request(&req)?;
-        Ok(())
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Where to find the wheezper-llm worker binary:
-/// 1. $WHEEZPER_LLM_WORKER (dev builds)
-/// 2. next to the wheezper executable (same target dir / same zip)
-/// 3. embedded copy, extracted once into the model cache dir
-fn worker_binary_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("WHEEZPER_LLM_WORKER")
-        && PathBuf::from(&p).exists()
-    {
-        return Ok(PathBuf::from(p));
-    }
-
-    let exe = std::env::current_exe().context("locating wheezper executable")?;
-    let exe_dir = exe.parent().context("executable has no parent dir")?.to_path_buf();
-    let sibling = if cfg!(windows) { "wheezper-llm.exe" } else { "wheezper-llm" };
-    let sibling_path = exe_dir.join(sibling);
-    if sibling_path.exists() {
-        return Ok(sibling_path);
-    }
-
-    // embedded copy (build.rs puts it in OUT_DIR; empty when not provided)
-    const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wheezper-llm.bin"));
-    if EMBEDDED.is_empty() {
-        return Err(anyhow!(
-            "wheezper-llm worker not found (not embedded, not next to {}). \
-             Use an Ollama server instead: --ollama http://<server>:11434",
-            exe_dir.display()
-        ));
-    }
-    let dir = models::cache_dir()?.join("bin");
-    std::fs::create_dir_all(&dir).ok();
-    let dest = dir.join(sibling);
-    if !dest.exists() || std::fs::metadata(&dest).map(|m| m.len() as usize).ok() != Some(EMBEDDED.len()) {
-        std::fs::write(&dest, EMBEDDED).with_context(|| format!("extracting {}", dest.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).ok();
-        }
-    }
-    Ok(dest)
-}
-
-// ---------------------------------------------------------------------------
-
 /// Minimal JSON string value extractor for flat JSON responses
 /// (no serde dependency needed for this).
 fn extract_json_string(body: &str, key: &str) -> Option<String> {
@@ -344,6 +214,156 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(feature = "llm")]
+#[allow(unused_imports)]
+pub use builtin::Builtin;
+
+#[cfg(feature = "llm")]
+mod builtin {
+    use super::*;
+
+    // ---------------------------------------------------------------------------
+    // built-in backend: llama.cpp in an embedded helper process
+    // ---------------------------------------------------------------------------
+
+    pub struct Builtin {
+        pub model_name: String,
+        model_path: PathBuf,
+        threads: i32,
+        worker: std::cell::RefCell<Worker>,
+    }
+
+    impl Builtin {
+        /// `name_or_path`: a known model name (gemma3-1b), an Ollama-style tag
+        /// (gemma3:1b), or a path to an existing .gguf. The model is downloaded
+        /// on first use; the worker process is embedded in wheezper.exe.
+        pub fn new(name_or_path: &str, threads: i32) -> Result<Self> {
+            let model_path = models::resolve_llm(Some(name_or_path))
+                .with_context(|| format!("resolving built-in LLM model '{name_or_path}'"))?;
+            let mut worker = Worker::spawn()?;
+            worker.warm_up(&model_path, threads)?; // load the model once, fail early
+            Ok(Self { model_name: name_or_path.to_string(), model_path, threads, worker: std::cell::RefCell::new(worker) })
+        }
+
+        pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
+            let req = format!(
+                "{{\"model\":{}, \"system\":{}, \"prompt\":{}, \"max_tokens\":{}, \"threads\":{}}}",
+                json_str(&self.model_path.display().to_string()),
+                json_str(system),
+                json_str(prompt),
+                max_tokens,
+                self.threads,
+            );
+            self.worker.borrow_mut().request(&req)
+        }
+    }
+
+    /// A running `wheezper-llm` helper: JSON lines in, JSON lines out.
+    struct Worker {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl Worker {
+        fn spawn() -> Result<Self> {
+            let path = worker_binary_path()?;
+            let mut child = Command::new(&path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .with_context(|| format!("spawning {}", path.display()))?;
+            let stdin = child.stdin.take().context("worker stdin")?;
+            let stdout = BufReader::new(child.stdout.take().context("worker stdout")?);
+            Ok(Self { child, stdin, stdout })
+        }
+
+        /// Send one request line, read one response line.
+        fn request(&mut self, req_json: &str) -> Result<String> {
+            writeln!(self.stdin, "{req_json}").context("writing to LLM worker")?;
+            self.stdin.flush().ok();
+            let mut line = String::new();
+            self.stdout
+                .read_line(&mut line)
+                .context("reading from LLM worker")?;
+            if line.trim().is_empty() {
+                return Err(anyhow!("LLM worker closed unexpectedly"));
+            }
+            let text = extract_json_string(line.trim(), "text")
+                .ok_or_else(|| anyhow!("bad LLM worker response: {}", line.chars().take(200).collect::<String>()))?;
+            if let Some(err) = extract_json_string(line.trim(), "error") {
+                return Err(anyhow!("LLM worker: {err}"));
+            }
+            Ok(text)
+        }
+
+        /// Load the model (empty prompt probe) so failures surface at startup.
+        fn warm_up(&mut self, model_path: &std::path::Path, threads: i32) -> Result<()> {
+            let req = format!(
+                "{{\"model\":{}, \"system\":\"\", \"prompt\":\"\", \"max_tokens\":1, \"threads\":{}}}",
+                json_str(&model_path.display().to_string()),
+                threads,
+            );
+            self.request(&req)?;
+            Ok(())
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.stdin.flush();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Where to find the wheezper-llm worker binary:
+    /// 1. $WHEEZPER_LLM_WORKER (dev builds)
+    /// 2. next to the wheezper executable (same target dir / same zip)
+    /// 3. embedded copy, extracted once into the model cache dir
+    fn worker_binary_path() -> Result<PathBuf> {
+        if let Ok(p) = std::env::var("WHEEZPER_LLM_WORKER")
+            && PathBuf::from(&p).exists()
+        {
+            return Ok(PathBuf::from(p));
+        }
+
+        let exe = std::env::current_exe().context("locating wheezper executable")?;
+        let exe_dir = exe.parent().context("executable has no parent dir")?.to_path_buf();
+        let sibling = if cfg!(windows) { "wheezper-llm.exe" } else { "wheezper-llm" };
+        let sibling_path = exe_dir.join(sibling);
+        if sibling_path.exists() {
+            return Ok(sibling_path);
+        }
+
+        // embedded copy (build.rs puts it in OUT_DIR; empty when not provided)
+        const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wheezper-llm.bin"));
+        if EMBEDDED.is_empty() {
+            return Err(anyhow!(
+                "wheezper-llm worker not found (not embedded, not next to {}). \
+                 Use an Ollama server instead: --ollama http://<server>:11434",
+                exe_dir.display()
+            ));
+        }
+        let dir = models::cache_dir()?.join("bin");
+        std::fs::create_dir_all(&dir).ok();
+        let dest = dir.join(sibling);
+        if !dest.exists() || std::fs::metadata(&dest).map(|m| m.len() as usize).ok() != Some(EMBEDDED.len()) {
+            std::fs::write(&dest, EMBEDDED).with_context(|| format!("extracting {}", dest.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).ok();
+            }
+        }
+        Ok(dest)
+    }
+
+    // ---------------------------------------------------------------------------
+
 }
 
 #[cfg(test)]

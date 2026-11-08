@@ -297,13 +297,24 @@ impl Engine {
                 }
                 Err(e) => {
                     // no server: hardwired llama.cpp, model auto-downloads
-                    eprintln!("wheezper: no Ollama server ({e}); using built-in llama.cpp");
-                    match llm::Builtin::new(&cli.ollama_model, threads) {
-                        Ok(b) => Some(llm::Llm::Builtin(b)),
-                        Err(e2) => {
-                            eprintln!("wheezper: warning: built-in LLM unavailable: {e2:#}");
-                            None
+                    #[cfg(feature = "llm")]
+                    {
+                        eprintln!("wheezper: no Ollama server ({e}); using built-in llama.cpp");
+                        match llm::Builtin::new(&cli.ollama_model, threads) {
+                            Ok(b) => Some(llm::Llm::Builtin(b)),
+                            Err(e2) => {
+                                eprintln!("wheezper: warning: built-in LLM unavailable: {e2:#}");
+                                None
+                            }
                         }
+                    }
+                    #[cfg(not(feature = "llm"))]
+                    {
+                        eprintln!(
+                            "wheezper: no Ollama server ({e}) and this build has no built-in \
+                             LLM (compiled with --no-default-features); continuing without it"
+                        );
+                        None
                     }
                 }
             }
