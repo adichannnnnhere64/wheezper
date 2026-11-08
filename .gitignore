@@ -13,3 +13,6 @@ bench/out/
 *.opus
 *.lyrics
 *.lyeics
+
+# a locally placed/patched binary is a build artifact, never commit it
+/wheezper
