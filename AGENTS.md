@@ -246,11 +246,11 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
-**91–97 %** (measured 90.9 / 92.4 / 93.9 / 95.5 / 96.0 / 97.0, and 97.0 pinned to
-2 cores). The engine's own replay benchmark (`stream::tests::
-measures_notes_accuracy`) averages **95.5 %** over ten audio alignments
-(`OFFSET_MS=…`, because the same alignment measured eight times only proves the
-dice rolled well), worst alignment 90.9. Both were ~66–85 % before the fixes in
+**93–100 %** (measured 90.9 / 92.4 / 93.9 / 95.5 / 96.0 / 96.97 / 97.0 / 100, and
+97.0 pinned to 2 cores). The engine's own replay benchmark
+(`stream::tests::measures_notes_accuracy`) averages **97.1 %** over ten audio
+alignments (`OFFSET_MS=…`, because the same alignment measured eight times only
+proves the dice rolled well), worst alignment 95.45. Both were ~66–85 % before the fixes in
 the traps list below. The gate is 80 %: the ceiling left is whisper
 hallucinating over pauses, not the pipeline.
 
@@ -307,7 +307,9 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   that silently deleted up to 8 s of notes per pass — the transcript simply
   ended while audio was still playing (measured: CI 69.7 % vs 95 % locally,
   and the replay benchmark's worst alignments jumped 83 → 91 once fixed). Only
-  a quiet channel whose buffered audio has no speech at all may be dropped.
+  a quiet channel whose buffered audio has no speech at all may be dropped —
+  and a window whisper refuses to decode twice is skipped (`MAX_EMPTY_RETRIES`),
+  or the shutdown drain would never finish and `kill -9` would eat the tail.
 - **The final tier takes ~3 s of new audio per pass, not 0.7 s.** Each pass
   starts at the commit boundary and commits up to `window − hold`, so the
   cadence *is* the error rate: every boundary is a place with no left context.

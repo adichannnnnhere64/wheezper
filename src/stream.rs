@@ -42,6 +42,10 @@ const LINE_FLUSH_WORDS: usize = 24;
 const DUP_SLACK_S: f64 = 0.6;
 /// How many trailing committed words the dedupe compares against.
 const DUP_TAIL_WORDS: usize = 4;
+/// How many times an empty decode of the same window is retried before the
+/// engine skips ahead (a decode that keeps returning nothing must not stall
+/// the shutdown drain forever).
+const MAX_EMPTY_RETRIES: u32 = 2;
 /// A committed word may end at most this far past the last audio that
 /// actually carried speech energy (whisper invents words on silence — the
 /// shutdown drain of an idle channel used to append "you you you").
@@ -290,6 +294,8 @@ pub struct StreamChannel {
     committed_tail: Vec<String>,
     /// The "falling behind" warning is printed once per channel.
     warned_drop: bool,
+    /// Consecutive passes that committed nothing for the same window start.
+    retries: u32,
 }
 
 impl StreamChannel {
@@ -308,6 +314,7 @@ impl StreamChannel {
             last_speech_s: 0.0,
             committed_tail: Vec::new(),
             warned_drop: false,
+            retries: 0,
         }
     }
 
@@ -443,8 +450,24 @@ impl StreamChannel {
         // no speech at all may be dropped — an empty decode of speech must be
         // retried, not thrown away (on a slow runner this silently deleted up
         // to 8 s of notes per pass; the transcript ended while audio played on).
-        if upto == start_s && quiet && self.last_speech_s <= start_s + 0.1 {
-            upto = start_s + cutoff;
+        // Retrying is bounded: a window whisper refuses to decode twice would
+        // otherwise spin forever and the shutdown drain would never finish.
+        if upto == start_s {
+            if quiet && self.last_speech_s <= start_s + 0.1 {
+                upto = start_s + cutoff;
+            } else if self.retries >= MAX_EMPTY_RETRIES {
+                upto = start_s + cutoff;
+                if !self.warned_drop {
+                    self.warned_drop = true;
+                    eprintln!(
+                        "wheezper: stream: whisper returned nothing for a window twice — skipping ahead (audio at {start_s:.1}s)"
+                    );
+                }
+            } else {
+                self.retries += 1;
+            }
+        } else {
+            self.retries = 0;
         }
         if !delta.text.is_empty() {
             self.last_commit_s = upto;

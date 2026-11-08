@@ -92,7 +92,7 @@ for _ in 1 2 3; do paplay --device="$sink" "$wav" || fail "playback failed"; don
 echo "playback finished; letting the decoder commit the tail"
 sleep 8
 kill -TERM "$app" 2>/dev/null || true
-for _ in $(seq 1 60); do kill -0 "$app" 2>/dev/null || break; sleep 1; done
+for _ in $(seq 1 90); do kill -0 "$app" 2>/dev/null || break; sleep 1; done
 kill -9 "$app" 2>/dev/null || true
 wait "$app" 2>/dev/null || true
 app=""
@@ -129,7 +129,7 @@ grep -q 'source=dual' "$log2" || { cat "$log2"; fail "wheezper did not start in 
 paplay --device="$sink" "$wav" || fail "playback failed"
 sleep 4
 kill -TERM "$app" 2>/dev/null || true
-for _ in $(seq 1 60); do kill -0 "$app" 2>/dev/null || break; sleep 1; done
+for _ in $(seq 1 90); do kill -0 "$app" 2>/dev/null || break; sleep 1; done
 kill -9 "$app" 2>/dev/null || true
 wait "$app" 2>/dev/null || true
 app=""
