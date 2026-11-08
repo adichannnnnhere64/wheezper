@@ -54,7 +54,8 @@ channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
   mel, temperature-fallback ladder, rolling decode context, continuity
   prompt. Words commit exactly once by timestamp, append-only. **The notes are
   built only from this tier.** Its lag (~4 s single / ~7 s dual) is invisible:
-  the preview already showed the words.
+  the preview already showed the words. Cadence, dedupe and the silence rule
+  matter for accuracy — see the traps below.
 - **Provisional tier** = live-edge preview: tail windows ≤ 0.8 s
   (`audio_ctx=40`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
   `max_tokens=6`, no prompt or rolling context. Passes cost ~0.10 s; words
@@ -69,6 +70,17 @@ Acceptance (gated, run it after touching the streaming engine):
 ```bash
 CHANNELS=2 MODEL=base WZ_ACCEPT=1 LATENCY_SECONDS=40 nix-shell --run \
   'cargo test --release stream::tests::measures_commit_latency -- --ignored --nocapture'
+```
+
+Notes accuracy (gated at 85 % by `scripts/vmtest-capture.sh`, which records
+real audio through a virtual sink):
+
+```bash
+nix-shell -p pulseaudio python3 --run \
+  'MODEL=base MIN_ACCURACY=85 ./scripts/vmtest-capture.sh'
+# no audio server needed: the final tier replayed in real time, scored inline
+THREADS=4 nix-shell --run \
+  'cargo test --release stream::tests::measures_notes_accuracy -- --ignored --nocapture'
 ```
 
 **What made it work** (all measured; the naive configs are instructive):
@@ -230,7 +242,14 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 | tier | 1 ch | 2 ch | pass cost |
 |---|---|---|---|
 | provisional (on screen) | 0.22 s median / 0.46 s p90 | 0.22–0.33 s / 0.46–0.62 s | 0.10 s |
-| final (into notes) | 4.11 s median | 6.6–7.4 s | 3.1–3.3 s (2 threads) |
+| final (into notes) | 4.1 s median | 7.3 s median / 8.5 s p90 | 3.1–3.5 s (2 threads) |
+
+Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
+fixture through a virtual sink, notes scored against the tripled reference):
+**91–97 %** (measured 90.9 / 92.4 / 93.9 / 97.0 on 6 cores and pinned to 2
+cores). The engine's own replay benchmark
+(`stream::tests::measures_notes_accuracy`) sits at a stable **95.5 %**. Both
+were ~66–85 % before the fixes in the Phase-2 notes below.
 
 Accuracy (word, `bench/RESULTS.md`): fixture 100 %; sung lyrics `base` 39–51 %,
 `small` 79–81 %, `turbo` 89–93 % (turbo is 3.8× slower than real time → batch
@@ -269,6 +288,27 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   stop used to mean its leftover audio was never transcribed, so on a box that
   could not keep up (2-core CI runners) the notes silently lost the tail. Do
   not go back to a single drain pass.
+- **Drain the capture queue every main-loop iteration** (`AudioReceiver::
+  try_pop`). Popping one chunk per 25 ms step caps throughput at `chunk/step`;
+  a 16 kHz monitor delivers ~10 ms chunks, so the pipeline fell ~1.5× behind
+  real time and the whole tail was decoded during the shutdown drain, where
+  there is no right-context to commit with. This was the single largest
+  accuracy bug in live capture (capture 72 % vs the same audio through the
+  file path, 100 %).
+- **Never commit past the last chunk that carried speech energy**
+  (`last_speech_s` + 0.4 s). On padding silence whisper keeps decoding; the
+  drain of an idle channel used to append "you you you you" to the notes.
+- **The final tier takes ~3 s of new audio per pass, not 0.7 s.** Each pass
+  starts at the commit boundary and commits up to `window − hold`, so the
+  cadence *is* the error rate: every boundary is a place with no left context.
+  Measured on the replayed fixture: 0.7 s cadence → 71–91 % (mean 82),
+  3.0 s → 95.45 % on eight consecutive runs. Lag grows to ~7 s dual, still
+  invisible behind the preview.
+- **A word must not be committed twice when the boundary falls inside it.**
+  whisper re-decodes the word straddling the boundary and returns it with a
+  later end, so "Ask not!" was followed by "not …" (duplicates score as
+  insertions). `leading_repeat` compares the pass's first words with the last
+  four committed ones (punctuation-only tokens excluded).
 - `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
   conditioning; without it whisper loops on music (143 inserted words vs 6).
   The explicit `initial_prompt` still applies.

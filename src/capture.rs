@@ -477,6 +477,25 @@ impl AudioReceiver {
         }
     }
 
+    /// Pop whatever is queued right now, without waiting. A capture device
+    /// delivers several small chunks between main-loop iterations; popping
+    /// one per iteration caps throughput at `chunk / step` and silently builds
+    /// a backlog (measured: a 16 kHz monitor stream lagging ~1.5x real time,
+    /// so the notes' tail was decoded during the shutdown drain with no
+    /// right-context — the one place the engine commits unstable words).
+    pub fn try_pop(&self) -> Pop {
+        let (lock, _cv) = &*self.state;
+        let mut st = lock.lock().unwrap();
+        match st.chunks.pop_front() {
+            Some(chunk) => {
+                st.samples -= chunk.len();
+                Pop::Data(chunk)
+            }
+            None if st.closed => Pop::Closed,
+            None => Pop::Timeout,
+        }
+    }
+
     pub fn dropped_chunks(&self) -> u64 {
         self.state.0.lock().unwrap().dropped_chunks
     }

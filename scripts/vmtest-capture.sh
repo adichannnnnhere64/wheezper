@@ -10,7 +10,7 @@
 # receive audio and are labelled me/them.
 #
 # Needs: a running PulseAudio/PipeWire server with pactl + paplay, python3.
-# Env: MODEL (default base), MIN_ACCURACY (default 70), WHEEZPER (binary path).
+# Env: MODEL (default base), MIN_ACCURACY (default 85), WHEEZPER (binary path).
 # The gate is looser than the file-path gate (90%) on purpose: this exercises
 # the *streaming* engine from a cold start, which trades accuracy for latency.
 set -euo pipefail
@@ -28,7 +28,7 @@ else
   exit 2
 fi
 model="${MODEL:-base}"
-min_accuracy="${MIN_ACCURACY:-70}"
+min_accuracy="${MIN_ACCURACY:-85}"
 wav="bench/fixtures/jfk.wav"
 reference="bench/fixtures/jfk.txt"
 out="bench/out"
@@ -47,7 +47,7 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo; echo "=== $*"; }
 
-# The streaming engine commits words in ~1.5 s windows, so a single 11 s clip
+# The streaming engine commits in ~3 s of audio per pass, so a single 11 s clip
 # only exercises its cold start. Play the fixture three times back to back and
 # score against the tripled reference: that is the regime it is built for.
 ref3="$out/jfk-3x.txt"

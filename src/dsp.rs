@@ -206,4 +206,32 @@ mod tests {
         assert_eq!(f.finish().unwrap(), vec![9.0, 0.0, 0.0, 0.0]);
         assert!(f.finish().is_none());
     }
+
+    /// Benchmark helper: resample a raw f32le file with the streaming
+    /// resampler (IN, OUT, FROM, TO env vars), so the audio-quality impact of
+    /// `Resampler` can be scored with bench/run.sh.
+    #[test]
+    #[ignore = "benchmark helper: needs IN/OUT env vars"]
+    fn resample_file() {
+        let inp = std::env::var("IN").expect("IN");
+        let outp = std::env::var("OUT").expect("OUT");
+        let from: u32 = std::env::var("FROM").expect("FROM").parse().expect("FROM");
+        let to: u32 = std::env::var("TO").expect("TO").parse().expect("TO");
+        let bytes = std::fs::read(&inp).expect("read IN");
+        let samples: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let mut r = Resampler::new(from, to);
+        let mut out = Vec::new();
+        r.push_slice(&samples, &mut out);
+        let mut bytes = Vec::with_capacity(out.len() * 4);
+        for s in &out {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&outp, bytes).expect("write OUT");
+        eprintln!("resampled {} -> {} samples", samples.len(), out.len());
+    }
 }

@@ -36,8 +36,18 @@ use std::time::{Duration, Instant};
 
 /// Flush a line after this many words even without punctuation.
 const LINE_FLUSH_WORDS: usize = 24;
-/// Channel is considered quiet after this much silence.
-const IDLE_AFTER: Duration = Duration::from_millis(700);
+/// How far past the commit boundary a word may end and still count as the
+/// same word the previous pass already committed (whisper re-decodes the word
+/// straddling the boundary, so it comes back with a slightly later end).
+const DUP_SLACK_S: f64 = 0.6;
+/// How many trailing committed words the dedupe compares against.
+const DUP_TAIL_WORDS: usize = 4;
+/// A committed word may end at most this far past the last audio that
+/// actually carried speech energy (whisper invents words on silence — the
+/// shutdown drain of an idle channel used to append "you you you").
+const SPEECH_SLACK_S: f64 = 0.4;
+/// Per-chunk energy floor (~-52 dBFS): below this the chunk is silence.
+const SPEECH_ENERGY: f32 = 0.000_005_6;
 /// Flush a line this long after its channel went quiet.
 const IDLE_FLUSH: Duration = Duration::from_millis(2000);
 
@@ -56,6 +66,12 @@ pub struct Tuning {
     /// Never commit a word that ends within this much of the window end: at
     /// the live edge whisper has no right-context and that tail is unstable.
     pub hold_s: f32,
+    /// Silence after which the channel counts as quiet and its tail is
+    /// committed as-is (no later pass will give it right-context). Longer for
+    /// the final tier: natural pauses inside a sentence are ~0.7 s, and
+    /// committing then without right-context is where the garbage words come
+    /// from (measured: "and fellow Americans. And" for "fellow Americans").
+    pub idle_after_s: f32,
     /// Safety cap: uncommitted audio beyond this is dropped (losing time).
     pub buf_cap_s: f32,
     /// Decode the buffer's *tail* (live edge) instead of its head (commit
@@ -77,8 +93,16 @@ impl Tuning {
             window_s: 8.0,
             min_window_s: 1.5,
             idle_min_window_s: 0.5,
-            new_audio_s: 0.7,
+            // 3 s of new audio per pass, not 0.7: each pass starts at the
+            // commit boundary and commits up to `window - hold`, so a 3 s
+            // cadence commits ~2.5-3 s of text per pass instead of ~1 s.
+            // Every boundary is a place where whisper has no left context;
+            // measured on the jfk fixture replayed three times, cadence 0.7
+            // scored 71-91% (mean 82) while 3.0 scored 95.45% eight runs in a
+            // row. The extra lag is invisible behind the preview tier.
+            new_audio_s: 3.0,
             hold_s: 0.5,
+            idle_after_s: 1.5,
             buf_cap_s: 30.0,
             tail_window: false,
             track_line: true,
@@ -97,6 +121,7 @@ impl Tuning {
             idle_min_window_s: 0.25,
             new_audio_s: 0.02,
             hold_s: 0.10,
+            idle_after_s: 0.7,
             buf_cap_s: 4.0,
             tail_window: true,
             track_line: false,
@@ -118,6 +143,7 @@ impl Tuning {
         f("WZ_IDLE_MIN_WINDOW_S", &mut self.idle_min_window_s);
         f("WZ_NEW_AUDIO_S", &mut self.new_audio_s);
         f("WZ_HOLD_S", &mut self.hold_s);
+        f("WZ_IDLE_AFTER_S", &mut self.idle_after_s);
         self
     }
 }
@@ -217,6 +243,7 @@ pub fn spawn_worker(
                     Some(v) => !v.has_speech(&job.samples, 0.05),
                     None => false,
                 };
+                let started = Instant::now();
                 let segs = if vad_blocked {
                     Vec::new()
                 } else {
@@ -224,6 +251,14 @@ pub fn spawn_worker(
                         .unwrap_or_default()
                 };
                 let dur_s = job.samples.len() as f32 / TARGET_RATE as f32;
+                if std::env::var("WZ_STREAM_DEBUG").ok().as_deref() == Some("1") {
+                    eprintln!(
+                        "decode {profile:?} dur={dur_s:.2} took={:.2}s words={} prompt={:?}",
+                        started.elapsed().as_secs_f32(),
+                        segs.iter().map(|s| s.words.len()).sum::<usize>(),
+                        job.prompt.as_deref().map(|p| p.len())
+                    );
+                }
                 let res = StreamResult { chan: job.chan, start_s: job.start_s, dur_s, segs };
                 if out_tx.send(res).is_err() {
                     return;
@@ -249,6 +284,10 @@ pub struct StreamChannel {
     closed: bool,
     /// Channel-timeline position (seconds) where the last committed word ended.
     last_commit_s: f64,
+    /// Channel-timeline end of the last audio chunk above the speech floor.
+    last_speech_s: f64,
+    /// Text of the last few committed words, for the boundary dedupe.
+    committed_tail: Vec<String>,
 }
 
 impl StreamChannel {
@@ -264,6 +303,8 @@ impl StreamChannel {
             last_audio: Instant::now(),
             closed: false,
             last_commit_s: 0.0,
+            last_speech_s: 0.0,
+            committed_tail: Vec::new(),
         }
     }
 
@@ -273,10 +314,13 @@ impl StreamChannel {
         // silence from an idle monitor must not look like fresh speech: only
         // audible chunks count as activity (≈ -45 dBFS energy floor)
         let energy = chunk.iter().map(|x| x * x).sum::<f32>() / chunk.len().max(1) as f32;
-        if energy > 0.000_005_6 {
+        if energy > SPEECH_ENERGY {
             self.last_audio = Instant::now();
         }
         self.buf.extend_from_slice(chunk);
+        if energy > SPEECH_ENERGY {
+            self.last_speech_s = self.buf_start_s + self.buf.len() as f64 / TARGET_RATE as f64;
+        }
         let cap = (self.tuning.buf_cap_s * TARGET_RATE as f32) as usize;
         if self.buf.len() > cap {
             let drop_n = self.buf.len() - cap;
@@ -286,7 +330,7 @@ impl StreamChannel {
     }
 
     fn quiet(&self) -> bool {
-        self.last_audio.elapsed() >= IDLE_AFTER
+        self.last_audio.elapsed() >= Duration::from_secs_f32(self.tuning.idle_after_s)
     }
 
     /// Send the uncommitted window to the worker when there is enough new
@@ -334,25 +378,52 @@ impl StreamChannel {
         let quiet = self.quiet();
         let cutoff = (if quiet { dur_s } else { dur_s - self.tuning.hold_s }).max(0.0) as f64;
 
-        let mut delta = CommitDelta::default();
-        let mut upto = start_s;
+        // stable words of this pass, in order: (channel-time end, text)
+        let mut cand: Vec<(f64, &str)> = Vec::new();
         'segs: for seg in segs {
             for word in &seg.words {
                 let rel_end = (word.end_s as f64).min(dur_s as f64);
-                // timestamps behind the commit boundary were decoded twice
-                if rel_end <= upto - start_s {
+                let abs_end = start_s + rel_end;
+                // audio behind the boundary was committed by an earlier pass
+                if abs_end <= self.last_commit_s {
                     continue;
                 }
                 // still at the live edge: this word can change, wait for it
                 if rel_end > cutoff {
                     break 'segs;
                 }
-                delta.text.push_str(&word.text);
-                delta.words.push((start_s + rel_end, word.text.clone()));
-                if self.tuning.track_line {
-                    self.line.push_str(&word.text);
+                // there is no audio left that could carry this word: whisper
+                // keeps decoding on padding silence ("you you you" at the end
+                // of an idle channel), so never commit past the last sound
+                if abs_end > self.last_speech_s + SPEECH_SLACK_S {
+                    break 'segs;
                 }
-                upto = start_s + rel_end;
+                cand.push((abs_end, word.text.as_str()));
+            }
+        }
+        // whisper re-decodes the word straddling the boundary and hands it
+        // back with a slightly later end, so it would be committed twice
+        // (measured: "Ask not!" then "not watch your ..."). Drop a leading
+        // run that repeats what is already in the notes.
+        let dup = self.leading_repeat(&cand);
+
+        let mut delta = CommitDelta::default();
+        let mut upto = start_s;
+        for (abs_end, text) in cand[dup..].iter().copied() {
+            delta.text.push_str(text);
+            delta.words.push((abs_end, text.to_string()));
+            if self.tuning.track_line {
+                self.line.push_str(text);
+            }
+            upto = abs_end;
+            // punctuation-only tokens ("!", ",") are not words: they would
+            // otherwise sit in the dedupe tail as "" and break the comparison
+            let norm = text.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if !norm.is_empty() {
+                self.committed_tail.push(norm);
+                if self.committed_tail.len() > DUP_TAIL_WORDS {
+                    self.committed_tail.remove(0);
+                }
             }
         }
 
@@ -366,14 +437,41 @@ impl StreamChannel {
         if !delta.text.is_empty() {
             self.last_commit_s = upto;
         }
+        if std::env::var("WZ_STREAM_DEBUG").ok().as_deref() == Some("1") {
+            eprintln!(
+                "pass start={start_s:.2} dur={dur_s:.2} cutoff={cutoff:.2} quiet={quiet} words={} dup={dup} cand_head={:?} tail={:?} committed={:?} boundary={upto:.2}",
+                cand.len(),
+                cand.iter().take(2).map(|(e, w)| (format!("{e:.2}"), w.trim())).collect::<Vec<_>>(),
+                self.committed_tail,
+                delta.text.trim()
+            );
+        }
         self.drop_committed(upto);
         delta
+    }
+
+    /// Number of leading words of `cand` that are the same words the previous
+    /// pass just committed (whisper re-decodes the boundary word).
+    fn leading_repeat(&self, cand: &[(f64, &str)]) -> usize {
+        let max = self.committed_tail.len().min(cand.len()).min(DUP_TAIL_WORDS);
+        let mut dup = 0;
+        for k in 1..=max {
+            let tail = &self.committed_tail[self.committed_tail.len() - k..];
+            let same = tail.iter().zip(&cand[..k]).all(|(t, (end, w))| {
+                *end < self.last_commit_s + DUP_SLACK_S
+                    && *t == w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+            });
+            if same {
+                dup = k;
+            }
+        }
+        dup
     }
 
     /// Send the last uncommitted audio at shutdown (no new audio will come,
     /// so the caller should treat `on_result` as quiet).
     pub fn flush(&mut self) {
-        self.last_audio = Instant::now() - IDLE_AFTER;
+        self.last_audio = Instant::now() - Duration::from_secs_f32(self.tuning.idle_after_s);
     }
 
     /// Drop buffered audio before channel-time `upto_s` (seconds). Used by
@@ -883,5 +981,154 @@ mod tests {
             assert!(w[..4] != w[4..], "output repeats itself: {committed:?}");
         }
         assert!(previewed_words > 0, "provisional tier produced no words");
+    }
+
+    /// Notes accuracy of the *streaming* engine, measured the way the capture
+    /// VM test measures it (fixture played three times, words committed live)
+    /// but without an audio server — so a tuning change can be scored in ~40 s:
+    ///
+    ///   cargo test --release stream::tests::measures_notes_accuracy -- \
+    ///     --ignored --nocapture
+    #[test]
+    #[ignore = "benchmark: needs the model + fixture, runs in real time"]
+    fn measures_notes_accuracy() {
+        let Some(audio) = load_f32() else {
+            eprintln!("skipping: bench/fixtures/jfk.f32 missing");
+            return;
+        };
+        let reference = std::fs::read_to_string("bench/fixtures/jfk.txt").expect("reference text");
+        let model_name = std::env::var("MODEL").unwrap_or_else(|_| "base".into());
+        let reps: usize = std::env::var("REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let threads: i32 = std::env::var("THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+
+        let model = crate::models::resolve(Some(&model_name)).expect("model");
+        let (tx, rx) = spawn_worker(&model, "en", threads, false, Profile::Final).expect("worker");
+        let mut sc = StreamChannel::new(Some("them"), Tuning::final_default().with_env());
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut committed = String::new();
+        let chunk = TARGET_RATE as usize / 100; // 10 ms, like a cpal callback
+        let started = Instant::now();
+        let mut fed_samples = 0usize;
+        for _ in 0..reps {
+            let mut i = 0;
+            while i < audio.len() {
+                let start = i;
+                let end = (i + chunk).min(audio.len());
+                sc.push_16k(&audio[start..end]);
+                fed_samples += end - start;
+                i = end;
+                while let Ok(res) = rx.try_recv() {
+                    let d = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                    if !d.text.trim().is_empty() {
+                        committed.push_str(d.text.trim());
+                        committed.push(' ');
+                        if sc.line_ready()
+                            && let Some(line) = sc.take_line()
+                        {
+                            lines.push(line);
+                        }
+                    }
+                }
+                let prompt = sc.prompt_tail();
+                sc.maybe_send(0, &tx, &prompt);
+                // real time minus what inference already spent
+                let fed = fed_samples as f32 / TARGET_RATE as f32;
+                let spent = started.elapsed().as_secs_f32();
+                if fed > spent {
+                    std::thread::sleep(Duration::from_secs_f32(fed - spent));
+                }
+            }
+        }
+        // drain
+        sc.flush();
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let pending = if sc.busy() { true } else { sc.maybe_send(0, &tx, &sc.prompt_tail()) };
+            if !pending || Instant::now() >= deadline {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(res) => {
+                    let d = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                    if !d.text.trim().is_empty() {
+                        committed.push_str(d.text.trim());
+                        committed.push(' ');
+                        if sc.line_ready()
+                            && let Some(line) = sc.take_line()
+                        {
+                            lines.push(line);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if sc.line_open()
+            && let Some(line) = sc.take_line()
+        {
+            lines.push(line);
+        }
+        for line in &lines {
+            eprintln!("LINE: {line}");
+        }
+        let (sub, del, ins) = word_errors(&reference.repeat(reps), &committed);
+        let errors = sub + del + ins;
+        let ref_words = words(&reference.repeat(reps));
+        let acc = 100.0 * (1.0 - errors as f64 / ref_words.len() as f64);
+        eprintln!(
+            "STREAM NOTES: sub={sub} del={del} ins={ins} errors={errors}/{} accuracy={acc:.2}%",
+            ref_words.len()
+        );
+    }
+
+    /// Normalized word list: lowercase, punctuation stripped.
+    fn words(s: &str) -> Vec<String> {
+        s.to_ascii_lowercase()
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+
+    /// (substitutions, deletions, insertions) via word-level Levenshtein.
+    fn word_errors(reference: &str, hypothesis: &str) -> (usize, usize, usize) {
+        let (r, h) = (words(reference), words(hypothesis));
+        let mut dp = vec![vec![0usize; h.len() + 1]; r.len() + 1];
+        for (i, row) in dp.iter_mut().enumerate() {
+            row[0] = i;
+        }
+        for (j, cell) in dp[0].iter_mut().enumerate() {
+            *cell = j;
+        }
+        for i in 1..=r.len() {
+            for j in 1..=h.len() {
+                dp[i][j] = if r[i - 1] == h[j - 1] {
+                    dp[i - 1][j - 1]
+                } else {
+                    1 + dp[i - 1][j - 1].min(dp[i - 1][j]).min(dp[i][j - 1])
+                };
+            }
+        }
+        let (mut sub, mut del, mut ins) = (0, 0, 0);
+        let (mut i, mut j) = (r.len(), h.len());
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 && r[i - 1] == h[j - 1] {
+                i -= 1;
+                j -= 1;
+            } else if i > 0 && j > 0 && dp[i][j] == dp[i - 1][j - 1] + 1 {
+                sub += 1;
+                i -= 1;
+                j -= 1;
+            } else if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
+                del += 1;
+                i -= 1;
+            } else {
+                ins += 1;
+                j -= 1;
+            }
+        }
+        (sub, del, ins)
     }
 }

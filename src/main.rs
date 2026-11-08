@@ -936,10 +936,11 @@ fn run_capture(cli: &Cli, mode: SourceMode, label: Option<&'static str>, engine:
 
     let result: Result<()> = loop {
         for (cap, channel) in caps.iter().zip(channels.iter_mut()) {
-            match cap.receiver.pop_timeout(step) {
-                Pop::Data(chunk) => channel.push(&chunk, &mut engine),
-                Pop::Timeout => {}
-                Pop::Closed => break,
+            // drain the queue, not one chunk per step (see run_stream)
+            let mut pop = cap.receiver.pop_timeout(step);
+            while let Pop::Data(chunk) = pop {
+                channel.push(&chunk, &mut engine);
+                pop = cap.receiver.try_pop();
             }
         }
         if !running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -990,16 +991,16 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
     let step = Duration::from_millis(25); // see run_capture
 
     let result: Result<()> = loop {
-        match mic.receiver.pop_timeout(step) {
-            Pop::Data(chunk) => me.push(&chunk, &mut engine),
-            Pop::Timeout => {}
-            Pop::Closed => break Ok(()),
+        let mut pop = mic.receiver.pop_timeout(step);
+        while let Pop::Data(chunk) = pop {
+            me.push(&chunk, &mut engine);
+            pop = mic.receiver.try_pop();
         }
         for (cap, channel) in them_caps.iter().zip(others.iter_mut()) {
-            match cap.receiver.pop_timeout(step) {
-                Pop::Data(chunk) => channel.push(&chunk, &mut engine),
-                Pop::Timeout => {}
-                Pop::Closed => break,
+            let mut pop = cap.receiver.pop_timeout(step);
+            while let Pop::Data(chunk) = pop {
+                channel.push(&chunk, &mut engine);
+                pop = cap.receiver.try_pop();
             }
         }
         if !running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1158,19 +1159,28 @@ fn run_stream(
     'live: loop {
         let mut all_closed = true;
         for (i, (cap, feed)) in caps.iter().zip(feeds.iter_mut()).enumerate() {
-            match cap.receiver.pop_timeout(step) {
-                Pop::Data(chunk) => {
-                    let mono = feed.resample(&chunk);
-                    streams[i].push_16k(mono);
-                    if live {
-                        provs[i].push_16k(mono);
+            // drain everything the device handed us, not one chunk per
+            // iteration: a 16 kHz monitor delivers ~10 ms chunks, so a single
+            // pop per 25 ms step falls behind real time and the pipeline
+            // silently decodes a growing backlog
+            let mut pop = cap.receiver.pop_timeout(step);
+            loop {
+                match pop {
+                    Pop::Data(chunk) => {
+                        let mono = feed.resample(&chunk);
+                        streams[i].push_16k(mono);
+                        if live {
+                            provs[i].push_16k(mono);
+                        }
+                        pop = cap.receiver.try_pop();
                     }
-                }
-                Pop::Timeout => {}
-                Pop::Closed => {
-                    streams[i].mark_closed();
-                    if live {
-                        provs[i].mark_closed();
+                    Pop::Timeout => break,
+                    Pop::Closed => {
+                        streams[i].mark_closed();
+                        if live {
+                            provs[i].mark_closed();
+                        }
+                        break;
                     }
                 }
             }
