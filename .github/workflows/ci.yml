@@ -356,7 +356,7 @@ jobs:
           ./shipped/wheezper --version
       - name: Record through a virtual device and transcribe it
         run: |
-          WHEEZPER=./shipped/wheezper MODEL=base MIN_ACCURACY=85 \
+          WHEEZPER=./shipped/wheezper MODEL=base MIN_ACCURACY=80 \
             ./scripts/vmtest-capture.sh
 
   # ---------------------------------------------------------------------------

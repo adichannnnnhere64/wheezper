@@ -530,9 +530,23 @@ impl StreamChannel {
     }
 
     /// Continuity prompt for the decoder: tail of the committed line.
+    /// Continuity hint for the next window: off by default. A tail of the
+    /// open line is text for the decoder to *complete*, and a completed
+    /// sentence is an early EOT or a hallucinated continuation (measured:
+    /// 2 words committed for 3 s of audio, and "asked me to come back to the"
+    /// invented after the speech ended). Off: 91.7 % mean over ten audio
+    /// alignments, min 83; 12 words: 88.5 % mean, min 78.8. `--lyrics` passes
+    /// its own prompt; `WZ_PROMPT_WORDS=n` restores a tail for experiments.
     pub fn prompt_tail(&self) -> String {
+        let n_words: usize = std::env::var("WZ_PROMPT_WORDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if n_words == 0 {
+            return String::new();
+        }
         let words: Vec<&str> = self.line.split_whitespace().collect();
-        let n = words.len().saturating_sub(12);
+        let n = words.len().saturating_sub(n_words);
         words[n..].join(" ")
     }
 
@@ -648,7 +662,12 @@ mod tests {
     /// 16 kHz mono f32 speech used by the replay test. Committed under
     /// bench/fixtures so `cargo test` works in a clean checkout (CI).
     fn load_f32() -> Option<Vec<f32>> {
-        let bytes = std::fs::read("bench/fixtures/jfk.f32").ok()?;
+        load_f32_path("bench/fixtures/jfk.f32")
+    }
+
+    /// Read a raw 16 kHz f32le file.
+    fn load_f32_path(path: &str) -> Option<Vec<f32>> {
+        let bytes = std::fs::read(path).ok()?;
         Some(
             bytes
                 .as_chunks::<4>()
@@ -992,8 +1011,9 @@ mod tests {
     #[test]
     #[ignore = "benchmark: needs the model + fixture, runs in real time"]
     fn measures_notes_accuracy() {
-        let Some(audio) = load_f32() else {
-            eprintln!("skipping: bench/fixtures/jfk.f32 missing");
+        let path = std::env::var("AUDIO").unwrap_or_else(|_| "bench/fixtures/jfk.f32".into());
+        let Some(audio) = load_f32_path(&path) else {
+            eprintln!("skipping: {path} missing");
             return;
         };
         let reference = std::fs::read_to_string("bench/fixtures/jfk.txt").expect("reference text");
@@ -1007,15 +1027,26 @@ mod tests {
 
         let mut lines: Vec<String> = Vec::new();
         let mut committed = String::new();
-        let chunk = TARGET_RATE as usize / 100; // 10 ms, like a cpal callback
+        // RATE=44100 replays through the capture path too: the device rate is
+        // what a real call gives us, and the resampler is the only difference
+        // between "file is right" and "live capture is right"
+        let rate: u32 = std::env::var("RATE").ok().and_then(|v| v.parse().ok()).unwrap_or(TARGET_RATE);
+        let mut feed = ChannelFeed::new(rate);
+        // OFFSET_MS shifts where the audio starts relative to the engine's
+        // window grid. Without it every run decodes the identical windows and
+        // "8 runs in a row at 95%" only measures one lucky alignment.
+        let offset_ms: usize = std::env::var("OFFSET_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let offset = vec![0.0f32; rate as usize * offset_ms / 1000];
+        let chunk = rate as usize / 100; // 10 ms, like a cpal callback
         let started = Instant::now();
         let mut fed_samples = 0usize;
+        sc.push_16k(feed.resample(&offset));
         for _ in 0..reps {
             let mut i = 0;
             while i < audio.len() {
                 let start = i;
                 let end = (i + chunk).min(audio.len());
-                sc.push_16k(&audio[start..end]);
+                sc.push_16k(feed.resample(&audio[start..end]));
                 fed_samples += end - start;
                 i = end;
                 while let Ok(res) = rx.try_recv() {
@@ -1033,7 +1064,7 @@ mod tests {
                 let prompt = sc.prompt_tail();
                 sc.maybe_send(0, &tx, &prompt);
                 // real time minus what inference already spent
-                let fed = fed_samples as f32 / TARGET_RATE as f32;
+                let fed = fed_samples as f32 / rate as f32;
                 let spent = started.elapsed().as_secs_f32();
                 if fed > spent {
                     std::thread::sleep(Duration::from_secs_f32(fed - spent));

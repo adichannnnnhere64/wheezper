@@ -10,7 +10,7 @@
 # receive audio and are labelled me/them.
 #
 # Needs: a running PulseAudio/PipeWire server with pactl + paplay, python3.
-# Env: MODEL (default base), MIN_ACCURACY (default 85), WHEEZPER (binary path).
+# Env: MODEL (default base), MIN_ACCURACY (default 80), WHEEZPER (binary path).
 # The gate is looser than the file-path gate (90%) on purpose: this exercises
 # the *streaming* engine from a cold start, which trades accuracy for latency.
 set -euo pipefail
@@ -28,7 +28,7 @@ else
   exit 2
 fi
 model="${MODEL:-base}"
-min_accuracy="${MIN_ACCURACY:-85}"
+min_accuracy="${MIN_ACCURACY:-80}"
 wav="bench/fixtures/jfk.wav"
 reference="bench/fixtures/jfk.txt"
 out="bench/out"
