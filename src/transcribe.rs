@@ -70,6 +70,61 @@ impl Transcriber {
             false,
         )
     }
+
+    /// Greedy variant that keeps per-word end times, so the streaming
+    /// pipeline can commit each word exactly once, by time (see `stream`).
+    pub fn segments_greedy(&mut self, samples: &[f32], prompt: Option<&str>) -> Result<Vec<Seg>> {
+        segments_state(
+            &mut self.state,
+            self.language.as_deref(),
+            self.threads,
+            samples,
+            prompt,
+            false,
+        )
+    }
+}
+
+/// Byte-level BPE tokens can carry a fragment of a multi-byte character
+/// (whisper tokenises “...” as raw bytes), which shows up as U+FFFD. Collapse
+/// such a run between letters back to a plain apostrophe ("doesn’t").
+fn clean_token(raw: &str) -> String {
+    if !raw.contains('\u{FFFD}') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut pending = 0usize;
+    for c in raw.chars() {
+        if c == '\u{FFFD}' {
+            pending += 1;
+            continue;
+        }
+        if pending > 0 {
+            let prev_alnum = out.chars().last().is_some_and(|p| p.is_alphanumeric());
+            if prev_alnum && c.is_alphanumeric() {
+                out.push('\'');
+            }
+            pending = 0;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One decoded word: text plus where it ends in the source audio.
+#[derive(Clone, Debug)]
+pub struct Word {
+    /// End of the word, seconds from `samples[0]`.
+    pub end_s: f32,
+    /// Token text as whisper emits it (leading space included when present).
+    pub text: String,
+}
+
+/// One whisper segment: its words plus the joined text.
+#[derive(Clone, Debug)]
+pub struct Seg {
+    pub words: Vec<Word>,
+    pub text: String,
 }
 
 /// Core inference, usable from any state (main engine or caption workers).
@@ -85,6 +140,20 @@ pub fn transcribe_state(
     prompt: Option<&str>,
     beam: bool,
 ) -> Result<String> {
+    let segs = segments_state(state, language, threads, samples, prompt, beam)?;
+    Ok(segs.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" "))
+}
+
+/// Core inference keeping per-word end timestamps.
+#[allow(clippy::too_many_arguments)]
+pub fn segments_state(
+    state: &mut WhisperState,
+    language: Option<&str>,
+    threads: i32,
+    samples: &[f32],
+    prompt: Option<&str>,
+    beam: bool,
+) -> Result<Vec<Seg>> {
     let strategy = if beam {
         SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 }
     } else {
@@ -98,9 +167,24 @@ pub fn transcribe_state(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
-    // continuity: after a force-cut mid-utterance, seed the decoder with
-    // the tail of the previous segment so it doesn't restart a sentence
-    if let Some(p) = prompt {
+    // per-word timestamps: the streaming pipeline commits words by time, so
+    // audio is never re-transcribed and never silently skipped
+    params.set_token_timestamps(true);
+    // TUNING KNOBS (temporary, for the song benchmark sweep)
+    let envf = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
+    if std::env::var("WZ_NOCTX").ok().as_deref() == Some("1") {
+        params.set_no_context(true);
+    }
+    if let Some(v) = envf("WZ_TEMP") { params.set_temperature_inc(v); }
+    if let Some(v) = envf("WZ_ENT") { params.set_entropy_thold(v); }
+    if let Some(v) = envf("WZ_LOG") { params.set_logprob_thold(v); }
+    if let Some(v) = envf("WZ_NOSP") { params.set_no_speech_thold(v); }
+    if let Some(v) = envf("WZ_MAXINIT") { params.set_max_initial_ts(v); }
+    if std::env::var("WZ_NOPROMPT").ok().as_deref() == Some("1") {
+        // skip prompt entirely (sweep only)
+    } else if let Some(p) = prompt {
+        // continuity: after a force-cut mid-utterance, seed the decoder with
+        // the tail of the previous segment so it doesn't restart a sentence
         params.set_initial_prompt(p);
     }
 
@@ -108,29 +192,47 @@ pub fn transcribe_state(
         .full(params, samples)
         .context("whisper inference failed")?;
 
-    let mut out = String::new();
+    let mut out = Vec::new();
     for i in 0..state.full_n_segments() {
         let Some(seg) = state.get_segment(i) else { continue };
         // High no-speech probability on silence/music => hallucinated text
         if seg.no_speech_probability() > 0.6 {
             continue;
         }
-        let text = seg
-            .to_str_lossy()
-            .context("segment text was not valid UTF-8")?
-            .trim()
-            .to_string();
-        if text.is_empty() {
+        let mut words = Vec::new();
+        for j in 0..seg.n_tokens() {
+            let Some(tok) = seg.get_token(j) else { continue };
+            let Ok(raw) = tok.to_str_lossy() else { continue };
+            // special + timestamp tokens ("[_BEG_]", "[_TT_120]") and
+            // whisper's own markers ("[MUSIC]", "[INAUDIBLE]") are not text
+            let raw = clean_token(&raw);
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.starts_with('[') || trimmed.ends_with(']') {
+                continue;
+            }
+            let t1 = tok.token_data().t1;
+            if t1 < 0 {
+                continue;
+            }
+            words.push(Word { end_s: t1 as f32 / 100.0, text: raw.to_string() });
+        }
+        let text = words.iter().map(|w| w.text.as_str()).collect::<String>();
+        let text = text.trim();
+        if text.is_empty() || (text.starts_with('[') && text.ends_with(']')) {
+            continue;
+        }
+        // whisper's non-speech markers, with or without their brackets
+        if matches!(
+            text.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_uppercase().as_str(),
+            "MUSIC" | "BLANK_AUDIO" | "INAUDIBLE" | "APPLAUSE" | "LAUGHTER" | "SILENCE"
+        ) {
             continue;
         }
         // whisper's silence placeholder — never a real utterance
         if text == "[BLANK_AUDIO]" {
             continue;
         }
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&text);
+        out.push(Seg { words, text: text.to_string() });
     }
     Ok(out)
 }

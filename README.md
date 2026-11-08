@@ -54,6 +54,14 @@ wheezper --source loopback --device hdmi
 
 # any recording or exotic source: pipe mono f32le PCM
 ffmpeg -i recording.wav -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
+
+# MUSIC (songs, videos with sung vocals): the VAD gate deletes singing and
+# short segments cut mid-phrase. Turn both off and use a bigger model
+wheezper --source loopback --no-vad --max-segment 25 --model turbo
+
+# known song: follow a reference lyric sheet (see "Songs and lyrics" below)
+wheezper --source loopback --no-vad --max-segment 40 --model turbo \
+         --lyrics song.lyrics --lyric-sync
 ```
 
 Output (default `notes/YYYY-MM-DD.md`, flushed per line) is also echoed to
@@ -68,6 +76,37 @@ stdout, so you can watch it live:
 Loopback notes: on Linux it captures the default sink's PulseAudio monitor
 source (works under PipeWire). On Windows, WASAPI loopback opens the default
 output device as an input stream. On hosts without loopback, pipe via ffmpeg.
+
+## Songs and lyrics
+
+Speech-tuned defaults fight music: the Silero VAD gate classifies singing as
+non-speech (it silently drops whole lines) and 10 s segments cut through
+phrases. For anything sung:
+
+```bash
+wheezper --no-vad --max-segment 25 --model turbo
+```
+
+Measured on two NIKI tracks (see `bench/RESULTS.md` for the full table,
+scripts and raw output):
+
+| setup | word accuracy | character accuracy |
+|---|---|---|
+| `base` (default) | 39% | 63% |
+| `small` | 79–81% | 87% |
+| `turbo` | 89–93% | 94–95% |
+| `turbo --lyrics --lyric-sync` (known song) | 99–100% | 99–100% |
+
+95% word-level accuracy is not reachable from acoustics alone on sung, layered
+vocals at this model scale — the remaining errors are homophones and dropped function
+words. If you *have* the lyrics:
+
+- `--lyrics FILE` — the decoder is prompted with the lyrics around a moving
+  cursor (bias only; measured gain is small).
+- `--lyrics FILE --lyric-sync` — output the reference wording for every
+  segment the (unbiased) transcription aligns with, keeping ASR text where it
+  does not. This is karaoke-style lyric sync, not transcription: 99–100% word
+  accuracy on the tracks tested. Longer segments help it (see below).
 
 ## Models
 

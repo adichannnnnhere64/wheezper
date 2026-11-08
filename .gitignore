@@ -7,3 +7,9 @@
 target-xwin/
 target-linux-portable/
 wheezper-linux-amd64.tar.gz
+bench/out/
+
+# local benchmark material: song audio + reference lyrics (not redistributable)
+*.opus
+*.lyrics
+*.lyeics

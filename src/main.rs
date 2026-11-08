@@ -47,6 +47,19 @@ struct Cli {
     #[arg(short, long)]
     notes: Option<PathBuf>,
 
+    /// Known-song mode: reference lyrics (one line per lyric line). The
+    /// decoder is prompted with the lyrics around a moving cursor, so it
+    /// follows the real words instead of guessing at mumbled/sung ones.
+    /// Best with a single audio source (--source stdin, mic or loopback).
+    #[arg(long, value_name = "FILE")]
+    lyrics: Option<PathBuf>,
+
+    /// With --lyrics: emit the reference lyric words for every segment the
+    /// transcription aligns with — karaoke-style lyric sync. Unaligned
+    /// segments keep the ASR text; already-emitted passages are dropped.
+    #[arg(long, requires = "lyrics")]
+    lyric_sync: bool,
+
     /// Whisper language code, or "auto" to detect per segment
     #[arg(short, long, default_value = "auto")]
     language: String,
@@ -262,6 +275,10 @@ struct Engine {
     /// Local LLM post-processing: session summary on stop, optional polish.
     llm: Option<llm::Llm>,
     polish: bool,
+    /// Reference-lyrics follower (--lyrics), shared by all channels.
+    lyrics: Option<LyricFollower>,
+    /// --lyric-sync: output the reference words where the ASR aligns.
+    lyric_sync: bool,
 }
 
 impl Engine {
@@ -307,6 +324,20 @@ impl Engine {
                     None
                 }
             }
+        };
+
+        let lyrics = match cli.lyrics.as_deref() {
+            Some(path) => {
+                let follower = LyricFollower::load(path)?;
+                eprintln!(
+                    "wheezper: lyrics <- {} ({} words, mode: {})",
+                    path.display(),
+                    follower.len(),
+                    if cli.lyric_sync { "sync" } else { "bias" }
+                );
+                Some(follower)
+            }
+            None => None,
         };
 
         let partial_tx = if cli.partial {
@@ -362,7 +393,19 @@ impl Engine {
             None
         };
 
-        Ok(Self { transcriber, vad, last: Default::default(), notepad, webhook, partial: cli.partial, partial_tx, llm, polish: cli.polish && cli.ollama.is_some() })
+        Ok(Self {
+            transcriber,
+            vad,
+            last: Default::default(),
+            notepad,
+            webhook,
+            partial: cli.partial,
+            partial_tx,
+            llm,
+            polish: cli.polish && cli.ollama.is_some(),
+            lyrics,
+            lyric_sync: cli.lyric_sync,
+        })
     }
 
     /// Queue a live-caption preview (never blocks; drops when busy).
@@ -380,6 +423,27 @@ impl Engine {
         }
     }
 
+    /// Prompt from the reference lyrics (--lyrics). The bias plus
+    /// --lyric-sync's "never emit a span twice" rule is the combination that
+    /// measured best: the prompt keeps the decoder's wording on the lyrics,
+    /// and re-sung/re-prompted passages cannot be emitted twice.
+    fn lyric_prompt(&self) -> Option<String> {
+        self.lyrics.as_ref().map(|l| l.prompt())
+    }
+
+    /// Move the lyric cursor past words just committed (live/stream mode).
+    fn lyric_remember(&mut self, text: &str) {
+        if let Some(l) = &mut self.lyrics {
+            l.remember(text);
+        }
+    }
+
+    fn lyric_advance(&mut self, text: &str) {
+        if let Some(l) = &mut self.lyrics {
+            let _ = l.advance(text);
+        }
+    }
+
     /// Transcribe one segment and write it to every sink.
     /// `tail` carries per-channel prompt continuity between calls.
     fn handle(&mut self, samples: &[f32], label: Option<&str>, tail: &mut Option<String>) {
@@ -390,9 +454,25 @@ impl Engine {
         {
             return;
         }
-        let prompt = tail.clone();
+        let prompt = match &self.lyrics {
+            Some(l) => Some(l.prompt()),
+            None => tail.clone(),
+        };
         match self.transcriber.transcribe(samples, prompt.as_deref()) {
             Ok(raw) => {
+                let raw = match &mut self.lyrics {
+                    Some(l) => {
+                        let (snapped, duplicate) = l.advance(&raw);
+                        if duplicate && self.lyric_sync {
+                            return; // already transcribed this passage
+                        }
+                        match snapped {
+                            Some(lyric) if self.lyric_sync && !lyric.is_empty() => lyric,
+                            _ => raw,
+                        }
+                    }
+                    None => raw,
+                };
                 // optional LLM cleanup per utterance (keeps raw text on failure)
                 let text = match (&self.llm, self.polish) {
                     (Some(o), true) => o.polish(&raw).unwrap_or(raw),
@@ -416,6 +496,7 @@ impl Engine {
                 }
                 match self.notepad.append(label, &text) {
                     Ok(true) => {
+                        self.lyric_remember(&text);
                         *tail = Some(last_words(&text, 12));
                         self.clear_partial();
                         let ts = Local::now().format("%H:%M:%S");
@@ -533,6 +614,139 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("no_vad").and_then(|v| v.as_bool())
     {
         cli.no_vad = v;
+    }
+}
+
+/// Reference-lyrics follower for known-song mode (`--lyrics`).
+///
+/// Holds a cursor into the lyric word list. Each segment is decoded with the
+/// words just *before* the cursor as the initial prompt — whisper treats that
+/// as "previously said" text and continues from there, so it expects the
+/// upcoming lyric line and picks its wording instead of guessing at slurred
+/// syllables. After each segment the cursor moves to wherever the hypothesis
+/// landed in the lyrics (fuzzy, so a repeated chorus finds its earlier spot).
+struct LyricFollower {
+    words: Vec<String>,
+    pos: usize,
+    /// Furthest word of the file already emitted by --lyric-sync: the cursor
+    /// may revisit earlier lines (repeated choruses), the output may not.
+    emitted: usize,
+    /// Words of the last line output, to catch a segment that re-sings (or,
+    /// under the prompt's bias, re-reads) what was just transcribed.
+    last: Vec<String>,
+}
+
+/// Words of lyric context handed to the decoder (whisper's prompt budget is
+/// 224 tokens; 30 words is plenty and keeps the bias local).
+const LYRIC_PROMPT_WORDS: usize = 30;
+/// Words of the hypothesis to look for when moving the cursor.
+const LYRIC_ANCHOR_WORDS: usize = 6;
+
+fn lyric_norm(w: &str) -> String {
+    w.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '\'')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+impl LyricFollower {
+    fn load(path: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading lyrics {}", path.display()))?;
+        let words: Vec<String> = text.split_whitespace().map(|w| w.to_string()).collect();
+        if words.is_empty() {
+            anyhow::bail!("lyrics file {} is empty", path.display());
+        }
+        Ok(Self { words, pos: 0, emitted: 0, last: Vec::new() })
+    }
+
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Context ending at the cursor: the decoder continues into the segment.
+    fn prompt(&self) -> String {
+        let end = self.pos.min(self.words.len());
+        let start = end.saturating_sub(LYRIC_PROMPT_WORDS);
+        self.words[start..end].join(" ")
+    }
+
+    /// Record what was actually printed, so the next segment can be checked
+    /// for re-singing the same passage (a snapped line and an ASR line of the
+    /// same audio are near-identical).
+    fn remember(&mut self, text: &str) {
+        self.last = text.split_whitespace().map(lyric_norm).filter(|w| !w.is_empty()).collect();
+    }
+
+    /// Move the cursor past the lyrics the hypothesis just covered.
+    /// Returns `(Some(reference words), false)` when the match is solid and
+    /// forward (emit the authoritative wording), `(None, true)` when the audio
+    /// re-visited a span that was already emitted (drop it: the transcript is
+    /// linear), and `(None, false)` when nothing matched (keep ASR text).
+    fn advance(&mut self, text: &str) -> (Option<String>, bool) {
+        let anchor: Vec<String> = {
+            let mut v: Vec<String> = text
+                .split_whitespace()
+                .map(lyric_norm)
+                .filter(|w| !w.is_empty())
+                .collect();
+            let skip = v.len().saturating_sub(LYRIC_ANCHOR_WORDS);
+            v.drain(..skip);
+            v
+        };
+        // a segment that mostly repeats the previous line is a re-rendition
+        // or a prompt-induced re-read: emit it once (sync mode drops it)
+        let hyp: Vec<String> = text.split_whitespace().map(lyric_norm).filter(|w| !w.is_empty()).collect();
+        if hyp.len() >= 4 && !self.last.is_empty() {
+            let shared = hyp.iter().filter(|w| self.last.contains(w)).count();
+            if shared * 10 >= hyp.len() * 6 {
+                return (None, true);
+            }
+        }
+        if anchor.len() < 2 || self.pos >= self.words.len() {
+            return (None, false);
+        }
+        let need = anchor.len().div_ceil(2); // at least half the anchor words
+        let mut best: Option<(usize, usize, usize)> = None; // (hits, dist, end)
+        let last = self.words.len().saturating_sub(anchor.len());
+        for start in 0..=last {
+            let hits = anchor
+                .iter()
+                .enumerate()
+                .filter(|(k, w)| &lyric_norm(&self.words[start + k]) == *w)
+                .count();
+            if hits < need {
+                continue;
+            }
+            // prefer matches at/after the cursor; a backwards jump has to be
+            // a much better match to win (repeated choruses do go backwards)
+            let dist = if start >= self.pos {
+                start - self.pos
+            } else {
+                4 * (self.pos - start)
+            };
+            if best.is_none_or(|(h, d, _)| hits > h || (hits == h && dist < d)) {
+                best = Some((hits, dist, start + anchor.len()));
+            }
+        }
+        let Some((hits, _, end)) = best else {
+            return (None, false);
+        };
+        let start = self.pos.min(self.words.len());
+        self.pos = end.min(self.words.len());
+        let solid = anchor.len() >= 3 && hits * 2 >= anchor.len() && end > start;
+        if !solid {
+            return (None, false);
+        }
+        if start < self.emitted {
+            // the song re-visited a passage we already transcribed: the linear
+            // transcript must not repeat it
+            return (None, true);
+        }
+        self.emitted = self.pos;
+        let lyric = self.words[start..self.pos].join(" ");
+        self.last = lyric.split_whitespace().map(lyric_norm).filter(|w| !w.is_empty()).collect();
+        (Some(lyric), false)
     }
 }
 
@@ -796,8 +1010,9 @@ fn run_dual(cli: &Cli, engine: Engine) -> Result<Engine> {
 
 // --- incremental streaming: words committed once, as soon as stable -------
 
-/// Unified live loop: sliding-window inference, two-pass word commit,
-/// append-only output. One shared worker thread does all inference.
+/// Unified live loop: sliding-window inference, per-word commit by
+/// timestamp, append-only output. One shared worker thread does all
+/// inference.
 fn run_stream(
     cli: &Cli,
     chans: Vec<(Capture, Option<&'static str>)>,
@@ -850,18 +1065,21 @@ fn run_stream(
         while let Ok(res) = rx.try_recv() {
             if let Some(sc) = streams.get_mut(res.chan) {
                 let was_open = sc.line_open();
-                let delta = sc.on_result(&res.text);
-                if !delta.is_empty() {
+                let delta = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                if !delta.trim().is_empty() {
+                    engine.lyric_advance(&delta);
+                    engine.lyric_remember(&delta);
                     print_open(sc, !was_open);
-                    print!("{delta} ");
+                    print!("{} ", delta.trim());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
         }
 
         // dispatch new windows; flush completed lines
+        let lyric_prompt = engine.lyric_prompt();
         for (i, sc) in streams.iter_mut().enumerate() {
-            let prompt = sc.prompt_tail();
+            let prompt = lyric_prompt.clone().unwrap_or_else(|| sc.prompt_tail());
             sc.maybe_send(i, &tx, &prompt);
             if sc.line_ready()
                 && let Some(line) = sc.take_line()
@@ -875,30 +1093,37 @@ fn run_stream(
         }
     }
 
-    // shutdown: drain in-flight windows, commit remaining hypotheses
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(100)) {
+    // shutdown: give every channel one last pass for the audio still in its
+    // buffer (the tail of the utterance), then commit what is left
+    for (i, sc) in streams.iter_mut().enumerate() {
+        sc.flush();
+        let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
+        sc.maybe_send(i, &tx, &prompt);
+    }
+    // a pass can take seconds (whisper pads to 30 s); wait it out instead of
+    // abandoning the last line the moment the channel goes momentarily quiet
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && streams.iter().any(|sc| sc.busy()) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(res) => {
                 if let Some(sc) = streams.get_mut(res.chan) {
                     let was_open = sc.line_open();
-                    let delta = sc.on_result(&res.text);
-                    if !delta.is_empty() {
+                    let delta = sc.on_result(res.start_s, res.dur_s, &res.segs);
+                    if !delta.trim().is_empty() {
+                        engine.lyric_advance(&delta);
+                        engine.lyric_remember(&delta);
                         print_open(sc, !was_open);
-                        print!("{delta} ");
+                        print!("{} ", delta.trim());
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                 }
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     for sc in streams.iter_mut() {
-        let was_open = sc.line_open();
-        let delta = sc.finish();
-        if !delta.is_empty() {
-            print_open(sc, !was_open);
-            print!("{delta} ");
-        }
+        sc.finish();
         if sc.line_open()
             && let Some(line) = sc.take_line()
         {

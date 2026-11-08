@@ -20,8 +20,8 @@ pub const MODELS: &[ModelSpec] = &[
     ModelSpec { name: "tiny", file: "ggml-tiny-q5_1.bin", approx_mb: 32 },
     ModelSpec { name: "base", file: "ggml-base-q5_1.bin", approx_mb: 57 },
     ModelSpec { name: "small", file: "ggml-small-q5_1.bin", approx_mb: 181 },
-    ModelSpec { name: "medium", file: "ggml-medium-q5_1.bin", approx_mb: 513 },
-    ModelSpec { name: "turbo", file: "ggml-large-v3-turbo-q5_1.bin", approx_mb: 574 },
+    ModelSpec { name: "medium", file: "ggml-medium-q5_0.bin", approx_mb: 539 },
+    ModelSpec { name: "turbo", file: "ggml-large-v3-turbo-q5_0.bin", approx_mb: 574 },
 ];
 
 const HF_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
