@@ -288,6 +288,8 @@ pub struct StreamChannel {
     last_speech_s: f64,
     /// Text of the last few committed words, for the boundary dedupe.
     committed_tail: Vec<String>,
+    /// The "falling behind" warning is printed once per channel.
+    warned_drop: bool,
 }
 
 impl StreamChannel {
@@ -305,6 +307,7 @@ impl StreamChannel {
             last_commit_s: 0.0,
             last_speech_s: 0.0,
             committed_tail: Vec::new(),
+            warned_drop: false,
         }
     }
 
@@ -326,6 +329,14 @@ impl StreamChannel {
             let drop_n = self.buf.len() - cap;
             self.buf.drain(..drop_n);
             self.buf_start_s += drop_n as f64 / TARGET_RATE as f64;
+            // losing audio is never silent: this is the only path that can drop
+            // speech, and it means the box cannot keep up with the model
+            if !self.warned_drop {
+                self.warned_drop = true;
+                eprintln!(
+                    "wheezper: stream: inference is not keeping up — dropping the oldest uncommitted audio (try a smaller --model or more --threads)"
+                );
+            }
         }
     }
 
@@ -427,11 +438,12 @@ impl StreamChannel {
             }
         }
 
-        // nothing was committed: either the tail is still moving, or the
-        // window held no speech at all. Only the latter frees the audio.
-        if upto == start_s
-            && (quiet || self.buf.len() >= (self.tuning.window_s * TARGET_RATE as f32) as usize)
-        {
+        // nothing was committed: either the tail is still moving, or the decode
+        // came back empty. Only a *quiet* channel whose buffered audio carries
+        // no speech at all may be dropped — an empty decode of speech must be
+        // retried, not thrown away (on a slow runner this silently deleted up
+        // to 8 s of notes per pass; the transcript ended while audio played on).
+        if upto == start_s && quiet && self.last_speech_s <= start_s + 0.1 {
             upto = start_s + cutoff;
         }
         if !delta.text.is_empty() {

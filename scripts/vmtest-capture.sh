@@ -97,13 +97,20 @@ kill -9 "$app" 2>/dev/null || true
 wait "$app" 2>/dev/null || true
 app=""
 
-[ -s "$notes" ] || fail "nothing was recorded to $notes"
-grep -q '^\s*-\s' "$notes" || fail "notepad has no transcript lines"
+show_diagnostics() {
+  # the transcript alone does not say *why* it is short: the engine's stderr
+  # says whether it fell behind, dropped audio or never got a window
+  echo "--- wheezper log (tail) ---" >&2
+  tail -30 "$log" >&2 || true
+}
+
+[ -s "$notes" ] || { show_diagnostics; fail "nothing was recorded to $notes"; }
+grep -q '^\s*-\s' "$notes" || { show_diagnostics; fail "notepad has no transcript lines"; }
 sed -n '1,8p' "$notes"
-grep -qi 'ask not' "$notes" || fail "no 'ask not' in the live transcript"
-grep -qi 'country' "$notes" || fail "no 'country' in the live transcript"
+grep -qi 'ask not' "$notes" || { show_diagnostics; fail "no 'ask not' in the live transcript"; }
+grep -qi 'country' "$notes" || { show_diagnostics; fail "no 'country' in the live transcript"; }
 python3 bench/score.py "$ref3" "$notes" --min-accuracy "$min_accuracy" \
-  || fail "live capture transcript did not match the recording"
+  || { show_diagnostics; fail "live capture transcript did not match the recording"; }
 
 # ---------------------------------------------------------------------------
 step 'record: --source dual (two capture streams, me/them labels)'

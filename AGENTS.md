@@ -246,13 +246,13 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
-**88–97 %**, typically ~92 (measured 87.9 / 90.9 / 92.4 / 93.9 / 97.0 on 6
-cores, 97.0 pinned to 2 cores). The engine's own replay benchmark
-(`stream::tests::measures_notes_accuracy`) averages **91.4 %** over ten audio
-alignments (`OFFSET_MS=…`, because the same alignment measured eight times only
-proves the dice rolled well), worst alignment 83.3. Both were ~66–85 % before
-the fixes in the traps list below. The gate is 80 % — the ceiling here is
-whisper's own hallucination on pauses, not the pipeline.
+**91–97 %** (measured 90.9 / 92.4 / 93.9 / 95.5 / 96.0 / 97.0, and 97.0 pinned to
+2 cores). The engine's own replay benchmark (`stream::tests::
+measures_notes_accuracy`) averages **95.5 %** over ten audio alignments
+(`OFFSET_MS=…`, because the same alignment measured eight times only proves the
+dice rolled well), worst alignment 90.9. Both were ~66–85 % before the fixes in
+the traps list below. The gate is 80 %: the ceiling left is whisper
+hallucinating over pauses, not the pipeline.
 
 Accuracy (word, `bench/RESULTS.md`): fixture 100 %; sung lyrics `base` 39–51 %,
 `small` 79–81 %, `turbo` 89–93 % (turbo is 3.8× slower than real time → batch
@@ -301,6 +301,13 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - **Never commit past the last chunk that carried speech energy**
   (`last_speech_s` + 0.4 s). On padding silence whisper keeps decoding; the
   drain of an idle channel used to append "you you you you" to the notes.
+- **An empty decode must be retried, never treated as silence.** The "window
+  held no speech, so free the audio" shortcut also fired when whisper returned
+  nothing for *speech* (a filtered segment, a bad pass), and on a slow runner
+  that silently deleted up to 8 s of notes per pass — the transcript simply
+  ended while audio was still playing (measured: CI 69.7 % vs 95 % locally,
+  and the replay benchmark's worst alignments jumped 83 → 91 once fixed). Only
+  a quiet channel whose buffered audio has no speech at all may be dropped.
 - **The final tier takes ~3 s of new audio per pass, not 0.7 s.** Each pass
   starts at the commit boundary and commits up to `window − hold`, so the
   cadence *is* the error rate: every boundary is a place with no left context.
