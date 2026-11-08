@@ -1244,7 +1244,9 @@ fn run_stream(
     }
 
     // shutdown: give every channel one last pass per tier (the tail of the
-    // utterance), then commit what is left
+    // utterance), then commit what is left. A tier that fell behind during
+    // capture needs more than one window to reach the end of its buffer;
+    // dropping the rest would silently lose the tail of the notes.
     for (i, sc) in streams.iter_mut().enumerate() {
         sc.flush();
         let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
@@ -1259,10 +1261,29 @@ fn run_stream(
     // a final pass can take seconds (whisper pads to 30 s); wait it out
     // instead of abandoning the last line the moment the channel goes
     // momentarily quiet
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline
-        && (streams.iter().any(|sc| sc.busy()) || provs.iter().any(|p| p.busy()))
-    {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        // re-dispatch while any channel still holds sendable audio: each
+        // arriving pass frees the next window. `maybe_send` returning false
+        // on an idle channel means its buffer is drained, so the deadline
+        // is only reached when the box cannot keep up at all.
+        let mut pending = false;
+        for (i, sc) in streams.iter_mut().enumerate() {
+            pending |= if sc.busy() {
+                true
+            } else {
+                let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
+                sc.maybe_send(i, &tx, &prompt)
+            };
+        }
+        if let Some((ptx, _)) = &prov {
+            for (i, p) in provs.iter_mut().enumerate() {
+                pending |= if p.busy() { true } else { p.maybe_send(i, ptx) };
+            }
+        }
+        if !pending || Instant::now() >= deadline {
+            break;
+        }
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(res) => {
                 if let Some(sc) = streams.get_mut(res.chan) {

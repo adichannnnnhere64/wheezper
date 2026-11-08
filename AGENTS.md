@@ -6,7 +6,7 @@ must not regress.
 
 **wheezper** is a single-binary CLI that listens to a meeting/call and writes a
 timestamped markdown transcript as it happens: local whisper.cpp inference, no
-cloud, no install, Linux / Windows / Android(Termux). Version `0.3.0`.
+cloud, no install, Linux / Windows / Android(Termux). Version `0.4.0`.
 
 ---
 
@@ -264,6 +264,11 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   true for both tiers; provisional words beyond the final boundary are shed
   from the preview by the same rule as the final boundary advances.
   Text-overlap anchors were tried and fail the moment the window start moves.
+- **The shutdown drain dispatches until the buffer is empty** (`maybe_send`
+  returns `true` only when it actually sent a pass). One window in flight at
+  stop used to mean its leftover audio was never transcribed, so on a box that
+  could not keep up (2-core CI runners) the notes silently lost the tail. Do
+  not go back to a single drain pass.
 - `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
   conditioning; without it whisper loops on music (143 inserted words vs 6).
   The explicit `initial_prompt` still applies.
