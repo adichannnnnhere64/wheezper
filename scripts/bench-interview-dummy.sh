@@ -45,7 +45,7 @@ for video in "${videos[@]}"; do
     echo "wheezper: transcribing $name with $MODEL; reference=$reference"
     if ! ffmpeg -nostdin -v error -i "$video" -vn -ac 1 -ar 16000 -f f32le - \
         | "$BIN" --source stdin --model "$MODEL" --language en --prompt "$prompt" \
-            --threshold-db "$THRESHOLD_DB" --threads "$THREADS" \
+            --threshold-db="$THRESHOLD_DB" --threads "$THREADS" \
             --min-silence "$MIN_SILENCE" --max-segment "$MAX_SEGMENT" \
             --notes "$notes" > "$OUT_DIR/$name.log" \
             2> "$OUT_DIR/$name.stderr.log"; then

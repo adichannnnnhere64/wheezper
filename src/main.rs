@@ -155,7 +155,7 @@ struct Cli {
     rate: u32,
 
     /// RMS level (dBFS) below which audio counts as silence
-    #[arg(long, default_value_t = -40.0)]
+    #[arg(long, default_value_t = -40.0, allow_hyphen_values = true)]
     threshold_db: f32,
 
     /// Seconds of silence that close a segment. Lower = final text appears
