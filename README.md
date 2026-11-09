@@ -28,7 +28,9 @@ VC++ redistributable needed).
   (worker embedded in the exe, Gemma model auto-downloads) — no installs.
 - **Phase 3 context and annotations**: `--prompt` biases whisper with a short
   domain hint; `--with-agent` adds optional asynchronous notes under committed
-  transcript lines without delaying transcription.
+  transcript lines without delaying transcription. Add `--knowledgebase FILE`
+  to turn it into an interview assistant that answers as the candidate in one
+  concise 10-20 word sentence.
 
 ## Usage
 
@@ -58,6 +60,11 @@ wheezper --source dual --prompt "Engineering planning for Atlas" \
 # cloud annotations require OLLAMA_API_KEY; the final number is output tokens
 OLLAMA_API_KEY=... wheezper --with-agent "ollama-cloud:deepseek-v4.1-flash:1017"
 # or put OLLAMA_API_KEY in ./.env (gitignored); the environment wins
+
+# interview mode: answer the interviewer as the candidate from a knowledgebase
+wheezper --source loopback \
+  --with-agent "ollama-cloud:deepseek-v4.1-flash:128" \
+  --knowledgebase knowledgebase.example.md
 
 # pick a model: tiny, base (default), small, medium, turbo
 wheezper --model small
@@ -355,7 +362,13 @@ wheezper --ollama http://server:11434        # explicit remote Ollama server
 
 `--with-agent PROVIDER:MODEL[:BUDGET]` supports `ollama` (local server at
 `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
-`builtin` (the embedded llama.cpp model). Cloud reasoning models are asked not
+`builtin` (the embedded llama.cpp model). With `--knowledgebase FILE`, the
+agent switches from meeting annotations to **interview mode**: it answers the
+interviewer's latest line as the candidate, using the file's facts, in one
+conversational 10-20 word sentence. Without the flag it keeps annotating.
+`knowledgebase.example.md` is a ready-to-edit Java Spring profile; the file is
+bounded to ~4,000 characters and is never uploaded anywhere except as part of
+the agent prompt. Cloud reasoning models are asked not
 to emit chain-of-thought (`think: false`), so the token budget is spent on the
 answer; annotations render as `↳ 🤖 …: ANS: …`. `ollama-cloud` needs no local model
 or server; it is HTTPS plus the key. If `OLLAMA_API_KEY` is not exported,
@@ -380,6 +393,10 @@ words so the domain hint cannot evict local context.
 # OLLAMA_API_KEY can come from the environment or ./.env
 cargo build --release
 scripts/test-cloud-agent.sh interview.wav deepseek-v4.1-flash
+
+# interview mode: answer as the candidate from the sample knowledgebase
+KNOWLEDGEBASE=knowledgebase.example.md \
+  scripts/test-cloud-agent.sh interview.wav deepseek-v4.1-flash
 ```
 
 The script transcribes the recording through the normal stdin path, runs the
@@ -437,6 +454,7 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --partial         rolling live captions of the utterance in progress
     --prompt <TEXT>   domain/context hint (first 40 words; opt-in)
     --with-agent <SPEC>  async annotations: PROVIDER:MODEL[:BUDGET]
+    --knowledgebase <FILE>  interview answers from this file (with --with-agent)
     --ollama [URL]    session summary via Ollama server at URL if running,
                       else built-in llama.cpp (model auto-downloads)
     --ollama-model <M>  gemma3:1b [default] | any Ollama model | .gguf path

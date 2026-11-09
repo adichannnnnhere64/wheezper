@@ -8,7 +8,8 @@
 # OLLAMA_API_KEY comes from the environment or ./.env. The audio is only read
 # locally; nothing is uploaded except the transcript lines sent to the agent.
 # Env: WHISPER_MODEL (default base), WHEEZPER_CLOUD_MODEL,
-#      WHEEZPER_CLOUD_BUDGET (default 128), WHEEZPER (binary).
+#      WHEEZPER_CLOUD_BUDGET (default 128), KNOWLEDGEBASE (interview mode),
+#      WHEEZPER (binary).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -19,6 +20,11 @@ model="${2:-${WHEEZPER_CLOUD_MODEL:-deepseek-v4.1-flash}}"
 budget="${WHEEZPER_CLOUD_BUDGET:-128}"
 whisper="${WHISPER_MODEL:-base}"
 bin="${WHEEZPER:-target/release/wheezper}"
+extra=()
+if [ -n "${KNOWLEDGEBASE:-}" ]; then
+    [ -f "$KNOWLEDGEBASE" ] || { echo "no such knowledgebase: $KNOWLEDGEBASE" >&2; exit 2; }
+    extra+=(--knowledgebase "$KNOWLEDGEBASE")
+fi
 [ -x "$bin" ] || { echo "build the release binary first ($bin)" >&2; exit 2; }
 if ! command -v ffmpeg >/dev/null; then
     echo "ffmpeg is required to decode the sample" >&2
@@ -37,7 +43,7 @@ echo "wheezper: cloud agent test -> $out (model=$model, whisper=$whisper)"
 ffmpeg -nostdin -v error -i "$audio" -vn -ac 1 -ar 16000 -f f32le - \
     | "$bin" --source stdin --model "$whisper" --language en \
         --prompt "Java Spring Boot developer interview: Spring Boot, microservices, REST APIs, Kubernetes, AWS, Java." \
-        --with-agent "ollama-cloud:$model:$budget" \
+        --with-agent "ollama-cloud:$model:$budget" "${extra[@]}" \
         --notes "$notes" > "$log" 2>&1
 
 if ! grep -q 'ANS: ' "$notes"; then

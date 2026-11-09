@@ -143,12 +143,18 @@ Windows cross-build and Termux `--no-default-features` build green.
   running.
 - The orchestration thread inserts one-line annotations directly under their
   matching transcript rows. The line is `↳ 🤖 <channel> / <model>: ANS: <answer>`;
-  annotations identify `me`/`them`, go to the notepad only, and never block
-  whisper inference or enter stdout/webhooks. `SKIP` replies are omitted.
+  annotations identify `me`/`them` (interview mode says `candidate`), go to the
+  notepad only, and never block whisper inference or enter stdout/webhooks.
+  `SKIP` replies are omitted.
 - Ollama requests set `think: false`: reasoning cloud models otherwise spend
   the whole token budget in `message.thinking` and return an empty
   `message.content`. `scripts/test-cloud-agent.sh AUDIO [MODEL]` runs a real
   recording through this path and prints the answers as `ANS: …`.
+- `--knowledgebase FILE` switches the agent to **interview mode**: it answers
+  the interviewer's latest line as the candidate, using the file + transcript,
+  in one conversational 10-20 word sentence. The file is bounded to ~4,000
+  chars; `knowledgebase.example.md` is the Java Spring template. Answers are
+  trimmed at a sentence/clause boundary before the 20-word cap.
 - The built-in annotation model defaults to **one** thread
   (`WHEEZPER_AGENT_THREADS` overrides it): a local LLM on the same box must not
   steal a core from the provisional tier. A local Ollama server can still
@@ -191,9 +197,11 @@ src/stream.rs      two-tier streaming engine: final tier (commit-once rule,
                    also the replay + latency benchmarks
 src/llm.rs         LLM backends: Ollama server/cloud and embedded llama.cpp
                    worker (feature `llm`)
-src/agent.rs       async per-line annotation worker and --with-agent provider parser
+src/agent.rs       async per-line annotation worker, interview knowledgebase
+                   mode, and --with-agent provider parser
 src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
 src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
+knowledgebase.example.md  sample Java Spring interview profile for --knowledgebase
 llm-worker/        helper binary for the embedded LLM (separate ggml)
 vendor/            pinned whisper-rs-sys / llama-cpp-sys-2 sources
 bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
@@ -210,7 +218,7 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release --workspace' # 27 pass; 4 ignored
+nix-shell --run 'cargo test  --release --workspace' # 30 pass; 5 ignored
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
@@ -374,6 +382,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - The embedded LLM worker needs the `llm` feature and, in CI, the
   `WHEEZPER_LLM_WORKER` env var; without it `build.rs` embeds an empty
   placeholder and `--ollama` falls back to a server.
+- **The knowledgebase is context, not a prompt dump.** Keep it factual and
+  bounded; it is loaded only with `--with-agent`, and a missing/empty file is a
+  startup error. Interview answers are capped at 20 words by code, not just by
+  the prompt.
 - **Do not infer speaker demographics.** `me`/`them` are capture channels, not
   gender; there is no accent/age/voice heuristic in the code. Accent robustness
   is the whisper model's job: `base` can be rough on fast Indian English while

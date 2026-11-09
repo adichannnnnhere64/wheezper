@@ -130,6 +130,12 @@ struct Cli {
     #[arg(long, value_name = "PROVIDER:MODEL[:BUDGET]")]
     with_agent: Option<String>,
 
+    /// Interview knowledgebase (markdown/text). With --with-agent, the agent
+    /// answers the interviewer as the candidate using these facts, in one
+    /// concise 10-20 word sentence.
+    #[arg(long, value_name = "FILE")]
+    knowledgebase: Option<PathBuf>,
+
     /// LLM model for summary/polish. Server: anything it hosts.
     /// Built-in: gemma3-1b [default, Google's, ~800 MB GGUF] or a .gguf path
     /// Cloud: names from https://ollama.com/api/tags (e.g. gemma4:31b)
@@ -305,10 +311,23 @@ impl Engine {
         let transcriber = Transcriber::new(model, &cli.language, threads)?;
         eprintln!("wheezper: notes -> {}", notes_path.display());
         let domain_prompt = cli.prompt.as_deref().map(|p| first_words(p, 40)).filter(|p| !p.is_empty());
+        let knowledgebase = if cli.with_agent.is_some() {
+            cli.knowledgebase
+                .as_deref()
+                .map(agent::load_knowledgebase)
+                .transpose()?
+        } else {
+            if cli.knowledgebase.is_some() {
+                eprintln!("wheezper: warning: --knowledgebase has no effect without --with-agent");
+            }
+            None
+        };
         let agent = cli
             .with_agent
             .as_deref()
-            .map(|spec| agent::Agent::new(spec, domain_prompt.as_deref(), threads))
+            .map(|spec| {
+                agent::Agent::new(spec, domain_prompt.as_deref(), threads, knowledgebase.as_deref())
+            })
             .transpose()?;
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
 
@@ -648,6 +667,11 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("with-agent").or_else(|| get("with_agent")).and_then(|v| v.as_str())
     {
         cli.with_agent = Some(v.to_string());
+    }
+    if !given("knowledgebase")
+        && let Some(v) = get("knowledgebase").or_else(|| get("knowledge_base")).and_then(|v| v.as_str())
+    {
+        cli.knowledgebase = Some(PathBuf::from(v));
     }
     if !given("source")
         && let Some(v) = get("source").and_then(|v| v.as_str())
