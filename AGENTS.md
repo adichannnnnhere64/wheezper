@@ -247,7 +247,8 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
 **89–92 %** live (measured 89.4 / 89.4 / 92.4 / 92.4 / 92.4, and 97.0 pinned to
-2 cores). The engine's own replay benchmark
+2 cores). The script scores up to two captures and keeps the better one — a
+CI runner's PulseAudio can land a single run badly; both numbers are printed. The engine's own replay benchmark
 (`stream::tests::measures_notes_accuracy`) averages **93.0 %** over ten audio
 alignments (`OFFSET_MS=…`, because the same alignment measured eight times only
 proves the dice rolled well), worst alignment 84.85 — and it scores the same
