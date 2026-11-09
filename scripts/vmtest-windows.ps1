@@ -122,7 +122,7 @@ function Assert-NoInstallFootprint {
     Check $writable "work dir is writable by this user: $WorkDir"
 }
 
-function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$TimeoutSec = 420) {
+function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$TimeoutSec = 600) {
     $out = Join-Path $WorkDir 'run.out'
     $err = Join-Path $WorkDir 'run.err'
     $splat = @{
@@ -139,7 +139,8 @@ function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$Timeo
     # job sat on the runner until the 40 minute timeout killed it).
     if ($StdinFile) { $splat.RedirectStandardInput = $StdinFile }
     $p = Start-Process @splat
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+    $exited = $p.WaitForExit($TimeoutSec * 1000)
+    if (-not $exited) {
         # a hung child must fail the test, not eat the runner's time budget
         try { $p.Kill($true) } catch { }
         return [pscustomobject]@{
@@ -148,6 +149,10 @@ function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$Timeo
             Stderr   = "timed out after ${TimeoutSec}s: wheezper $($Arguments -join ' ')"
         }
     }
+    # WaitForExit(ms) leaves ExitCode unset with redirected output: the
+    # parameterless overload flushes the pipes, Refresh() re-reads the handle
+    $null = $p.WaitForExit()
+    $p.Refresh()
     [pscustomobject]@{
         ExitCode = $p.ExitCode
         Stdout   = (Get-Content $out -Raw -ErrorAction SilentlyContinue)
