@@ -164,7 +164,7 @@ impl Agent {
                         continue;
                     }
                     let channel = job.channel.as_deref().unwrap_or("meeting");
-                    let annotation = format!("  ↳ 🤖 {channel} / {model}: {response}");
+                    let annotation = format!("  ↳ 🤖 {channel} / {model}: ANS: {response}");
                     if completed_tx
                         .send(Annotation {
                             target: job.target,

@@ -355,7 +355,9 @@ wheezper --ollama http://server:11434        # explicit remote Ollama server
 
 `--with-agent PROVIDER:MODEL[:BUDGET]` supports `ollama` (local server at
 `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
-`builtin` (the embedded llama.cpp model). `ollama-cloud` needs no local model
+`builtin` (the embedded llama.cpp model). Cloud reasoning models are asked not
+to emit chain-of-thought (`think: false`), so the token budget is spent on the
+answer; annotations render as `↳ 🤖 …: ANS: …`. `ollama-cloud` needs no local model
 or server; it is HTTPS plus the key. If `OLLAMA_API_KEY` is not exported,
 wheezper also reads it from `./.env` (environment first; `.env` is never
 committed; see `.env.example`). The optional final number is the
@@ -371,6 +373,21 @@ latency matters most.
 `--prompt` is limited to the first 40 words for whisper and the agent. When
 whisper has local continuity text, the domain hint is combined with its last 12
 words so the domain hint cannot evict local context.
+
+### Cloud annotation smoke test
+
+```bash
+# OLLAMA_API_KEY can come from the environment or ./.env
+cargo build --release
+scripts/test-cloud-agent.sh interview.wav deepseek-v4.1-flash
+```
+
+The script transcribes the recording through the normal stdin path, runs the
+cloud annotation agent, and prints every answer as `ANS: …`. It exits non-zero
+if no annotation reaches the notepad. The pipeline itself has no speaker
+assumptions (`me`/`them` are capture channels); use
+`WHISPER_MODEL=small scripts/test-cloud-agent.sh ...` (or `turbo`) when testing
+accented English.
 
 How the built-in engine fits in one exe: whisper.cpp and llama.cpp both
 bundle their own ggml, so they cannot be linked into a single executable.

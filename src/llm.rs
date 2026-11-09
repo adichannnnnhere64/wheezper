@@ -130,6 +130,20 @@ pub struct Ollama {
     agent: ureq::Agent,
 }
 
+fn chat_body(model: &str, system: &str, prompt: &str, max_tokens: u32) -> String {
+    // Reasoning models put chain-of-thought in `message.thinking` and can
+    // spend the whole token budget before writing `message.content`.
+    // Annotations and summaries need the answer, not the scratchpad, so
+    // disable thinking explicitly; models without the toggle ignore it.
+    format!(
+        "{{\"model\":{}, \"messages\":[{{\"role\":\"system\",\"content\":{}}},{{\"role\":\"user\",\"content\":{}}}], \"think\":false, \"stream\":false, \"options\":{{\"num_predict\":{}, \"temperature\":0.3}}}}",
+        json_str(model),
+        json_str(system),
+        json_str(prompt),
+        max_tokens,
+    )
+}
+
 impl Ollama {
     pub fn new(url: &str, model: &str) -> Self {
         let config = ureq::config::Config::builder()
@@ -175,11 +189,19 @@ impl Ollama {
             .map(|s| s.split('"').next().unwrap_or_default().to_string())
             .collect();
         if !names.iter().any(|name| model_matches(name, &self.model)) {
+            let cloud = self.url.contains("ollama.com");
+            let available = if names.is_empty() { "none".to_string() } else { names.join(", ") };
+            let hint = if cloud {
+                format!("check the model name at {}/api/tags", self.url)
+            } else {
+                format!("Try: ollama pull {}", self.model)
+            };
             return Err(anyhow!(
-                "model '{}' not found in Ollama (available: {}). Try: ollama pull {}",
+                "model '{}' not found in {} (available: {}). {}",
                 self.model,
-                if names.is_empty() { "none".to_string() } else { names.join(", ") },
-                self.model
+                if cloud { "Ollama Cloud" } else { "Ollama" },
+                available,
+                hint
             ));
         }
         Ok(())
@@ -187,13 +209,7 @@ impl Ollama {
 
     /// One-shot generation via /api/chat. Returns the model's reply text.
     pub fn generate(&self, system: &str, prompt: &str, max_tokens: u32) -> Result<String> {
-        let body = format!(
-            "{{\"model\":{}, \"messages\":[{{\"role\":\"system\",\"content\":{}}},{{\"role\":\"user\",\"content\":{}}}], \"stream\":false, \"options\":{{\"num_predict\":{}, \"temperature\":0.3}}}}",
-            json_str(&self.model),
-            json_str(system),
-            json_str(prompt),
-            max_tokens,
-        );
+        let body = chat_body(&self.model, system, prompt, max_tokens);
         let resp = self
             .auth(
                 self.agent
@@ -212,8 +228,22 @@ impl Ollama {
             .read_to_string(&mut body)
             .context("reading Ollama response")?;
         // {"message":{"role":"assistant","content":"..."},"done":true}
-        extract_json_string(&body, "content")
-            .ok_or_else(|| anyhow!("could not parse Ollama response: {}", body.chars().take(200).collect::<String>()))
+        match extract_json_string(&body, "content") {
+            Some(content) if !content.trim().is_empty() => Ok(content),
+            Some(_) => {
+                if extract_json_string(&body, "thinking").is_some_and(|t| !t.trim().is_empty()) {
+                    Err(anyhow!(
+                        "Ollama spent the whole budget on reasoning (raise the token budget or use a non-reasoning model)"
+                    ))
+                } else {
+                    Err(anyhow!("Ollama returned an empty answer"))
+                }
+            }
+            None => Err(anyhow!(
+                "could not parse Ollama response: {}",
+                body.chars().take(200).collect::<String>()
+            )),
+        }
     }
 }
 
@@ -433,6 +463,32 @@ mod tests {
         assert_eq!(parse_dotenv("OLLAMA_API_KEY=\"a b\"", "OLLAMA_API_KEY").as_deref(), Some("a b"));
         assert_eq!(parse_dotenv("OLLAMA_API_KEY=", "OLLAMA_API_KEY"), None);
         assert_eq!(parse_dotenv("OTHER=x", "OLLAMA_API_KEY"), None);
+    }
+
+    #[test]
+    fn chat_requests_disable_thinking_and_bound_output() {
+        let body = super::chat_body("m", "system", "user", 64);
+        assert!(body.contains("\"think\":false"));
+        assert!(body.contains("\"num_predict\":64"));
+        assert!(body.contains("\"stream\":false"));
+    }
+
+    #[test]
+    #[ignore = "requires OLLAMA_API_KEY and network access"]
+    fn cloud_model_returns_an_answer() {
+        let model = std::env::var("WHEEZPER_CLOUD_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4.1-flash".to_string());
+        let server = super::Ollama::new("https://ollama.com/api", &model);
+        server.check().expect("cloud model available");
+        let answer = server
+            .generate(
+                "You are a Java Spring developer being interviewed. Answer in one short paragraph.",
+                "Explain how Spring Boot dependency injection works.",
+                128,
+            )
+            .expect("cloud generate");
+        assert!(!answer.trim().is_empty(), "cloud model returned no content");
+        println!("ANS: {answer}");
     }
 
     #[test]

@@ -142,9 +142,13 @@ Windows cross-build and Termux `--no-default-features` build green.
   drains queued annotations for up to 2 s, then abandons whatever is still
   running.
 - The orchestration thread inserts one-line annotations directly under their
-  matching transcript rows. Annotations identify `me`/`them`, go to the notepad
-  only, and never block whisper inference or enter stdout/webhooks. `SKIP`
-  replies are omitted.
+  matching transcript rows. The line is `↳ 🤖 <channel> / <model>: ANS: <answer>`;
+  annotations identify `me`/`them`, go to the notepad only, and never block
+  whisper inference or enter stdout/webhooks. `SKIP` replies are omitted.
+- Ollama requests set `think: false`: reasoning cloud models otherwise spend
+  the whole token budget in `message.thinking` and return an empty
+  `message.content`. `scripts/test-cloud-agent.sh AUDIO [MODEL]` runs a real
+  recording through this path and prints the answers as `ANS: …`.
 - The built-in annotation model defaults to **one** thread
   (`WHEEZPER_AGENT_THREADS` overrides it): a local LLM on the same box must not
   steal a core from the provisional tier. A local Ollama server can still
@@ -195,7 +199,8 @@ vendor/            pinned whisper-rs-sys / llama-cpp-sys-2 sources
 bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
                    RESULTS.md, fixtures, song sweep, score tests
 scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
-                   windows}, bench-interview-dummy.sh, termux-build.sh
+                   windows}, bench-interview-dummy.sh, test-cloud-agent.sh,
+                   termux-build.sh
 .github/workflows/ ci.yml (gates), termux.yml, release.yml
 PLAN.md            original design intent (partly diverged; this file wins)
 ```
@@ -205,7 +210,7 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release --workspace' # 26 pass; 3 ignored
+nix-shell --run 'cargo test  --release --workspace' # 27 pass; 4 ignored
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
@@ -369,6 +374,11 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - The embedded LLM worker needs the `llm` feature and, in CI, the
   `WHEEZPER_LLM_WORKER` env var; without it `build.rs` embeds an empty
   placeholder and `--ollama` falls back to a server.
+- **Do not infer speaker demographics.** `me`/`them` are capture channels, not
+  gender; there is no accent/age/voice heuristic in the code. Accent robustness
+  is the whisper model's job: `base` can be rough on fast Indian English while
+  `small`/`turbo` are materially better. Test with more than one English voice
+  before claiming a voice-class regression.
 - **Annotations are on a different thread, but they still share the CPU.** The
   built-in agent defaults to one thread and a four-job queue; local Ollama can
   use every core it wants. Phase 2's provisional budget wins: annotations are
