@@ -24,3 +24,7 @@ bench/out/
 # Python bytecode from bench/score.py tests
 __pycache__/
 *.pyc
+
+# local API keys (never commit)
+.env
+.env.local

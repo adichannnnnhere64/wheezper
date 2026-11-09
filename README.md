@@ -56,7 +56,8 @@ wheezper --source dual --prompt "Engineering planning for Atlas" \
   --with-agent "ollama:gemma3:1b:256"
 
 # cloud annotations require OLLAMA_API_KEY; the final number is output tokens
-wheezper --with-agent "ollama-cloud:deepseek-v4.1-flash:1017"
+OLLAMA_API_KEY=... wheezper --with-agent "ollama-cloud:deepseek-v4.1-flash:1017"
+# or put OLLAMA_API_KEY in ./.env (gitignored); the environment wins
 
 # pick a model: tiny, base (default), small, medium, turbo
 wheezper --model small
@@ -354,7 +355,10 @@ wheezper --ollama http://server:11434        # explicit remote Ollama server
 
 `--with-agent PROVIDER:MODEL[:BUDGET]` supports `ollama` (local server at
 `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
-`builtin` (the embedded llama.cpp model). The optional final number is the
+`builtin` (the embedded llama.cpp model). `ollama-cloud` needs no local model
+or server; it is HTTPS plus the key. If `OLLAMA_API_KEY` is not exported,
+wheezper also reads it from `./.env` (environment first; `.env` is never
+committed; see `.env.example`). The optional final number is the
 positive output-token budget (default 256). Calls use a bounded queue, skip
 very short lines, and are capped at 10 per minute; a full queue drops an
 annotation with one warning. Agent output is written only to the notepad, under

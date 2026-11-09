@@ -130,8 +130,9 @@ Windows cross-build and Termux `--no-default-features` build green.
 
 - Example `ollama-cloud:deepseek-v4.1-flash:1017` means a 1017-token output
   budget. The default budget is 256. Providers: `ollama` (local server at
-  `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
-  `builtin` (embedded llama.cpp; requires the `llm` feature).
+  `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required; it
+  reads the environment first, then `./.env`), and `builtin` (embedded
+  llama.cpp; requires the `llm` feature).
 - Provider syntax and model availability are checked at startup; invalid or
   unavailable models fail loudly. The model and endpoint are printed once.
 - Each committed line of at least three words is sent with the previous three
@@ -204,7 +205,7 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release --workspace' # 25 pass; 3 ignored
+nix-shell --run 'cargo test  --release --workspace' # 26 pass; 3 ignored
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
@@ -375,6 +376,9 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - **`bench/score.py` scores only `- [HH:MM:SS] …` rows.** Annotations, summaries
   and other prose are ignored on purpose; do not go back to scoring the whole
   notepad or every annotation becomes an insertion.
+- **`.env` is only an API-key convenience, never a committed file.**
+  `OLLAMA_API_KEY` comes from the environment first; `./.env` is a fallback.
+  Add `.env.example`, not `.env`, and keep `.env` in `.gitignore`.
 - **`--prompt` is opt-in bias.** It helps names/jargon in meetings and hurts
   music (the decoder reads words that are not in the audio); keep it off for
   `--lyrics` unless measured otherwise. The domain hint is capped at 40 words

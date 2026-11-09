@@ -98,8 +98,8 @@ impl Agent {
                 (Llm::Server(server), endpoint)
             }
             "ollama-cloud" => {
-                if std::env::var("OLLAMA_API_KEY").map_or(true, |key| key.is_empty()) {
-                    bail!("--with-agent ollama-cloud requires OLLAMA_API_KEY");
+                if llm::ollama_api_key().is_none() {
+                    bail!("--with-agent ollama-cloud requires OLLAMA_API_KEY (environment or ./.env)");
                 }
                 let server = llm::Ollama::new("https://ollama.com/api", &spec.model);
                 server

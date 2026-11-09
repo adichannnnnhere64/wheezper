@@ -79,6 +79,48 @@ impl Llm {
 // Ollama server backend
 // ---------------------------------------------------------------------------
 
+/// API key from the process environment, falling back to `./.env`.
+///
+/// The fallback exists so a portable run can carry its key in a local file
+/// without a dotenv crate or mutating the process environment. The real
+/// environment always wins, and a missing/unreadable `.env` is not an error.
+pub fn ollama_api_key() -> Option<String> {
+    std::env::var("OLLAMA_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            let raw = std::fs::read_to_string(".env").ok()?;
+            parse_dotenv(&raw, "OLLAMA_API_KEY")
+        })
+}
+
+/// Minimal `KEY=VALUE` reader: comments, blank lines, optional `export`, and
+/// matching single/double quotes. No interpolation, which keeps the parser
+/// predictable for API keys.
+fn parse_dotenv(raw: &str, wanted: &str) -> Option<String> {
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != wanted {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
 pub struct Ollama {
     pub url: String,
     pub model: String,
@@ -102,7 +144,7 @@ impl Ollama {
         Self {
             url,
             model: model.to_string(),
-            api_key: std::env::var("OLLAMA_API_KEY").ok().filter(|k| !k.is_empty()),
+            api_key: ollama_api_key(),
             agent: ureq::Agent::new_with_config(config),
         }
     }
@@ -373,7 +415,7 @@ mod builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_json_string, model_matches};
+    use super::{extract_json_string, model_matches, parse_dotenv};
 
     #[test]
     fn extracts_response_field() {
@@ -382,6 +424,15 @@ mod tests {
             Some("hello \"world\"\nline".to_string())
         );
         assert_eq!(extract_json_string(r#"{"error":"x"}"#, "content"), None);
+    }
+
+    #[test]
+    fn reads_api_keys_from_dotenv_syntax() {
+        let raw = "# comment\n\nexport OLLAMA_API_KEY='sk-test'\nOTHER=1\n";
+        assert_eq!(parse_dotenv(raw, "OLLAMA_API_KEY").as_deref(), Some("sk-test"));
+        assert_eq!(parse_dotenv("OLLAMA_API_KEY=\"a b\"", "OLLAMA_API_KEY").as_deref(), Some("a b"));
+        assert_eq!(parse_dotenv("OLLAMA_API_KEY=", "OLLAMA_API_KEY"), None);
+        assert_eq!(parse_dotenv("OTHER=x", "OLLAMA_API_KEY"), None);
     }
 
     #[test]
