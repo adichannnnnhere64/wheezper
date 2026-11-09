@@ -160,11 +160,23 @@ impl Tuning {
 /// makes the ggml spin barriers convoy and doubles every pass time
 /// (measured on the 6-core reference box: 2+4 misses the p90 budget,
 /// 2+3 clears it with margin).
+///
+/// On many-thread laptops (>8 logical cores) the provisional tier gains
+/// nothing past 3 threads (measured: 4th thread only adds jitter) while
+/// the low-frequency cores make the final pass the backlog risk — so the
+/// extra budget goes to the final tier (2 -> 4), where it halves the
+/// worst-case notes lag that is the only place a single-channel setup can
+/// fall behind real time.
 pub fn split_threads(cores: i32, requested: i32) -> (i32, i32) {
     if requested > 0 {
         // explicit --threads: split it evenly and predictably
         let half = (requested / 2).max(1);
         return (half, half);
+    }
+    if cores >= 9 {
+        let fin = (cores / 4).clamp(2, 4);
+        let prov = 3;
+        return (fin, prov);
     }
     let fin = (cores / 3).clamp(1, 2);
     let prov = (cores - fin - 1).clamp(1, 4);
@@ -747,6 +759,27 @@ mod tests {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn split_threads_reserves_a_core_and_never_starves_a_tier() {
+        // explicit request: even split, both tiers kept alive
+        assert_eq!(super::split_threads(14, 8), (4, 4));
+        assert_eq!(super::split_threads(2, 1), (1, 1));
+        // small boxes: up to 2 final, provisional gets the rest minus one
+        assert_eq!(super::split_threads(6, 0), (2, 3));
+        assert_eq!(super::split_threads(4, 0), (1, 2));
+        assert_eq!(super::split_threads(2, 0), (1, 1));
+        // many-thread laptops: provisional caps at 3, finals get the gain
+        assert_eq!(super::split_threads(14, 0), (3, 3));
+        assert_eq!(super::split_threads(16, 0), (4, 3));
+        for cores in [1, 2, 4, 6, 8, 9, 12, 14, 20, 32] {
+            let (fin, prov) = super::split_threads(cores, 0);
+            assert!(fin >= 1 && prov >= 1, "cores={cores}: {fin}/{prov}");
+            if cores >= 3 {
+                assert!(fin + prov < cores, "cores={cores}: no capture core left");
+            }
+        }
     }
 
     #[test]

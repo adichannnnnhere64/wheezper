@@ -101,7 +101,11 @@ THREADS=4 nix-shell --run \
 4. **Thread budget decides the tail.** Two ggml workers oversubscribing the
    box spin-barrier convoy and double every pass: 4+4 measured p90 > 1 s.
    The shipped split on 6 cores is 2 (final) + 3 (provisional) + 1 (capture/
-   main loop) — see `stream::split_threads`. When stdout is piped the final
+   main loop) — see `stream::split_threads`. On ≥9-thread laptops the
+   provisional tier is capped at 3 threads (a 4th only adds jitter: measured
+   0.17 s/0.30 s p90 vs 0.15/0.31 at 3) and the spare budget goes to the
+   final tier (up to 4), because low-frequency laptop cores make the final
+   pass the backlog risk, not the preview. When stdout is piped the final
    tier is alone and gets the old full share (`cores.min(4)`).
 5. Append-only whisper cannot reach 0.5 s at acceptable quality: stable
    decode needs ≥ ~2 s of window, and every fast small-window config
