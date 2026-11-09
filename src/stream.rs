@@ -95,8 +95,8 @@ impl Tuning {
     pub fn final_default() -> Self {
         Self {
             window_s: 8.0,
-            min_window_s: 1.5,
-            idle_min_window_s: 0.5,
+            min_window_s: 2.5,
+            idle_min_window_s: 2.0,
             // 3 s of new audio per pass, not 0.7: each pass starts at the
             // commit boundary and commits up to `window - hold`, so a 3 s
             // cadence commits ~2.5-3 s of text per pass instead of ~1 s.
@@ -284,11 +284,6 @@ pub struct StreamChannel {
     line: String,
     unprocessed: usize,
     in_flight: bool,
-    /// Wall-clock time of the last chunk that carried speech energy.
-    last_audio: Instant,
-    /// Consecutive chunks of >= 0.5 s: the device is batching its audio, which
-    /// makes wall-clock silence meaningless as a "did the speaker pause" signal.
-    big_chunks: u8,
     /// Shutdown drain: no more audio will arrive, so the buffered tail is the
     /// end of the utterance even if it has speech right up to the last sample.
     draining: bool,
@@ -297,6 +292,8 @@ pub struct StreamChannel {
     last_commit_s: f64,
     /// Channel-timeline end of the last audio chunk above the speech floor.
     last_speech_s: f64,
+    /// Is there speech in the buffer? (Silence can be dropped without a pass.)
+    speech_in_buf: bool,
     /// Text of the last few committed words, for the boundary dedupe.
     committed_tail: Vec<String>,
     /// The "falling behind" warning is printed once per channel.
@@ -315,12 +312,11 @@ impl StreamChannel {
             line: String::new(),
             unprocessed: 0,
             in_flight: false,
-            last_audio: Instant::now(),
-            big_chunks: 0,
             draining: false,
             closed: false,
             last_commit_s: 0.0,
             last_speech_s: 0.0,
+            speech_in_buf: false,
             committed_tail: Vec::new(),
             warned_drop: false,
             retries: 0,
@@ -332,21 +328,11 @@ impl StreamChannel {
         self.unprocessed += chunk.len();
         // silence from an idle monitor must not look like fresh speech: only
         // audible chunks count as activity (≈ -45 dBFS energy floor)
-        // three big chunks in a row = the device is delivering in lumps (a
-        // PulseAudio monitor on a busy box hands over 1-2 s at a time); one
-        // stray big chunk is just a startup or backlog flush
-        if chunk.len() as f32 / TARGET_RATE as f32 > 0.5 {
-            self.big_chunks = (self.big_chunks + 1).min(4);
-        } else {
-            self.big_chunks = 0;
-        }
         let energy = chunk.iter().map(|x| x * x).sum::<f32>() / chunk.len().max(1) as f32;
-        if energy > SPEECH_ENERGY {
-            self.last_audio = Instant::now();
-        }
         self.buf.extend_from_slice(chunk);
         if energy > SPEECH_ENERGY {
             self.last_speech_s = self.buf_start_s + self.buf.len() as f64 / TARGET_RATE as f64;
+            self.speech_in_buf = true;
         }
         let cap = (self.tuning.buf_cap_s * TARGET_RATE as f32) as usize;
         if self.buf.len() > cap {
@@ -369,29 +355,14 @@ impl StreamChannel {
         self.buf_start_s + self.buf.len() as f64 / TARGET_RATE as f64
     }
 
-    /// No speech for `idle_after_s`, so the utterance *may* be over and a pass
-    /// should fire now instead of waiting for more audio. Wall-clock based —
-    /// but only when the device delivers audio in small chunks. A PulseAudio
-    /// monitor on a busy runner hands over ~1-2 s at a time, and then "no chunk
-    /// for 1.5 s" is a property of the delivery, not of the speech: every pass
-    /// looked like an utterance end, which commits the unstable tail without
-    /// right-context and wrote fragments ("not watch your", "your country.")
-    /// into the notes. `speech_ended` covers that case.
-    fn quiet(&self) -> bool {
-        self.draining
-            || (self.big_chunks < 3
-                && self.last_audio.elapsed() >= Duration::from_secs_f32(self.tuning.idle_after_s))
-    }
-
-    /// Did the audio itself go quiet? Measured on the channel timeline, not by
-    /// wall-clock: a capture device hands its audio over in lumps (a PulseAudio
-    /// monitor on a busy runner delivers ~2 s at a time), so a delivery gap is
-    /// not a pause. Only this decides whether the unstable tail may be
-    /// committed without right-context — getting it wrong writes garbage
+    /// Did the audio itself go quiet? Measured on the channel timeline, never
+    /// by wall-clock: a capture device hands its audio over in lumps (a
+    /// PulseAudio monitor on a busy runner delivers 1-2 s at a time), so a
+    /// delivery gap is not a pause. Only this decides whether the unstable tail
+    /// may be committed without right-context — getting it wrong writes garbage
     /// ("not watch your", "your country.") into the notes.
     fn speech_ended(&self) -> bool {
-        self.quiet()
-            || self.draining
+        self.draining
             || self.audio_end_s() - self.last_speech_s >= self.tuning.idle_after_s as f64
     }
 
@@ -404,16 +375,31 @@ impl StreamChannel {
         if self.in_flight || self.closed {
             return false;
         }
-        let quiet = self.quiet();
-        let min =
-            if quiet { self.tuning.idle_min_window_s } else { self.tuning.min_window_s } * TARGET_RATE as f32;
+        // nothing but silence buffered: free it instead of paying a full pass
+        // (whisper pads to 30 s, so a silent window still costs ~1.5 s)
+        if !self.speech_in_buf {
+            let end = self.audio_end_s();
+            self.drop_committed(end);
+            return false;
+        }
+        let drain = self.draining;
+        let min = if drain {
+            self.tuning.idle_min_window_s
+        } else {
+            self.tuning.min_window_s
+        } * TARGET_RATE as f32;
         if self.buf.len() < min as usize {
             return false;
         }
         let window_cap = (self.tuning.window_s * TARGET_RATE as f32) as usize;
         let backlog = self.buf.len() >= window_cap;
         let need = (self.tuning.new_audio_s * TARGET_RATE as f32) as usize;
-        if !quiet && !backlog && self.unprocessed < need {
+        // Windows fire on new audio, not on wall-clock silence: whether a
+        // device delivered a chunk recently says nothing about the speaker, and
+        // letting that schedule passes made the window length depend on the
+        // audio backend (2.5 s windows on a PulseAudio monitor, 4 s on
+        // CoreAudio, and different notes for the same meeting).
+        if !drain && !backlog && self.unprocessed < need {
             return false;
         }
         let win_len = window_cap.min(self.buf.len());
@@ -438,7 +424,6 @@ impl StreamChannel {
         // when the audio itself ended, the window's tail IS the end of the
         // utterance: no later pass will give it right-context, so commit it
         let ended = self.speech_ended();
-        let quiet = self.quiet();
         let cutoff = (if ended { dur_s } else { dur_s - self.tuning.hold_s }).max(0.0) as f64;
 
         // stable words of this pass, in order: (channel-time end, text)
@@ -519,7 +504,7 @@ impl StreamChannel {
         }
         if std::env::var("WZ_STREAM_DEBUG").ok().as_deref() == Some("1") {
             eprintln!(
-                "pass start={start_s:.2} dur={dur_s:.2} cutoff={cutoff:.2} quiet={quiet} words={} dup={dup} cand_head={:?} tail={:?} committed={:?} boundary={upto:.2}",
+                "pass start={start_s:.2} dur={dur_s:.2} cutoff={cutoff:.2} ended={ended} words={} dup={dup} cand_head={:?} tail={:?} committed={:?} boundary={upto:.2}",
                 cand.len(),
                 cand.iter().take(2).map(|(e, w)| (format!("{e:.2}"), w.trim())).collect::<Vec<_>>(),
                 self.committed_tail,
@@ -570,6 +555,7 @@ impl StreamChannel {
         }
         self.buf.drain(..n);
         self.buf_start_s += n as f64 / TARGET_RATE as f64;
+        self.speech_in_buf = self.last_speech_s > self.buf_start_s;
     }
 
     /// Stop accepting audio for this channel (the shutdown drain commits
@@ -593,7 +579,7 @@ impl StreamChannel {
         if line.split_whitespace().count() >= LINE_FLUSH_WORDS {
             return true;
         }
-        self.speech_ended() && self.audio_end_s() - self.last_speech_s > IDLE_FLUSH.as_secs_f64() && !self.in_flight
+        self.audio_end_s() - self.last_speech_s > IDLE_FLUSH.as_secs_f64() && !self.in_flight
     }
 
     /// Take the completed line, clearing state for the next one.
@@ -955,27 +941,24 @@ mod tests {
         assert!(!prov_commits.is_empty(), "no provisional words were committed");
     }
 
-    /// A device that hands over seconds of audio at a time must not look like
-    /// a speaker who stopped talking: wall-clock silence there is a property of
-    /// the delivery, and treating it as an utterance end commits whisper's
+    /// "The utterance ended" must be a property of the audio, not of how the
+    /// device hands it over: a backend that delivers seconds per callback used
+    /// to look like a speaker who stopped talking, which commits whisper's
     /// unstable tail without right-context.
     #[test]
-    fn lumpy_delivery_is_not_an_utterance_end() {
+    fn utterance_end_is_measured_in_audio_not_wall_clock() {
         let mut sc = StreamChannel::new(None, Tuning::final_default());
         let speech = vec![0.1f32; TARGET_RATE as usize]; // 1 s of audible audio
         let silence = vec![0.0f32; TARGET_RATE as usize]; // 1 s of digital silence
-        // smooth delivery: 100 chunks of 10 ms, so the device is not "lumpy"
-        for part in speech.chunks(160) {
-            sc.push_16k(part);
-        }
-        assert!(!sc.quiet(), "a channel that just received audio is not quiet");
+        // a device that delivers in 1 s lumps
+        sc.push_16k(&speech);
         assert!(!sc.speech_ended(), "speech is still arriving");
-        // then the device starts batching: three 1 s silent chunks
-        for _ in 0..3 {
-            sc.push_16k(&silence);
-        }
-        assert!(sc.speech_ended(), "1.5 s of silent audio means the speech ended");
-        assert!(!sc.quiet(), "but lumpy delivery must not fake a wall-clock pause");
+        // 1 s of silence is a pause, not an utterance end
+        sc.push_16k(&silence);
+        assert!(!sc.speech_ended(), "1 s of silence is still a pause");
+        // 2 s of silence is an utterance end
+        sc.push_16k(&silence);
+        assert!(sc.speech_ended(), "2 s of silent audio means the speech ended");
     }
 
     /// Replays a 16 kHz f32 file through the exact main-loop logic of
@@ -1144,11 +1127,19 @@ mod tests {
         // (a second or two per callback) instead of 10 ms at a time. The engine
         // must behave the same both ways; CI only ever sees the lumpy case.
         let lump_ms: usize = std::env::var("LUMP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // GAP_MS of silence between repetitions: three copies of the same clip
+        // back to back is a stress case no meeting produces (the decoder has no
+        // utterance boundary to lock onto). With gaps the engine commits at
+        // real silence, which is what it is built for.
+        let gap = vec![0.0f32; rate as usize * std::env::var("GAP_MS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) / 1000];
         let chunk = if lump_ms > 0 { rate as usize * lump_ms / 1000 } else { rate as usize / 100 };
         let started = Instant::now();
         let mut fed_samples = 0usize;
         sc.push_16k(feed.resample(&offset));
         for _ in 0..reps {
+            if !gap.is_empty() {
+                sc.push_16k(feed.resample(&gap));
+            }
             let mut i = 0;
             while i < audio.len() {
                 let start = i;

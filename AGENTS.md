@@ -246,11 +246,13 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
-**93–100 %** (measured 90.9 / 92.4 / 93.9 / 95.5 / 96.0 / 96.97 / 97.0 / 100, and
-97.0 pinned to 2 cores). The engine's own replay benchmark
-(`stream::tests::measures_notes_accuracy`) averages **97.1 %** over ten audio
+**89–92 %** live (measured 89.4 / 89.4 / 92.4 / 92.4 / 92.4, and 97.0 pinned to
+2 cores). The engine's own replay benchmark
+(`stream::tests::measures_notes_accuracy`) averages **93.0 %** over ten audio
 alignments (`OFFSET_MS=…`, because the same alignment measured eight times only
-proves the dice rolled well), worst alignment 95.45. Both were ~66–85 % before the fixes in
+proves the dice rolled well), worst alignment 84.85 — and it scores the same
+with `LUMP_MS=1000` (audio delivered a second at a time), which is what CI's
+backend does. Both were ~66–85 % before the fixes in
 the traps list below. The gate is 80 %: the ceiling left is whisper
 hallucinating over pauses, not the pipeline.
 
@@ -321,15 +323,16 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   later end, so "Ask not!" was followed by "not …" (duplicates score as
   insertions). `leading_repeat` compares the pass's first words with the last
   four committed ones (punctuation-only tokens excluded).
-- **"Quiet" is two questions, not one.** A capture device can hand over audio in
-  lumps (a PulseAudio monitor on a busy runner delivers 1-2 s at a time), so
-  "no chunk for 1.5 s" says nothing about whether the speaker paused — that
-  made every pass look like an utterance end and wrote fragments ("not watch
-  your", "your country.") into the notes, which is exactly what CI kept
-  failing on while local runs were fine. `quiet()` (wall-clock, only trusted
-  when chunks are small) decides when to *dispatch* a pass; `speech_ended()`
-  (in audio time, from `last_speech_s`) decides whether the unstable tail may
-  be *committed*.
+- **Never schedule or judge anything on wall-clock audio timing.** A capture
+  device hands audio over in lumps (a PulseAudio monitor on a busy runner
+  delivers 1-2 s per callback), so "no chunk for 1.5 s" says nothing about
+  whether the speaker paused. Deriving the window from that made the notes
+  depend on the audio backend (2.5 s windows on a PulseAudio monitor, 4 s on
+  PipeWire) and wrote fragments ("not watch your", "your country.") into the
+  notes — the failure CI kept hitting while local runs were fine. Now: a pass
+  fires on `new_audio_s` of new audio (or a full window when behind), silence
+  is dropped without a pass (`speech_in_buf`), and "the utterance ended" is
+  measured on the channel timeline (`speech_ended`, from `last_speech_s`).
 - **The streaming tier does not use the continuity prompt** (`prompt_tail` is
   empty unless `WZ_PROMPT_WORDS=n`). A 12-word tail is text the decoder tries to
   *complete*: measured 2 words committed for 3 s of audio, plus invented
