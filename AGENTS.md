@@ -6,7 +6,7 @@ must not regress.
 
 **wheezper** is a single-binary CLI that listens to a meeting/call and writes a
 timestamped markdown transcript as it happens: local whisper.cpp inference, no
-cloud, no install, Linux / Windows / Android(Termux). Version `0.5.0`.
+cloud, no install, Linux / Windows / Android(Termux). Version `0.5.1`.
 
 ---
 
