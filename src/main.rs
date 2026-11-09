@@ -136,6 +136,12 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     knowledgebase: Option<PathBuf>,
 
+    /// With --knowledgebase: when the kb does not cover the question, answer
+    /// general/technical questions from the model's own knowledge instead of
+    /// replying SKIP. Personal experience still comes only from the kb.
+    #[arg(long)]
+    kb_fallback: bool,
+
     /// LLM model for summary/polish. Server: anything it hosts.
     /// Built-in: gemma3-1b [default, Google's, ~800 MB GGUF] or a .gguf path
     /// Cloud: names from https://ollama.com/api/tags (e.g. gemma4:31b)
@@ -326,7 +332,13 @@ impl Engine {
             .with_agent
             .as_deref()
             .map(|spec| {
-                agent::Agent::new(spec, domain_prompt.as_deref(), threads, knowledgebase.as_deref())
+                agent::Agent::new(
+                    spec,
+                    domain_prompt.as_deref(),
+                    threads,
+                    knowledgebase.as_deref(),
+                    cli.kb_fallback,
+                )
             })
             .transpose()?;
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);

@@ -155,6 +155,10 @@ Windows cross-build and Termux `--no-default-features` build green.
   in one conversational 10-20 word sentence. The file is bounded to ~4,000
   chars; `knowledgebase.example.md` is the Java Spring template. Answers are
   trimmed at a sentence/clause boundary before the 20-word cap.
+- `--kb-fallback` relaxes interview mode: questions the kb does not cover get
+  answered from the model's own general/technical knowledge instead of `SKIP`.
+  Personal experience still comes only from the kb (the agent must never invent
+  facts about the candidate), so off by default.
 - The built-in annotation model defaults to **one** thread
   (`WHEEZPER_AGENT_THREADS` overrides it): a local LLM on the same box must not
   steal a core from the provisional tier. A local Ollama server can still

@@ -75,10 +75,19 @@ fn agent_system_prompt(
     interview: bool,
     knowledgebase: Option<&str>,
     domain_prompt: Option<&str>,
+    kb_fallback: bool,
 ) -> String {
     let mut system = if let Some(kb) = knowledgebase.filter(|kb| !kb.trim().is_empty()) {
+        // The default is strict: kb silence means SKIP, so the agent can never
+        // invent experience. --kb-fallback relaxes only the general/technical
+        // case; personal facts stay kb-bound either way.
+        let missing = if kb_fallback {
+            "If the knowledgebase does not cover the question, answer general and technical questions from your own knowledge; still never invent facts about your own experience."
+        } else {
+            "If the question cannot be answered from the knowledgebase, reply exactly SKIP."
+        };
         format!(
-            "You are the candidate in a live job interview. Answer the interviewer's latest question or interview prompt in the first person, using the knowledgebase and the interview transcript. Reply with one concise, conversational, interview-ready sentence of 10-20 words. Do not add analysis, notes, or explanations; do not invent facts. For greetings, thanks, small talk, or statements that are not interview questions, reply exactly SKIP. If the question cannot be answered from the knowledgebase, reply exactly SKIP.\n\nKnowledgebase:\n{kb}"
+            "You are the candidate in a live job interview. Answer the interviewer's latest question or interview prompt in the first person, using the knowledgebase and the interview transcript. Reply with one concise, conversational, interview-ready sentence of 10-20 words. Do not add analysis, notes, or explanations; do not invent facts. For greetings, thanks, small talk, or statements that are not interview questions, reply exactly SKIP. {missing}\n\nKnowledgebase:\n{kb}"
         )
     } else {
         String::from(
@@ -161,6 +170,7 @@ impl Agent {
         domain_prompt: Option<&str>,
         threads: i32,
         knowledgebase: Option<&str>,
+        kb_fallback: bool,
     ) -> Result<Self> {
         let spec = AgentSpec::parse(raw_spec)?;
         let knowledgebase = knowledgebase.filter(|kb| !kb.trim().is_empty());
@@ -210,13 +220,19 @@ impl Agent {
             _ => bail!("unknown --with-agent provider '{}'", spec.provider),
         };
 
-        let system = agent_system_prompt(interview, knowledgebase, domain_prompt);
+        let system = agent_system_prompt(interview, knowledgebase, domain_prompt, kb_fallback);
 
         eprintln!(
             "wheezper: agent={endpoint} (max {}/min, {} output tokens{})",
             CALLS_PER_MINUTE,
             budget,
-            if interview { ", interview knowledgebase" } else { "" }
+            if interview && kb_fallback {
+                ", interview knowledgebase +general fallback"
+            } else if interview {
+                ", interview knowledgebase"
+            } else {
+                ""
+            }
         );
         let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE_SIZE);
         let (completed_tx, completed) = mpsc::sync_channel::<Annotation>(QUEUE_SIZE);
@@ -415,7 +431,12 @@ mod tests {
 
     #[test]
     fn interview_prompt_has_persona_and_word_limit() {
-        let prompt = agent_system_prompt(true, Some("Position: Java Spring developer"), None);
+        let prompt = agent_system_prompt(true, Some("Position: Java Spring developer"), None, false);
+        assert!(prompt.contains("reply exactly SKIP.\n\nKnowledgebase"));
+        let prompt = agent_system_prompt(true, Some("Position: Java Spring developer"), None, true);
+        assert!(!prompt.contains("cannot be answered from the knowledgebase"));
+        assert!(prompt.contains("general and technical questions from your own knowledge"));
+        let prompt = agent_system_prompt(true, Some("Position: Java Spring developer"), None, false);
         assert!(prompt.contains("candidate"));
         assert!(prompt.contains("10-20 words"));
         assert!(prompt.contains("Java Spring developer"));
@@ -452,6 +473,7 @@ mod tests {
             true,
             Some(&kb),
             Some("Java Spring Boot developer interview"),
+            false,
         );
         let user = "Interview transcript (oldest to newest):\nInterviewer: What is your experience with Spring Boot?\n\nAnswer the latest line as the candidate.";
         let answer = server
