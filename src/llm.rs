@@ -132,8 +132,7 @@ impl Ollama {
             .skip(1)
             .map(|s| s.split('"').next().unwrap_or_default().to_string())
             .collect();
-        let wanted = self.model.split(':').next().unwrap_or_default();
-        if !names.iter().any(|n| n.starts_with(wanted)) {
+        if !names.iter().any(|name| model_matches(name, &self.model)) {
             return Err(anyhow!(
                 "model '{}' not found in Ollama (available: {}). Try: ollama pull {}",
                 self.model,
@@ -174,6 +173,12 @@ impl Ollama {
         extract_json_string(&body, "content")
             .ok_or_else(|| anyhow!("could not parse Ollama response: {}", body.chars().take(200).collect::<String>()))
     }
+}
+
+fn model_matches(available: &str, wanted: &str) -> bool {
+    available == wanted
+        || available.strip_suffix(":latest") == Some(wanted)
+        || wanted.strip_suffix(":latest") == Some(available)
 }
 
 /// Minimal JSON string value extractor for flat JSON responses
@@ -368,7 +373,7 @@ mod builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_json_string;
+    use super::{extract_json_string, model_matches};
 
     #[test]
     fn extracts_response_field() {
@@ -377,5 +382,12 @@ mod tests {
             Some("hello \"world\"\nline".to_string())
         );
         assert_eq!(extract_json_string(r#"{"error":"x"}"#, "content"), None);
+    }
+
+    #[test]
+    fn validates_exact_ollama_model_tags() {
+        assert!(model_matches("gemma3:1b", "gemma3:1b"));
+        assert!(model_matches("gemma3:1b:latest", "gemma3:1b"));
+        assert!(!model_matches("gemma3:12b", "gemma3:1b"));
     }
 }

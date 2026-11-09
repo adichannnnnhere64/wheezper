@@ -162,8 +162,9 @@ pub enum Profile {
     Final,
     /// Fast preview pass on the live edge: tiny encoder window (audio_ctx),
     /// one greedy decode (no fallback ladder — a failed first decode would
-    /// retry at up to 21x the cost), bounded token count, no prompt or
-    /// rolling context (bounded decode, no prompt echoes).
+    /// retry at up to 21x the cost), bounded token count, and no rolling
+    /// context. An explicit domain hint is still applied; the default remains
+    /// prompt-free to preserve Phase 2 latency.
     Provisional,
 }
 
@@ -211,6 +212,9 @@ pub fn segments_state(
         // encoder window in 20 ms frames; the provisional streaming window
         // must stay within audio_ctx*20 ms or audio past it is silently cut
         params.set_audio_ctx(envi("WZ_AUDIOCTX").unwrap_or(40));
+        if let Some(p) = prompt {
+            params.set_initial_prompt(p);
+        }
     } else {
         if std::env::var("WZ_NOCTX").ok().as_deref() == Some("1") {
             params.set_no_context(true);

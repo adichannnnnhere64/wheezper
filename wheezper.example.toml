@@ -7,6 +7,8 @@
 source = "dual"        # mic | loopback | dual | stdin
 model = "base"         # tiny | base | small | medium | turbo | /path/to/model.bin
 language = "en"        # or "auto" to detect per segment
+# prompt = "Engineering planning for the Atlas migration"  # domain hint, up to 40 words
+# with-agent = "ollama:gemma3:1b:256"  # async annotations; 256 output tokens
 # notes = "notes/work.md"
 # webhook = "http://192.168.1.20:8399/hook"
 # device = "hdmi"           # substring match, see --list-devices

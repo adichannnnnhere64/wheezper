@@ -58,7 +58,9 @@ channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
   matter for accuracy — see the traps below.
 - **Provisional tier** = live-edge preview: tail windows ≤ 0.8 s
   (`audio_ctx=40`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
-  `max_tokens=6`, no prompt or rolling context. Passes cost ~0.10 s; words
+  `max_tokens=6`, and no rolling context. It is prompt-free by default; an
+  explicit Phase-3 domain hint is applied without continuity text. Passes cost
+  ~0.10 s; words
   reach stdout in ~0.2–0.4 s and are revised in place as the final tier
   confirms (single bottom-line rewrite, `▍`-prefixed, ANSI CR+clear — no
   cursor-up, which breaks on wrapped rows). Display-only: never written to
@@ -112,51 +114,48 @@ Accuracy preserved: fixture gate 100 %, song bench byte-identical
 vmtest-capture 90.9 % loopback + dual labels, notes format unchanged,
 Windows cross-build and Termux `--no-default-features` build green.
 
-### Phase 3 — NOT STARTED. Context prompt + AI annotation agent
-
-Two new capabilities, specced here so the shape is agreed before coding.
+### Phase 3 — IMPLEMENTED on `v2`. Context prompt + AI annotation agent
 
 **3a. `--prompt="This is a meeting about google"`**
 
-- Domain/context hint from the human: names, jargon, products, the topic.
-- Used in two places: prepended (bounded, ~40 words) to whisper's
-  `initial_prompt` on every call, and included in the annotation agent's system
-  prompt.
-- whisper's prompt budget is ~224 tokens and the per-line tail prompt already
-  uses it; combine as `<domain prompt>. <last 12 words of the line>` and never
-  let the domain hint evict the local context entirely.
-- Note: prompt bias helped meetings and *hurt* music (it makes the decoder read
-  words that are not in the audio, see `bench/RESULTS.md`). Keep it opt-in.
+- Optional domain hint, bounded to the first 40 words. It is included in
+  whisper's `initial_prompt` for final and provisional calls, and in the
+  annotation system prompt.
+- When local continuity exists, whisper receives `<domain>. <last 12 local
+  words>`; without a domain hint, existing local prompt behavior is unchanged.
+  The provisional preview gets only the domain hint, with no rolling context.
+- Prompt bias can hurt music, so it stays opt-in.
 
 **3b. `--with-agent="PROVIDER:MODEL[:BUDGET]"`**
 
-- Example from the human: `--with-agent="ollama-cloud:deepseek-v4.1-flash:1017"`
-  → provider `ollama-cloud`, model `deepseek-v4.1-flash`, output budget `1017`
-  tokens. Grammar: split on `:`; if the **last** field parses as a positive
-  integer, it is the token budget (model names themselves may contain `:`).
-  Providers: `ollama` (local server, default `http://localhost:11434`),
-  `ollama-cloud` (needs `OLLAMA_API_KEY`, reuse the existing cloud path in
-  `src/llm.rs`), `builtin` (embedded llama.cpp, `llm` feature). Unknown
-  provider/model must fail loudly at startup, not silently disable the feature.
-- Behaviour: after each committed **line** (not each word), send the line plus a
-  short rolling context (previous ~3 lines + `--prompt`) to the agent and write
-  its answer as an indented annotation under the transcript line:
-  ```
-  - [14:02:11] **them:** So the migration window is Tuesday, is that still fine?
-    ↳ 🤖 deepseek-v4.1-flash: concrete date (Tuesday) with no owner; ask who signs off.
-  ```
-- Hard requirements:
-  - **Never block transcription.** Agent calls run on their own thread with a
-    bounded queue; drop (with a one-time warning) rather than delay. Phase 2's
-    latency budget wins over annotations.
-  - Annotations are opt-in, and `bench/score.py` must ignore anything that is
-    not a `- [HH:MM:SS] …` transcript line (it currently scores every word in
-    the file, so annotations would count as insertions).
-  - Cheap defaults: skip lines shorter than ~3 words, cap calls per minute, and
-    print the model/endpoint once at startup. Failures are non-fatal and
-    reported once.
-  - `--with-agent` must work with `--source dual` (annotations say which channel
-    the line came from).
+- Example `ollama-cloud:deepseek-v4.1-flash:1017` means a 1017-token output
+  budget. The default budget is 256. Providers: `ollama` (local server at
+  `http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
+  `builtin` (embedded llama.cpp; requires the `llm` feature).
+- Provider syntax and model availability are checked at startup; invalid or
+  unavailable models fail loudly. The model and endpoint are printed once.
+- Each committed line of at least three words is sent with the previous three
+  transcript lines and the domain hint to a worker thread. The queue holds four
+  jobs, calls are capped at 10/minute, and full/rate-limited queues drop with a
+  one-time warning. Agent failures are non-fatal and reported once.
+- The worker inserts one-line annotations directly under their matching
+  transcript rows. Annotations identify `me`/`them`, go to the notepad only,
+  and never block whisper inference or enter stdout/webhooks. `SKIP` replies are
+  omitted.
+- `bench/score.py` reads VTT references and scores only `- [HH:MM:SS]` rows, so
+  annotations and summaries do not count as insertions. The exact bit-parallel
+  edit-distance path keeps long interview references practical; short fixtures
+  retain the substitution/deletion/insertion alignment output.
+
+Interview accuracy gate (the folder is local test data and must not be committed):
+
+```bash
+nix-shell --run 'cargo build --release'
+scripts/bench-interview-dummy.sh /path/to/interview-dummy turbo
+```
+
+The harness transcribes both `.webm` files with their `.en.vtt` references and
+requires 95% word accuracy by default. Output goes to ignored `bench/out/`.
 
 ---
 
@@ -180,13 +179,15 @@ src/stream.rs      two-tier streaming engine: final tier (commit-once rule,
                    also the replay + latency benchmarks
 src/llm.rs         LLM backends: Ollama server/cloud and embedded llama.cpp
                    worker (feature `llm`)
+src/agent.rs       async per-line annotation worker and --with-agent provider parser
 src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
 src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
 llm-worker/        helper binary for the embedded LLM (separate ggml)
 vendor/            pinned whisper-rs-sys / llama-cpp-sys-2 sources
-bench/             score.py (WER/CER), run.sh, RESULTS.md, fixtures, song sweep
+bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
+                   RESULTS.md, fixtures, song sweep, score tests
 scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
-                   windows}, termux-build.sh
+                   windows}, bench-interview-dummy.sh, termux-build.sh
 .github/workflows/ ci.yml (gates), termux.yml, release.yml
 PLAN.md            original design intent (partly diverged; this file wins)
 ```
@@ -196,7 +197,7 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release'          # 17 tests; +1 ignored benchmark
+nix-shell --run 'cargo test  --release --workspace' # 23 pass; 3 ignored
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
@@ -376,12 +377,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 ## Open questions for the human
 
 - ~~Phase 2: is *replacing* already-shown words acceptable?~~ **Answered**:
-  the notepad stays append-only; only the stdout preview revises (TTY only).
+  transcript rows stay append-only; only the stdout preview revises (TTY only).
+  Opt-in Phase 3 annotations are inserted beneath their transcript row.
 - ~~Phase 2: may a different streaming engine be added?~~ **Moot**: the
   two-tier design hit the 0.5 s budget inside whisper.cpp; revisit only if
   the provisional tier needs to get cheaper still (e.g. `tiny.en`).
-- Phase 3: does `1017` in `--with-agent="ollama-cloud:deepseek-v4.1-flash:1017"`
-  mean output-token budget (current assumption), or something else (port,
-  context size, rate limit)?
-- Phase 3: are annotations allowed to go to the notepad only, or also to stdout
-  (they interleave with live text and the Phase-2 preview line)?
+- ~~Phase 3: does `1017` mean output-token budget?~~ **Answered**: yes.
+- ~~Phase 3: where do annotations go?~~ **Answered**: notepad only.

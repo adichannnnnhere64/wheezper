@@ -1,3 +1,4 @@
+mod agent;
 mod capture;
 mod config;
 mod dsp;
@@ -64,6 +65,10 @@ struct Cli {
     #[arg(short, long, default_value = "auto")]
     language: String,
 
+    /// Domain context for whisper and the optional annotation agent (first 40 words).
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+
     /// Audio source: mic, loopback (system audio), dual (mic + loopback,
     /// labeled "me"/"them"), or stdin (f32le mono PCM).
     /// Default: stdin if stdin is piped, else mic.
@@ -119,6 +124,11 @@ struct Cli {
     /// OLLAMA_API_KEY set in the environment, e.g. --ollama-model gemma4:31b
     #[arg(long, num_args = 0..=1, default_missing_value = "http://localhost:11434")]
     ollama: Option<String>,
+
+    /// Annotate committed transcript lines asynchronously: PROVIDER:MODEL[:BUDGET].
+    /// Providers: ollama, ollama-cloud (OLLAMA_API_KEY), builtin.
+    #[arg(long, value_name = "PROVIDER:MODEL[:BUDGET]")]
+    with_agent: Option<String>,
 
     /// LLM model for summary/polish. Server: anything it hosts.
     /// Built-in: gemma3-1b [default, Google's, ~800 MB GGUF] or a .gguf path
@@ -243,7 +253,9 @@ fn main() -> Result<()> {
         }
         SourceArg::Dual => run_dual(&cli, engine)?,
     };
+    engine.drain_agent_annotations();
     summarize_session(&mut engine)?;
+    engine.drain_agent_annotations();
     Ok(())
 }
 
@@ -266,6 +278,9 @@ struct Engine {
     /// a genuine repeat is kept.
     last: std::collections::HashMap<String, (String, u32)>,
     notepad: Notepad,
+    agent: Option<agent::Agent>,
+    domain_prompt: Option<String>,
+    recent_lines: std::collections::VecDeque<String>,
     webhook: Option<sink::Webhook>,
     partial: bool,
     /// Live-caption channel: Some when --partial. try_send only — if the
@@ -286,7 +301,13 @@ impl Engine {
     fn new(cli: &Cli, notes_path: &std::path::Path, model: &std::path::Path, threads: i32) -> Result<Self> {
         let notepad = Notepad::open(notes_path)?;
         let transcriber = Transcriber::new(model, &cli.language, threads)?;
-        eprintln!("wheezper: notes -> {}", notepad.path().display());
+        eprintln!("wheezper: notes -> {}", notes_path.display());
+        let domain_prompt = cli.prompt.as_deref().map(|p| first_words(p, 40)).filter(|p| !p.is_empty());
+        let agent = cli
+            .with_agent
+            .as_deref()
+            .map(|spec| agent::Agent::new(spec, domain_prompt.as_deref(), threads))
+            .transpose()?;
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
 
         let llm: Option<llm::Llm> = if let Some(url) = cli.ollama.as_deref() {
@@ -410,6 +431,9 @@ impl Engine {
             vad,
             last: Default::default(),
             notepad,
+            agent,
+            domain_prompt,
+            recent_lines: Default::default(),
             webhook,
             partial: cli.partial,
             partial_tx,
@@ -423,7 +447,8 @@ impl Engine {
     /// Queue a live-caption preview (never blocks; drops when busy).
     fn partial(&self, samples: &[f32], label: Option<&'static str>, tail: &Option<String>) {
         let Some(tx) = &self.partial_tx else { return };
-        let msg = PartialMsg { samples: samples.to_vec(), label, prompt: tail.clone() };
+        let prompt = self.whisper_prompt(tail.as_deref());
+        let msg = PartialMsg { samples: samples.to_vec(), label, prompt };
         let _ = tx.try_send(msg);
     }
 
@@ -443,6 +468,53 @@ impl Engine {
         self.lyrics.as_ref().map(|l| l.prompt())
     }
 
+    fn whisper_prompt(&self, context: Option<&str>) -> Option<String> {
+        combine_prompt(self.domain_prompt.as_deref(), context)
+    }
+
+    /// Write transcript text immediately, then enqueue its optional annotation.
+    fn append_line(&mut self, label: Option<&str>, text: &str) -> Result<bool> {
+        let target = self.notepad.append_with_key(label, text)?;
+        let Some(target) = target else { return Ok(false) };
+        if let Some(agent) = &mut self.agent {
+            let current = match label {
+                Some(channel) => format!("{channel}: {text}"),
+                None => text.to_string(),
+            };
+            let context = self
+                .recent_lines
+                .iter()
+                .cloned()
+                .chain(std::iter::once(current.clone()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            agent.submit(target, label, text, &context);
+            self.recent_lines.push_back(current);
+            while self.recent_lines.len() > 3 {
+                self.recent_lines.pop_front();
+            }
+        }
+        Ok(true)
+    }
+
+    /// Apply completed worker output on the orchestration thread, between
+    /// inference calls, so annotation writes can never hold up Whisper.
+    fn drain_agent_annotations(&mut self) {
+        let completed = self
+            .agent
+            .as_ref()
+            .map(agent::Agent::drain_completed)
+            .unwrap_or_default();
+        for annotation in completed {
+            if let Err(error) = self
+                .notepad
+                .append_annotation(&annotation.target, &annotation.text)
+            {
+                eprintln!("wheezper: warning: writing agent annotation failed: {error:#}");
+            }
+        }
+    }
+
     /// Move the lyric cursor past words just committed (live/stream mode).
     fn lyric_remember(&mut self, text: &str) {
         if let Some(l) = &mut self.lyrics {
@@ -459,6 +531,7 @@ impl Engine {
     /// Transcribe one segment and write it to every sink.
     /// `tail` carries per-channel prompt continuity between calls.
     fn handle(&mut self, samples: &[f32], label: Option<&str>, tail: &mut Option<String>) {
+        self.drain_agent_annotations();
         // neural VAD gate: call comfort-noise / loopback dither that passed
         // the RMS gate is dropped here, before it can hallucinate a line
         if let Some(v) = &mut self.vad
@@ -466,11 +539,11 @@ impl Engine {
         {
             return;
         }
-        let prompt = match &self.lyrics {
-            Some(l) => Some(l.prompt()),
-            None => tail.clone(),
-        };
-        match self.transcriber.transcribe(samples, prompt.as_deref()) {
+        let context = self.lyrics.as_ref().map(|l| l.prompt());
+        let prompt = self.whisper_prompt(context.as_deref().or(tail.as_deref()));
+        let result = self.transcriber.transcribe(samples, prompt.as_deref());
+        self.drain_agent_annotations();
+        match result {
             Ok(raw) => {
                 let raw = match &mut self.lyrics {
                     Some(l) => {
@@ -506,7 +579,7 @@ impl Engine {
                         *entry = (text.clone(), 0);
                     }
                 }
-                match self.notepad.append(label, &text) {
+                match self.append_line(label, &text) {
                     Ok(true) => {
                         self.lyric_remember(&text);
                         *tail = Some(last_words(&text, 12));
@@ -548,6 +621,16 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("language").and_then(|v| v.as_str())
     {
         cli.language = v.to_string();
+    }
+    if !given("prompt")
+        && let Some(v) = get("prompt").and_then(|v| v.as_str())
+    {
+        cli.prompt = Some(v.to_string());
+    }
+    if !given("with_agent")
+        && let Some(v) = get("with-agent").or_else(|| get("with_agent")).and_then(|v| v.as_str())
+    {
+        cli.with_agent = Some(v.to_string());
     }
     if !given("source")
         && let Some(v) = get("source").and_then(|v| v.as_str())
@@ -762,6 +845,20 @@ impl LyricFollower {
     }
 }
 
+fn first_words(s: &str, n: usize) -> String {
+    s.split_whitespace().take(n).collect::<Vec<_>>().join(" ")
+}
+
+fn combine_prompt(domain: Option<&str>, context: Option<&str>) -> Option<String> {
+    let domain = domain.map(|p| first_words(p, 40)).filter(|p| !p.is_empty());
+    match (domain, context.filter(|p| !p.trim().is_empty())) {
+        (Some(domain), Some(context)) => Some(format!("{domain}. {}", last_words(context, 12))),
+        (Some(domain), None) => Some(domain),
+        (None, Some(context)) => Some(context.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// Last `n` words of `s`, for whisper's initial prompt.
 fn last_words(s: &str, n: usize) -> String {
     s.split_whitespace()
@@ -814,6 +911,7 @@ impl Channel {
 
     /// Push a chunk of mono samples at the channel's input rate.
     fn push(&mut self, chunk: &[f32], engine: &mut Engine) {
+        engine.drain_agent_annotations();
         self.scratch.clear();
         self.resampler.push_slice(chunk, &mut self.scratch);
         self.framer.push(&self.scratch);
@@ -1145,6 +1243,7 @@ fn run_stream(
     let running = capture::ctrl_c_flag()?;
     let step = Duration::from_millis(25);
     let mut view = LiveView::new(live);
+    let preview_prompt = engine.domain_prompt.clone().unwrap_or_default();
 
     let print_open = |sc: &stream::StreamChannel, first: bool| {
         if first {
@@ -1157,6 +1256,7 @@ fn run_stream(
     };
 
     'live: loop {
+        engine.drain_agent_annotations();
         let mut all_closed = true;
         for (i, (cap, feed)) in caps.iter().zip(feeds.iter_mut()).enumerate() {
             // drain everything the device handed us, not one chunk per
@@ -1235,10 +1335,11 @@ fn run_stream(
         // dispatch new windows; flush completed lines
         let lyric_prompt = engine.lyric_prompt();
         for (i, sc) in streams.iter_mut().enumerate() {
-            let prompt = lyric_prompt.clone().unwrap_or_else(|| sc.prompt_tail());
-            sc.maybe_send(i, &tx, &prompt);
+            let context = lyric_prompt.clone().unwrap_or_else(|| sc.prompt_tail());
+            let prompt = engine.whisper_prompt(Some(&context));
+            sc.maybe_send(i, &tx, prompt.as_deref().unwrap_or(""));
             if let Some((ptx, _)) = &prov {
-                provs[i].maybe_send(i, ptx);
+                provs[i].maybe_send(i, ptx, &preview_prompt);
             }
             if sc.line_ready()
                 && let Some(line) = sc.take_line()
@@ -1259,13 +1360,14 @@ fn run_stream(
     // dropping the rest would silently lose the tail of the notes.
     for (i, sc) in streams.iter_mut().enumerate() {
         sc.flush();
-        let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
-        sc.maybe_send(i, &tx, &prompt);
+        let context = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
+        let prompt = engine.whisper_prompt(Some(&context));
+        sc.maybe_send(i, &tx, prompt.as_deref().unwrap_or(""));
     }
     for (i, p) in provs.iter_mut().enumerate() {
         p.flush();
         if let Some((ptx, _)) = &prov {
-            p.maybe_send(i, ptx);
+            p.maybe_send(i, ptx, &preview_prompt);
         }
     }
     // a final pass can take seconds (whisper pads to 30 s); wait it out
@@ -1282,13 +1384,14 @@ fn run_stream(
             pending |= if sc.busy() {
                 true
             } else {
-                let prompt = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
-                sc.maybe_send(i, &tx, &prompt)
+                let context = engine.lyric_prompt().unwrap_or_else(|| sc.prompt_tail());
+                let prompt = engine.whisper_prompt(Some(&context));
+                sc.maybe_send(i, &tx, prompt.as_deref().unwrap_or(""))
             };
         }
         if let Some((ptx, _)) = &prov {
             for (i, p) in provs.iter_mut().enumerate() {
-                pending |= if p.busy() { true } else { p.maybe_send(i, ptx) };
+                pending |= if p.busy() { true } else { p.maybe_send(i, ptx, &preview_prompt) };
             }
         }
         if !pending || Instant::now() >= deadline {
@@ -1350,7 +1453,7 @@ fn run_stream(
 /// the terminal line.
 fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str) {
     println!();
-    if let Err(e) = engine.notepad.append(label, line) {
+    if let Err(e) = engine.append_line(label, line) {
         eprintln!("wheezper: notepad write failed: {e:#}");
     }
     if let Some(hook) = &engine.webhook {
@@ -1362,5 +1465,28 @@ fn warn_dropped(rx: &capture::AudioReceiver) {
     let dropped = rx.dropped_chunks();
     if dropped > 0 {
         eprintln!("wheezper: warning: {dropped} audio chunks dropped (transcription fell behind)");
+    }
+}
+
+
+#[cfg(test)]
+mod phase3_tests {
+    use super::{combine_prompt, first_words};
+
+    #[test]
+    fn domain_prompt_is_bounded_and_keeps_local_context() {
+        let domain = (0..45).map(|n| format!("d{n}")).collect::<Vec<_>>().join(" ");
+        let local = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let combined = combine_prompt(Some(&domain), Some(local)).unwrap();
+        let words: Vec<_> = combined.split_whitespace().collect();
+        assert_eq!(words.len(), 52); // 40 domain words + 12 local words
+        assert_eq!(words[0], "d0");
+        assert!(combined.ends_with("two three four five six seven eight nine ten eleven twelve thirteen"));
+        assert_eq!(first_words(&domain, 40).split_whitespace().count(), 40);
+    }
+
+    #[test]
+    fn local_prompt_is_unchanged_without_domain_context() {
+        assert_eq!(combine_prompt(None, Some("the previous twelve words")), Some("the previous twelve words".to_string()));
     }
 }
