@@ -122,11 +122,32 @@ function Assert-NoInstallFootprint {
     Check $writable "work dir is writable by this user: $WorkDir"
 }
 
-function Run-Wheezper([string[]]$Arguments) {
+function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$TimeoutSec = 420) {
     $out = Join-Path $WorkDir 'run.out'
     $err = Join-Path $WorkDir 'run.err'
-    $p = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $WorkDir `
-        -RedirectStandardOutput $out -RedirectStandardError $err -NoNewWindow -Wait -PassThru
+    $splat = @{
+        FilePath               = $Exe
+        ArgumentList           = $Arguments
+        WorkingDirectory       = $WorkDir
+        RedirectStandardOutput = $out
+        RedirectStandardError  = $err
+        NoNewWindow            = $true
+        PassThru               = $true
+    }
+    # `--source stdin` reads the audio from stdin. Without this the child
+    # inherits the console's stdin and waits for input forever (it did: the
+    # job sat on the runner until the 40 minute timeout killed it).
+    if ($StdinFile) { $splat.RedirectStandardInput = $StdinFile }
+    $p = Start-Process @splat
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        # a hung child must fail the test, not eat the runner's time budget
+        try { $p.Kill($true) } catch { }
+        return [pscustomobject]@{
+            ExitCode = -1
+            Stdout   = ''
+            Stderr   = "timed out after ${TimeoutSec}s: wheezper $($Arguments -join ' ')"
+        }
+    }
     [pscustomobject]@{
         ExitCode = $p.ExitCode
         Stdout   = (Get-Content $out -Raw -ErrorAction SilentlyContinue)
@@ -223,7 +244,7 @@ Ok ("converted to 16 kHz mono f32le: $samples samples ({0:N1} s)" -f ($samples /
 $notes = Join-Path $WorkDir 'notes.md'
 if (Test-Path $notes) { Remove-Item $notes -Force }
 $r = Run-Wheezper @('--source', 'stdin', '--model', $Model, '--language', 'en',
-                    '--min-silence', '0.4', '--notes', $notes)
+                    '--min-silence', '0.4', '--notes', $notes) $f32
 Check ($r.ExitCode -eq 0) "transcription exit code 0 (got $($r.ExitCode))"
 if ($r.ExitCode -ne 0) { Write-Host $r.Stderr }
 Check (Test-Path $notes) "notepad written: $notes"
@@ -248,7 +269,7 @@ Check ($found.Count -ge 2) "transcript matches the fixture markers ($($found -jo
 Step 'second run reuses the cached model'
 $notes2 = Join-Path $WorkDir 'notes2.md'
 $r2 = Run-Wheezper @('--source', 'stdin', '--model', $Model, '--language', 'en',
-                     '--min-silence', '0.4', '--notes', $notes2)
+                     '--min-silence', '0.4', '--notes', $notes2) $f32
 Check ($r2.ExitCode -eq 0) "second run exit code 0 (got $($r2.ExitCode))"
 $norm2 = Normalize (Get-Content $notes2 -Raw -ErrorAction SilentlyContinue)
 Check ($norm2 -match 'ask not') 'second run still transcribes'
@@ -267,7 +288,7 @@ try {
         Speak-ToWav 'The quick brown fox jumps over the lazy dog.' $ttsWav
         Convert-WavToF32 $ttsWav $ttsF32 | Out-Null
         $r3 = Run-Wheezper @('--source', 'stdin', '--model', $Model, '--language', 'en',
-                             '--min-silence', '0.4', '--notes', $ttsNotes)
+                             '--min-silence', '0.4', '--notes', $ttsNotes) $ttsF32
         $ttsNorm = Normalize (Get-Content $ttsNotes -Raw -ErrorAction SilentlyContinue)
         Check ($r3.ExitCode -eq 0) 'TTS transcription exit code 0'
         Check ($ttsNorm -match 'brown fox') 'TTS transcript contains "brown fox"'
