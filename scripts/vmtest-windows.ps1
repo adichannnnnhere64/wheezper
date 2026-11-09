@@ -123,40 +123,45 @@ function Assert-NoInstallFootprint {
 }
 
 function Run-Wheezper([string[]]$Arguments, [string]$StdinFile = '', [int]$TimeoutSec = 600) {
-    $out = Join-Path $WorkDir 'run.out'
-    $err = Join-Path $WorkDir 'run.err'
-    $splat = @{
-        FilePath               = $Exe
-        ArgumentList           = $Arguments
-        WorkingDirectory       = $WorkDir
-        RedirectStandardOutput = $out
-        RedirectStandardError  = $err
-        NoNewWindow            = $true
-        PassThru               = $true
+    # System.Diagnostics.Process, not Start-Process: with redirected output
+    # `-PassThru` leaves ExitCode unset (every check reported "got "), and a
+    # hung child had to be killed by the runner's 40 minute job timeout. This
+    # gives a real exit code, real stdin redirection (--source stdin reads the
+    # audio from it) and a bounded wait.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = (($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' ')
+    $psi.WorkingDirectory = $WorkDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $null = $proc.Start()
+    # drain both pipes while the child runs, or a full pipe would deadlock it
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $stdin = $proc.StandardInput.BaseStream
+    if ($StdinFile) {
+        $fs = [System.IO.File]::OpenRead($StdinFile)
+        try { $fs.CopyTo($stdin) } finally { $fs.Dispose() }
     }
-    # `--source stdin` reads the audio from stdin. Without this the child
-    # inherits the console's stdin and waits for input forever (it did: the
-    # job sat on the runner until the 40 minute timeout killed it).
-    if ($StdinFile) { $splat.RedirectStandardInput = $StdinFile }
-    $p = Start-Process @splat
-    $exited = $p.WaitForExit($TimeoutSec * 1000)
-    if (-not $exited) {
+    $stdin.Close()
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
         # a hung child must fail the test, not eat the runner's time budget
-        try { $p.Kill($true) } catch { }
+        try { $proc.Kill() } catch { }
         return [pscustomobject]@{
             ExitCode = -1
             Stdout   = ''
             Stderr   = "timed out after ${TimeoutSec}s: wheezper $($Arguments -join ' ')"
         }
     }
-    # WaitForExit(ms) leaves ExitCode unset with redirected output: the
-    # parameterless overload flushes the pipes, Refresh() re-reads the handle
-    $null = $p.WaitForExit()
-    $p.Refresh()
+    $null = $proc.WaitForExit()
     [pscustomobject]@{
-        ExitCode = $p.ExitCode
-        Stdout   = (Get-Content $out -Raw -ErrorAction SilentlyContinue)
-        Stderr   = (Get-Content $err -Raw -ErrorAction SilentlyContinue)
+        ExitCode = $proc.ExitCode
+        Stdout   = $stdoutTask.Result
+        Stderr   = $stderrTask.Result
     }
 }
 
