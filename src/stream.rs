@@ -667,8 +667,13 @@ impl ProvisionalTier {
         self.ch.push_16k(chunk)
     }
 
-    pub fn maybe_send(&mut self, idx: usize, tx: &mpsc::Sender<StreamJob>) -> bool {
-        self.ch.maybe_send(idx, tx, "")
+    pub fn maybe_send(
+        &mut self,
+        idx: usize,
+        tx: &mpsc::Sender<StreamJob>,
+        domain_prompt: &str,
+    ) -> bool {
+        self.ch.maybe_send(idx, tx, domain_prompt)
     }
 
     /// A provisional hypothesis arrived: commit the stable words and return
@@ -742,6 +747,15 @@ mod tests {
                 .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn provisional_job_carries_an_opt_in_domain_prompt() {
+        let mut tier = ProvisionalTier::new();
+        let (tx, rx) = mpsc::channel();
+        tier.push_16k(&vec![0.1; TARGET_RATE as usize]);
+        assert!(tier.maybe_send(0, &tx, "engineering planning"));
+        assert_eq!(rx.recv().unwrap().prompt.as_deref(), Some("engineering planning"));
     }
 
     /// Measures live caption latency: word-end -> on screen, end to end,
@@ -870,7 +884,7 @@ mod tests {
                 if ch.fin.busy() && fin_sent.is_none() {
                     fin_sent = Some(Instant::now());
                 }
-                ch.prov.maybe_send(idx, &ptx);
+                ch.prov.maybe_send(idx, &ptx, "");
                 if ch.prov.busy() && prov_sent.is_none() {
                     prov_sent = Some(Instant::now());
                 }
@@ -1013,7 +1027,7 @@ mod tests {
             }
             let prompt = sc.prompt_tail();
             sc.maybe_send(0, &tx, &prompt);
-            prov.maybe_send(0, &ptx);
+            prov.maybe_send(0, &ptx, "");
             if sc.line_ready()
                 && let Some(line) = sc.take_line()
             {
@@ -1036,7 +1050,7 @@ mod tests {
         loop {
             let mut pending = false;
             pending |= if sc.busy() { true } else { sc.maybe_send(0, &tx, &sc.prompt_tail()) };
-            pending |= if prov.busy() { true } else { prov.maybe_send(0, &ptx) };
+            pending |= if prov.busy() { true } else { prov.maybe_send(0, &ptx, "") };
             if !pending || Instant::now() >= deadline {
                 break;
             }

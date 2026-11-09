@@ -26,6 +26,9 @@ VC++ redistributable needed).
 - **Built-in LLM**: `--ollama` summarizes the session via an Ollama server
   if you run one, else via **llama.cpp compiled into wheezper itself**
   (worker embedded in the exe, Gemma model auto-downloads) — no installs.
+- **Phase 3 context and annotations**: `--prompt` biases whisper with a short
+  domain hint; `--with-agent` adds optional asynchronous notes under committed
+  transcript lines without delaying transcription.
 
 ## Usage
 
@@ -44,6 +47,16 @@ wheezper --source dual --webhook https://example.com/hook
 
 # rolling live captions while you speak (stdout only; pairs well with --model tiny)
 wheezper --partial --model tiny
+
+# domain-specific terms, products, or meeting topic (opt-in whisper bias)
+wheezper --prompt "Engineering planning for the Atlas migration"
+
+# annotate committed lines asynchronously (requires a model already in Ollama)
+wheezper --source dual --prompt "Engineering planning for Atlas" \
+  --with-agent "ollama:gemma3:1b:256"
+
+# cloud annotations require OLLAMA_API_KEY; the final number is output tokens
+wheezper --with-agent "ollama-cloud:deepseek-v4.1-flash:1017"
 
 # pick a model: tiny, base (default), small, medium, turbo
 wheezper --model small
@@ -156,6 +169,21 @@ words. If you *have* the lyrics:
   segment the (unbiased) transcription aligns with, keeping ASR text where it
   does not. This is karaoke-style lyric sync, not transcription: 99–100% word
   accuracy on the tracks tested. Longer segments help it (see below).
+
+## Interview reference scoring
+
+To compare the two local WebM interviews against their matching YouTube VTTs,
+build the release binary and run the 95% word-accuracy gate:
+
+```bash
+nix-shell --run 'cargo build --release'
+scripts/bench-interview-dummy.sh /path/to/interview-dummy turbo
+```
+
+The harness handles rolling VTT cues and scores only timestamped transcript
+rows. It writes transcripts, logs, and per-video score summaries under
+`bench/out/`; override `MIN_ACCURACY`, `MIN_SILENCE`, `MAX_SEGMENT`,
+`THRESHOLD_DB`, `THREADS`, or `OUT_DIR` when tuning a run.
 
 ## Models
 
@@ -302,6 +330,8 @@ language = "en"     # or "auto"
 partial = true       # rolling live captions (stdout only)
 webhook = "http://192.168.1.20:8399/hook"
 notes = "notes/work.md"
+# prompt = "Engineering planning for the Atlas migration"
+# with-agent = "ollama:gemma3:1b:256"
 ```
 
 ## Built-in LLM: summaries + polish (nothing to install)
@@ -321,6 +351,18 @@ wheezper --ollama --polish              # also clean each utterance (latency!)
 wheezper --ollama --ollama-model gemma3:1b   # any Ollama model / gguf path
 wheezper --ollama http://server:11434        # explicit remote Ollama server
 ```
+
+`--with-agent PROVIDER:MODEL[:BUDGET]` supports `ollama` (local server at
+`http://localhost:11434`), `ollama-cloud` (`OLLAMA_API_KEY` required), and
+`builtin` (the embedded llama.cpp model). The optional final number is the
+positive output-token budget (default 256). Calls use a bounded queue, skip
+very short lines, and are capped at 10 per minute; a full queue drops an
+annotation with one warning. Agent output is written only to the notepad, under
+the matching transcript line. It is never sent to stdout or the webhook.
+
+`--prompt` is limited to the first 40 words for whisper and the agent. When
+whisper has local continuity text, the domain hint is combined with its last 12
+words so the domain hint cannot evict local context.
 
 How the built-in engine fits in one exe: whisper.cpp and llama.cpp both
 bundle their own ggml, so they cannot be linked into a single executable.
@@ -368,6 +410,8 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
     --webhook <URL>   POST each utterance to this URL as JSON
     --partial         rolling live captions of the utterance in progress
+    --prompt <TEXT>   domain/context hint (first 40 words; opt-in)
+    --with-agent <SPEC>  async annotations: PROVIDER:MODEL[:BUDGET]
     --ollama [URL]    session summary via Ollama server at URL if running,
                       else built-in llama.cpp (model auto-downloads)
     --ollama-model <M>  gemma3:1b [default] | any Ollama model | .gguf path
