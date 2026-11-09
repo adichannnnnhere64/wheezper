@@ -4,13 +4,16 @@ use crate::llm::{self, Llm};
 use crate::notepad::AnnotationKey;
 use anyhow::{Context, Result, bail};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const DEFAULT_BUDGET: u32 = 256;
 const QUEUE_SIZE: usize = 4;
 const CALLS_PER_MINUTE: usize = 10;
+/// Annotation inference is best-effort; one worker thread must not steal a
+/// core from the provisional tier (its 0.5 s budget is the priority).
+const DEFAULT_AGENT_THREADS: i32 = 1;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentSpec {
@@ -66,6 +69,9 @@ pub struct Annotation {
 pub struct Agent {
     tx: mpsc::SyncSender<Job>,
     completed: mpsc::Receiver<Annotation>,
+    /// Jobs queued or running, including those whose answer is not yet
+    /// collected. Used to drain briefly on stop without waiting forever.
+    pending: Arc<AtomicUsize>,
     recent_calls: VecDeque<Instant>,
     warned_drop: bool,
 }
@@ -77,6 +83,11 @@ impl Agent {
         threads: i32,
     ) -> Result<Self> {
         let spec = AgentSpec::parse(raw_spec)?;
+        let agent_threads = std::env::var("WHEEZPER_AGENT_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_AGENT_THREADS)
+            .clamp(1, threads.max(1));
         let (backend, endpoint) = match spec.provider.as_str() {
             "ollama" => {
                 let server = llm::Ollama::new("http://localhost:11434", &spec.model);
@@ -100,14 +111,14 @@ impl Agent {
             "builtin" => {
                 #[cfg(feature = "llm")]
                 {
-                    let model = llm::Builtin::new(&spec.model, threads)
+                    let model = llm::Builtin::new(&spec.model, agent_threads)
                         .context("validating built-in annotation model")?;
                     let endpoint = format!("{} (built-in llama.cpp)", model.model_name);
                     (Llm::Builtin(model), endpoint)
                 }
                 #[cfg(not(feature = "llm"))]
                 {
-                    let _ = threads;
+                    let _ = agent_threads;
                     bail!(
                         "--with-agent provider 'builtin' is unavailable in this build (compiled with --no-default-features)"
                     );
@@ -132,12 +143,15 @@ impl Agent {
         let (completed_tx, completed) = mpsc::sync_channel::<Annotation>(QUEUE_SIZE);
         let warned_failure = Arc::new(AtomicBool::new(false));
         let worker_warned = Arc::clone(&warned_failure);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
         let model = spec.model.clone();
         let budget = spec.budget;
         std::thread::Builder::new()
             .name("annotation-agent".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    let _guard = PendingGuard(Arc::clone(&worker_pending));
                     let response = match backend.generate(&system, &job.context, budget) {
                         Ok(response) => response,
                         Err(error) => {
@@ -167,6 +181,7 @@ impl Agent {
         Ok(Self {
             tx,
             completed,
+            pending,
             recent_calls: VecDeque::new(),
             warned_drop: false,
         })
@@ -175,6 +190,11 @@ impl Agent {
     /// Collect finished calls without waiting for the worker.
     pub fn drain_completed(&self) -> Vec<Annotation> {
         self.completed.try_iter().collect()
+    }
+
+    /// Jobs queued or running; zero means every answer has been handed back.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Relaxed)
     }
 
     /// Queue a useful-sized transcript line without waiting for inference.
@@ -205,10 +225,18 @@ impl Agent {
             channel: channel.map(str::to_string),
             context: context.to_string(),
         };
+        // Count before sending: the worker may finish before try_send returns.
+        self.pending.fetch_add(1, Ordering::Relaxed);
         match self.tx.try_send(job) {
             Ok(()) => self.recent_calls.push_back(now),
-            Err(mpsc::TrySendError::Full(_)) => self.warn_drop("queue full"),
-            Err(mpsc::TrySendError::Disconnected(_)) => self.warn_drop("worker stopped"),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.warn_drop("queue full");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+                self.warn_drop("worker stopped");
+            }
         }
     }
 
@@ -217,6 +245,16 @@ impl Agent {
             eprintln!("wheezper: warning: annotation dropped ({reason}); transcription continues");
             self.warned_drop = true;
         }
+    }
+}
+
+/// Decrements the pending count however the worker leaves a job (answer,
+/// failure, SKIP, or a panic).
+struct PendingGuard(Arc<AtomicUsize>);
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

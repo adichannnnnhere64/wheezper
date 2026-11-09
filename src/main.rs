@@ -253,7 +253,9 @@ fn main() -> Result<()> {
         }
         SourceArg::Dual => run_dual(&cli, engine)?,
     };
-    engine.drain_agent_annotations();
+    // Let annotations for the last lines land before the summary is appended.
+    // This runs after capture stopped, so it cannot delay the live path.
+    engine.flush_agent_annotations(Duration::from_secs(2));
     summarize_session(&mut engine)?;
     engine.drain_agent_annotations();
     Ok(())
@@ -513,6 +515,21 @@ impl Engine {
                 eprintln!("wheezper: warning: writing agent annotation failed: {error:#}");
             }
         }
+    }
+
+    /// Briefly drain queued annotations on stop. The worker may be mid-call,
+    /// so the timeout bounds shutdown; anything still running is abandoned.
+    fn flush_agent_annotations(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain_agent_annotations();
+            let pending = self.agent.as_ref().map_or(0, agent::Agent::pending);
+            if pending == 0 || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.drain_agent_annotations();
     }
 
     /// Move the lyric cursor past words just committed (live/stream mode).

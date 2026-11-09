@@ -358,7 +358,11 @@ wheezper --ollama http://server:11434        # explicit remote Ollama server
 positive output-token budget (default 256). Calls use a bounded queue, skip
 very short lines, and are capped at 10 per minute; a full queue drops an
 annotation with one warning. Agent output is written only to the notepad, under
-the matching transcript line. It is never sent to stdout or the webhook.
+the matching transcript line. It is never sent to stdout or the webhook. The
+built-in provider uses one thread by default (override with
+`WHEEZPER_AGENT_THREADS`) so annotations cannot starve the live preview; a local
+Ollama server still competes for CPU, so prefer a remote or cloud endpoint when
+latency matters most.
 
 `--prompt` is limited to the first 40 words for whisper and the agent. When
 whisper has local continuity text, the domain hint is combined with its last 12

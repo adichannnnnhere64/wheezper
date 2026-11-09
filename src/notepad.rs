@@ -108,11 +108,8 @@ impl Notepad {
         let mut inserted = false;
         for chunk in content.split_inclusive('\n') {
             offset += chunk.len();
-            let line = chunk
-                .strip_suffix('\n')
-                .unwrap_or(chunk)
-                .strip_suffix('\r')
-                .unwrap_or_else(|| chunk.strip_suffix('\n').unwrap_or(chunk));
+            let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if line == target.line {
                 if seen == target.occurrence {
                     updated.push_str(chunk);
@@ -138,7 +135,9 @@ impl Notepad {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(updated.as_bytes())?;
-        self.file.flush()?;
+        // The rewrite is the one non-append path; sync it so the new content
+        // is on disk before the annotation is considered written.
+        self.file.sync_all()?;
         Ok(())
     }
 }

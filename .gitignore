@@ -20,3 +20,7 @@ bench/out/
 # real meeting material used for local testing: never commit
 /interview-dummy/
 *.webm
+
+# Python bytecode from bench/score.py tests
+__pycache__/
+*.pyc

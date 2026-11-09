@@ -114,7 +114,7 @@ Accuracy preserved: fixture gate 100 %, song bench byte-identical
 vmtest-capture 90.9 % loopback + dual labels, notes format unchanged,
 Windows cross-build and Termux `--no-default-features` build green.
 
-### Phase 3 — IMPLEMENTED on `v2`. Context prompt + AI annotation agent
+### Phase 3 — DONE (merged from `v2`). Context prompt + AI annotation agent
 
 **3a. `--prompt="This is a meeting about google"`**
 
@@ -137,11 +137,18 @@ Windows cross-build and Termux `--no-default-features` build green.
 - Each committed line of at least three words is sent with the previous three
   transcript lines and the domain hint to a worker thread. The queue holds four
   jobs, calls are capped at 10/minute, and full/rate-limited queues drop with a
-  one-time warning. Agent failures are non-fatal and reported once.
-- The worker inserts one-line annotations directly under their matching
-  transcript rows. Annotations identify `me`/`them`, go to the notepad only,
-  and never block whisper inference or enter stdout/webhooks. `SKIP` replies are
-  omitted.
+  one-time warning. Agent failures are non-fatal and reported once. Shutdown
+  drains queued annotations for up to 2 s, then abandons whatever is still
+  running.
+- The orchestration thread inserts one-line annotations directly under their
+  matching transcript rows. Annotations identify `me`/`them`, go to the notepad
+  only, and never block whisper inference or enter stdout/webhooks. `SKIP`
+  replies are omitted.
+- The built-in annotation model defaults to **one** thread
+  (`WHEEZPER_AGENT_THREADS` overrides it): a local LLM on the same box must not
+  steal a core from the provisional tier. A local Ollama server can still
+  compete for CPU; `ollama-cloud` or a remote server is the safer choice when
+  the 0.5 s preview budget matters.
 - `bench/score.py` reads VTT references and scores only `- [HH:MM:SS]` rows, so
   annotations and summaries do not count as insertions. The exact bit-parallel
   edit-distance path keeps long interview references practical; short fixtures
@@ -197,7 +204,7 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release --workspace' # 23 pass; 3 ignored
+nix-shell --run 'cargo test  --release --workspace' # 25 pass; 3 ignored
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
@@ -361,6 +368,20 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - The embedded LLM worker needs the `llm` feature and, in CI, the
   `WHEEZPER_LLM_WORKER` env var; without it `build.rs` embeds an empty
   placeholder and `--ollama` falls back to a server.
+- **Annotations are on a different thread, but they still share the CPU.** The
+  built-in agent defaults to one thread and a four-job queue; local Ollama can
+  use every core it wants. Phase 2's provisional budget wins: annotations are
+  dropped, never queued ahead of transcription.
+- **`bench/score.py` scores only `- [HH:MM:SS] …` rows.** Annotations, summaries
+  and other prose are ignored on purpose; do not go back to scoring the whole
+  notepad or every annotation becomes an insertion.
+- **`--prompt` is opt-in bias.** It helps names/jargon in meetings and hurts
+  music (the decoder reads words that are not in the audio); keep it off for
+  `--lyrics` unless measured otherwise. The domain hint is capped at 40 words
+  and combined with the last 12 local words, never replacing them.
+- **Annotation insertion is the one non-append notes write.** It rewrites the
+  file under the matching line and `sync_all`s; all transcript rows stay
+  append-only and flushed per line.
 
 ## Conventions
 
