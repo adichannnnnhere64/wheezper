@@ -24,6 +24,15 @@ import kotlinx.coroutines.launch
 
 enum class Connection { Idle, Connecting, Live, Reconnecting, Offline }
 
+/** One AI-help answer, anchored to the transcript row it answers. */
+data class AiAnswer(
+    val sequence: Long,
+    val question: String,
+    val text: String = "",
+    val streaming: Boolean = true,
+    val error: String? = null,
+)
+
 data class UiState(
     val settings: Settings = Settings(),
     val connection: Connection = Connection.Idle,
@@ -41,11 +50,12 @@ data class UiState(
     val assistantAnswer: String = "",
     val assistantStatus: String = "",
     val assistantStreaming: Boolean = false,
-    /** Automatic interview help: the latest committed question and its answer. */
-    val autoAnswerQuestion: String = "",
-    val autoAnswerText: String = "",
-    val autoAnswerStreaming: Boolean = false,
-    val autoAnswerError: String? = null,
+    /**
+     * Automatic interview help, keyed by the transcript row each question
+     * answers. Answers stay bound to their row, so the interviewer's next
+     * question can never overwrite an answer that is still streaming.
+     */
+    val answers: Map<Long, AiAnswer> = emptyMap(),
     val autoAnsweredSequence: Long = 0,
     val transcriptQuery: String = "",
     val historyQuery: String = "",
@@ -63,8 +73,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var statusJob: Job? = null
     private var assistantJob: Job? = null
     private var autoJob: Job? = null
-    /** Latest question seen while another auto-answer is still streaming. */
-    private var queuedAuto: TranscriptEvent? = null
+    /**
+     * Questions waiting for the assistant, in arrival order. A bounded FIFO,
+     * not "newest wins": each answer is anchored to its row, so dropping an
+     * older question would leave that row unanswered for good.
+     */
+    private val autoQueue = ArrayDeque<TranscriptEvent>()
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -207,7 +221,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openSession(session: Session) {
         assistantJob?.cancel()
         autoJob?.cancel()
-        queuedAuto = null
+        autoQueue.clear()
         _state.update {
             it.copy(
                 openSession = session,
@@ -219,10 +233,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 assistantAnswer = "",
                 assistantStatus = "",
                 assistantStreaming = false,
-                autoAnswerQuestion = "",
-                autoAnswerText = "",
-                autoAnswerStreaming = false,
-                autoAnswerError = null,
+                answers = emptyMap(),
                 autoAnsweredSequence = 0,
                 transcriptQuery = "",
             )
@@ -240,7 +251,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         statusJob = null
         assistantJob = null
         autoJob = null
-        queuedAuto = null
+        autoQueue.clear()
         _state.update {
             it.copy(
                 openSession = null,
@@ -248,10 +259,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 lastSequence = 0,
                 connection = Connection.Idle,
                 laptopCommand = null,
-                autoAnswerQuestion = "",
-                autoAnswerText = "",
-                autoAnswerStreaming = false,
-                autoAnswerError = null,
+                answers = emptyMap(),
                 autoAnsweredSequence = 0,
                 transcriptQuery = "",
             )
@@ -371,6 +379,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         streamJob?.cancel()
         streamJob = viewModelScope.launch {
             var failures = 0
+            var seededAuto = false
             while (isActive) {
                 val repo = repository ?: break
                 _state.update {
@@ -380,8 +389,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 try {
                     // Durable catch-up first: the server is the source of truth
-                    // after a sleep, a network drop or a sequence gap.
-                    catchUp(repo, sessionId)
+                    // after a sleep, a network drop or a sequence gap. The very
+                    // first catch-up must not auto-answer the meeting's history.
+                    catchUp(repo, sessionId, autoAnswer = seededAuto)
+                    if (!seededAuto) {
+                        seededAuto = true
+                        // Reconnects keep this watermark, so lines that arrived
+                        // while offline are still answered.
+                        _state.update {
+                            it.copy(autoAnsweredSequence = maxOf(it.autoAnsweredSequence, it.lastSequence))
+                        }
+                    }
                     failures = 0
                     _state.update { it.copy(connection = Connection.Live) }
 
@@ -435,18 +453,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun catchUp(repo: MeetingRepository, sessionId: String) {
+    private suspend fun catchUp(repo: MeetingRepository, sessionId: String, autoAnswer: Boolean = true) {
         var from = _state.value.lastSequence
         while (true) {
             val page = repo.sync(sessionId, from)
-            addEvents(page.eventsList)
+            addEvents(page.eventsList, autoAnswer)
             val next = _state.value.lastSequence
             if (!page.hasMore || next <= from) break
             from = next
         }
     }
 
-    private fun addEvents(events: List<TranscriptEvent>) {
+    private fun addEvents(events: List<TranscriptEvent>, autoAnswer: Boolean = true) {
         if (events.isEmpty()) return
         var fresh: List<TranscriptEvent> = emptyList()
         _state.update { current ->
@@ -461,14 +479,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
-        if (fresh.isNotEmpty()) maybeAutoAnswer(fresh)
+        if (fresh.isNotEmpty() && autoAnswer) maybeAutoAnswer(fresh)
     }
 
     /**
      * Interview help: answer the far side as committed lines arrive. "Every
      * line" answers each far-side line; the default only answers questions.
-     * One request is in flight at a time and only the newest queued line is
-     * kept, so a slow model cannot build a backlog.
+     *
+     * Every matching line is queued in order and its answer is stored under the
+     * transcript row it answers, so a fast interviewer's next question can
+     * never overwrite an answer that is still streaming. One request is in
+     * flight at a time (a local model shares the CPU with transcription), but
+     * the queue is bounded so a slow model cannot build an endless backlog.
      */
     private fun maybeAutoAnswer(events: List<TranscriptEvent>) {
         val current = _state.value
@@ -479,15 +501,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (MeetingRepository.isCompleted(session)) return
 
         val everyLine = current.settings.assistantEveryLine
-        val candidate = events.asReversed().firstOrNull { event ->
+        val fresh = events.filter { event ->
             event.sequenceNumber > current.autoAnsweredSequence && wantsAnswer(event, everyLine)
-        } ?: return
-
-        if (autoJob?.isActive == true) {
-            queuedAuto = candidate
-            return
         }
-        startAutoAnswer(candidate)
+        if (fresh.isEmpty()) return
+
+        fresh.forEach(autoQueue::addLast)
+        while (autoQueue.size > AUTO_QUEUE_LIMIT) autoQueue.removeFirst()
+        _state.update {
+            it.copy(
+                autoAnsweredSequence = maxOf(
+                    it.autoAnsweredSequence,
+                    fresh.maxOf { event -> event.sequenceNumber },
+                )
+            )
+        }
+        drainAutoQueue()
+    }
+
+    private fun drainAutoQueue() {
+        if (autoJob?.isActive == true) return
+        val event = autoQueue.removeFirstOrNull() ?: return
+        startAutoAnswer(event)
     }
 
     private fun wantsAnswer(event: TranscriptEvent, everyLine: Boolean): Boolean {
@@ -504,32 +539,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startAutoAnswer(event: TranscriptEvent) {
-        val repo = repository ?: return
-        val session = _state.value.openSession ?: return
+        val repo = repository
+        val session = _state.value.openSession
+        if (repo == null || session == null) {
+            // Nothing to talk to: do not leave the queue stuck (drainAutoQueue
+            // already removed this event).
+            autoQueue.clear()
+            return
+        }
         val settings = _state.value.settings
+        val sequence = event.sequenceNumber
 
         if (settings.assistantCloud && settings.assistantToken.isBlank()) {
-            _state.update {
-                it.copy(
-                    autoAnswerQuestion = event.content,
-                    autoAnswerText = "",
-                    autoAnswerStreaming = false,
-                    autoAnswerError =
-                        "AI help is on, but Ollama Cloud needs a token. Add one in Settings.",
+            putAnswer(
+                AiAnswer(
+                    sequence = sequence,
+                    question = event.content,
+                    streaming = false,
+                    error = "AI help is on, but Ollama Cloud needs a token. Add one in Settings.",
                 )
-            }
+            )
+            drainAutoQueue()
             return
         }
 
-        _state.update {
-            it.copy(
-                autoAnsweredSequence = event.sequenceNumber,
-                autoAnswerQuestion = event.content,
-                autoAnswerText = "",
-                autoAnswerStreaming = true,
-                autoAnswerError = null,
-            )
-        }
+        putAnswer(AiAnswer(sequence = sequence, question = event.content))
 
         autoJob = viewModelScope.launch {
             val answer = StringBuilder()
@@ -543,28 +577,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ).collect { chunk ->
                     if (chunk.delta.isNotEmpty()) {
                         answer.append(chunk.delta)
-                        _state.update { it.copy(autoAnswerText = answer.toString()) }
+                        updateAnswer(sequence) { it.copy(text = answer.toString()) }
                     }
                 }
-                _state.update { it.copy(autoAnswerStreaming = false) }
+                updateAnswer(sequence) { it.copy(streaming = false) }
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
-                _state.update {
-                    it.copy(autoAnswerStreaming = false, autoAnswerError = friendly(error))
+                updateAnswer(sequence) {
+                    it.copy(streaming = false, error = friendly(error))
                 }
             } finally {
                 autoJob = null
-                val next = queuedAuto
-                queuedAuto = null
-                if (next != null && _state.value.openSession?.id == session.id && session.aiHelp) {
-                    startAutoAnswer(next)
+                // openSession/closeSession own clearing the queue; here we only
+                // continue it when the same meeting is still on screen.
+                val stillOpen = _state.value.openSession
+                if (stillOpen?.id == session.id && stillOpen.aiHelp) {
+                    drainAutoQueue()
                 }
             }
         }
     }
 
+    private fun putAnswer(answer: AiAnswer) {
+        _state.update { it.copy(answers = it.answers + (answer.sequence to answer)) }
+    }
+
+    private fun updateAnswer(sequence: Long, change: (AiAnswer) -> AiAnswer) {
+        _state.update { current ->
+            val existing = current.answers[sequence] ?: return@update current
+            current.copy(answers = current.answers + (sequence to change(existing)))
+        }
+    }
+
     private companion object {
+        /**
+         * Bounded backlog for interview help: enough for a few fast questions
+         * while one answer streams, small enough that a slow model cannot fall
+         * minutes behind the interviewer.
+         */
+        const val AUTO_QUEUE_LIMIT = 4
+
         /**
          * Cheap question heuristic for interview help. Committed lines are the
          * only input, so this is a filter, not a semantic classifier.

@@ -205,13 +205,15 @@ pub fn segments_state(
         // otherwise re-run at up to 21x the cost of the pass itself)
         params.set_temperature_inc(0.0);
         // bound runaway decoding on fragmented audio: hitting the cap still
-        // emits the words decoded so far. 6 tokens ≈ 2 words per pass —
-        // plenty, since provisional words stream continuously and the cap
-        // bounds the worst-case pass to ~0.3 s even under CPU contention
-        params.set_max_tokens(envi("WZ_MAXTOK").unwrap_or(6));
+        // emits the words decoded so far. A 6-token cap cut words mid-decode,
+        // which read as fragments ("(", "H") in the preview; 20 tokens covers
+        // a 1.2 s window without changing the pass cost (the window is the
+        // bound — measured max 0.20 s).
+        params.set_max_tokens(envi("WZ_MAXTOK").unwrap_or(20));
         // encoder window in 20 ms frames; the provisional streaming window
-        // must stay within audio_ctx*20 ms or audio past it is silently cut
-        params.set_audio_ctx(envi("WZ_AUDIOCTX").unwrap_or(40));
+        // must stay within audio_ctx*20 ms or audio past it is silently cut.
+        // 60 frames = 1.2 s, matching Tuning::provisional().window_s.
+        params.set_audio_ctx(envi("WZ_AUDIOCTX").unwrap_or(60));
         if let Some(p) = prompt {
             params.set_initial_prompt(p);
         }

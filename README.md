@@ -133,7 +133,11 @@ wheezper --source dual \
   chosen in the app, and an optional Ollama token (needed for Ollama Cloud) is
   stored on the phone and sent per request: the server never stores or logs it.
   Only committed text triggers an answer, so the answer follows the firm
-  transcript, not the provisional preview.
+  transcript, not the provisional preview. Each answer is **anchored to the
+  transcript row it answers** and stays there: a fast interviewer's next
+  question gets its own card under its own row. Questions queue in a small
+  bounded FIFO (one request in flight), so a slow answer is never overwritten
+  and the backlog cannot run away.
 
 Build/run the backend and app:
 
@@ -152,7 +156,7 @@ for the companion app and its pairing flow.
 
 Live capture runs **two tiers per channel** (Phase 2):
 
-- a **provisional** tier decodes just the live edge (≤0.8 s windows, capped
+- a **provisional** tier decodes just the live edge (≤1.2 s windows, capped
   encoder context, one greedy pass) and puts words on screen as a revisable
   `▍` preview line — **~0.2–0.35 s** after they are spoken;
 - the **final** tier is the quality engine (8 s windows, full decode with the
@@ -169,13 +173,21 @@ is measured end to end (6-core desktop, models local):
 
 | setup | median | p90 | one pass |
 |---|---|---|---|
-| preview tier, `base`, 1 ch | **0.22 s** | 0.46 s | 0.10 s |
-| preview tier, `base`, dual (both sides talking) | **0.22–0.33 s** | 0.46–0.62 s | 0.10 s |
+| preview tier, `base`, 1 ch | **0.23 s** | 0.32 s | 0.10 s |
+| preview tier, `base`, dual (both sides talking) | **0.32 s** | 0.53 s | 0.10 s |
 | final tier (into notes), `base`, 1 ch | 4.11 s | 5.50 s | 3.1 s (2 threads) |
-| final tier (into notes), `base`, dual | 6.6–7.4 s | 7.6 s | 3.3 s |
+| final tier (into notes), `base`, dual | 6.9 s | 7.2 s | 3.3 s |
 | Phase-1 single tier (piped stdout), `base`, 1 ch | 2.60 s | 3.00 s | 1.80 s (4 threads) |
 | Phase-1 single tier (piped stdout), `base`, dual | 4.23 s | 5.13 s | 1.70 s |
 | Phase-1 single tier (piped stdout), `small`, 1 ch | 6.86 s | 7.70 s | 6.40 s |
+
+Only the preview tier needs to be fast, so it can use a **cheaper model than
+`--model`**: `--preview-model` (default `auto`) keeps `tiny`/`base` as-is and uses
+`base` for the preview when the notes model is `small`, `medium` or `turbo`
+(measured one provisional pass: 0.10 s on base vs 0.20–0.40 s on small). The
+notes still come from `--model`, and the preview still revises in place.
+`--preview-model same` uses one model for both tiers; any other value is
+resolved like `--model`.
 
 Reproduce (add `WZ_ACCEPT=1` to gate the 0.5 s median / 0.8 s p90 budget on
 the preview tier):
@@ -500,6 +512,8 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
 ```
 -m, --model <PATH|NAME>  model path or name: tiny, base, small, medium, turbo
                           [default: base] (or env WHEEZPER_MODEL)
+    --preview-model <M>  live-preview model [default: auto] (env WHEEZPER_PREVIEW_MODEL)
+                          auto | same | tiny | base | ... | path
 -n, --notes <PATH>     notepad file [default: notes/YYYY-MM-DD.md]
 -l, --language <LANG>  language code, or "auto" [default: auto]
     --source <SRC>     mic | loopback | dual | stdin [default: stdin if piped, else mic]

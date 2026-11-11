@@ -22,7 +22,7 @@ use dsp::{Framer, Resampler};
 use notepad::Notepad;
 use segmenter::Segmenter;
 use std::io::{IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use transcribe::Transcriber;
 use vad::Vad;
@@ -45,6 +45,14 @@ struct Cli {
     /// auto-downloaded on first use: tiny, base, small, medium, turbo
     #[arg(short, long, env = "WHEEZPER_MODEL", default_value = "base")]
     model: String,
+
+    /// Model for the live preview tier (stdout only; notes stay on --model).
+    /// `auto` = keep --model when it is tiny/base, otherwise use base; `same`
+    /// = use --model for both tiers; anything else is resolved like --model.
+    /// A cheap preview model keeps every word on screen fast even when the
+    /// notes model is small/medium/turbo.
+    #[arg(long, env = "WHEEZPER_PREVIEW_MODEL", default_value = "auto", value_name = "MODEL")]
+    preview_model: String,
 
     /// Notepad output file [default: notes/YYYY-MM-DD.md]
     #[arg(short, long)]
@@ -709,6 +717,11 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
     {
         cli.model = v.to_string();
     }
+    if !given("preview_model")
+        && let Some(v) = get("preview-model").or_else(|| get("preview_model")).and_then(|v| v.as_str())
+    {
+        cli.preview_model = v.to_string();
+    }
     if !given("notes")
         && let Some(v) = get("notes").and_then(|v| v.as_str())
     {
@@ -1293,6 +1306,33 @@ impl LiveView {
     }
 }
 
+/// Pick the model for the live preview tier.
+///
+/// Preview text is display-only, so a smaller model than the notes model is not
+/// a quality regression: it puts complete words on screen sooner and frees CPU
+/// for the notes tier, which is the one that falls behind when the notes model
+/// is `small`/`medium`/`turbo` (measured on the reference box: one provisional
+/// pass is 0.10 s on base vs 0.20-0.40 s on small).
+///
+/// `auto` keeps `--model` when it is already cheap (tiny/base, or an explicit
+/// path the user chose), otherwise it uses base. `same` opts out.
+fn resolve_preview_model(choice: &str, notes_arg: &str, notes_model: &Path) -> Result<PathBuf> {
+    let choice = choice.trim();
+    match choice.to_ascii_lowercase().as_str() {
+        "" | "same" => Ok(notes_model.to_path_buf()),
+        "auto" => {
+            let name = notes_arg.trim().to_ascii_lowercase();
+            if name == "tiny" || name == "base" || Path::new(notes_arg).exists() {
+                Ok(notes_model.to_path_buf())
+            } else {
+                models::resolve(Some("base")).context("resolving the preview model 'base'")
+            }
+        }
+        _ => models::resolve(Some(choice))
+            .with_context(|| format!("resolving preview model '{choice}'")),
+    }
+}
+
 /// Unified live loop, two tiers per channel. The final tier is the Phase-1
 /// engine — generous windows, words committed exactly once by timestamp,
 /// append-only, the only thing that reaches the notes. The provisional tier
@@ -1331,8 +1371,16 @@ fn run_stream(
     // live: piped output skips the extra worker (and its CPU) entirely and
     // behaves exactly like Phase 1
     let prov = if live {
+        let preview_path = resolve_preview_model(&cli.preview_model, &cli.model, &model_path)?;
+        if preview_path != model_path {
+            eprintln!(
+                "wheezper: stream: preview model={} (notes stay on {})",
+                preview_path.display(),
+                model_path.display()
+            );
+        }
         let (ptx, prx) = stream::spawn_worker(
-            &model_path,
+            &preview_path,
             &cli.language,
             prov_threads,
             !cli.no_vad,
@@ -1588,7 +1636,25 @@ fn warn_dropped(rx: &capture::AudioReceiver) {
 
 #[cfg(test)]
 mod phase3_tests {
-    use super::{combine_prompt, first_words};
+    use super::{combine_prompt, first_words, resolve_preview_model};
+    use std::path::Path;
+
+    #[test]
+    fn preview_model_auto_keeps_a_cheap_notes_model() {
+        let notes = Path::new("/models/ggml-base-q5_1.bin");
+        // tiny/base are cheap enough for the preview: no second model
+        for name in ["base", "tiny", "Cargo.toml"] {
+            assert_eq!(
+                resolve_preview_model("auto", name, notes).unwrap(),
+                notes,
+                "auto should keep the notes model for {name}"
+            );
+        }
+        // explicit opt-outs / choices never resolve the notes model name
+        for choice in ["same", ""] {
+            assert_eq!(resolve_preview_model(choice, "turbo", notes).unwrap(), notes);
+        }
+    }
 
     #[test]
     fn domain_prompt_is_bounded_and_keeps_local_context() {

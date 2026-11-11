@@ -48,6 +48,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.wheezper.app.AiAnswer
 import com.wheezper.app.MainViewModel
 import com.wheezper.app.UiState
 import com.wheezper.app.data.MeetingRepository
@@ -117,7 +118,7 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
             ConnectionStrip(state.connection, state.settings.serverUrl)
 
             if (session.aiHelp && !completed) {
-                AutoAnswerPanel(state)
+                AiHelpStrip(state)
             }
 
             state.laptopCommand?.let { command ->
@@ -168,7 +169,10 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(visible, key = { it.sequenceNumber }) { event ->
-                        TranscriptRow(event)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            TranscriptRow(event)
+                            state.answers[event.sequenceNumber]?.let { AnswerCard(it) }
+                        }
                     }
                 }
             }
@@ -220,14 +224,21 @@ private fun TranscriptRow(event: TranscriptEvent) {
 }
 
 /**
- * Live interview help. The phone drives it: every committed far-side question
- * (or every far-side line, if selected) is sent to the server's assistant and
- * the streamed answer lands here, visibly separate from the transcript.
+ * Status strip for interview help. The answers themselves render under the
+ * transcript row they answer (see [AnswerCard]); this strip never holds a
+ * single shared answer slot, which a fast interviewer would keep overwriting.
  */
 @Composable
-private fun AutoAnswerPanel(state: UiState) {
-    var expanded by rememberSaveable { mutableStateOf(true) }
+private fun AiHelpStrip(state: UiState) {
     val accent = MaterialTheme.colorScheme.primary
+    val answers = state.answers.values
+    val thinking = answers.count { it.streaming }
+    val status = when {
+        thinking > 0 -> "answering…"
+        answers.isEmpty() -> "waiting for the next question"
+        answers.size == 1 -> "1 answer below"
+        else -> "${answers.size} answers below"
+    }
     Surface(
         color = accent.copy(alpha = 0.08f),
         shape = MaterialTheme.shapes.medium,
@@ -236,8 +247,8 @@ private fun AutoAnswerPanel(state: UiState) {
             .padding(horizontal = 16.dp, vertical = 6.dp),
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -258,52 +269,86 @@ private fun AutoAnswerPanel(state: UiState) {
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                TextButton(onClick = { expanded = !expanded }) {
-                    Text(if (expanded) "Hide" else "Show")
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "Answers stay under the question they belong to.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    status,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = accent,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The assistant's answer to this exact transcript row. It stays here as the
+ * meeting goes on: a later question gets its own card under its own row.
+ */
+@Composable
+private fun AnswerCard(answer: AiAnswer) {
+    val accent = MaterialTheme.colorScheme.primary
+    Surface(
+        color = accent.copy(alpha = 0.10f),
+        shape = MaterialTheme.shapes.medium,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 12.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "AI SUGGESTION — NOT PART OF THE TRANSCRIPT",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = accent,
+                )
+                Spacer(Modifier.weight(1f))
+                if (answer.streaming) {
+                    Text(
+                        "thinking…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
-
-            if (expanded) {
-                if (state.autoAnswerQuestion.isBlank()) {
-                    Text(
-                        "Waiting for the interviewer's next committed question…",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                } else {
-                    Text(
-                        "Q: ${state.autoAnswerQuestion}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    when {
-                        state.autoAnswerError != null -> Text(
-                            state.autoAnswerError,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                        state.autoAnswerText.isNotBlank() -> {
-                            Text(
-                                "AI SUGGESTION — NOT PART OF THE TRANSCRIPT",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = accent,
-                            )
-                            Text(state.autoAnswerText, style = MaterialTheme.typography.bodyLarge)
-                        }
-                        state.autoAnswerStreaming -> Text(
-                            "Thinking…",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        else -> Text(
-                            "No answer yet.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
+            when {
+                answer.error != null -> Text(
+                    answer.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                answer.text.isNotBlank() -> Text(
+                    answer.text,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+                answer.streaming -> Text(
+                    "Reading the transcript…",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                else -> Text(
+                    "No answer.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

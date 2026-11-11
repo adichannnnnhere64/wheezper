@@ -6,7 +6,7 @@ must not regress.
 
 **wheezper** is a single-binary CLI that listens to a meeting/call and writes a
 timestamped markdown transcript as it happens: local whisper.cpp inference, no
-cloud, no install, Linux / Windows / Android(Termux). Version `0.6.0`.
+cloud, no install, Linux / Windows / Android(Termux). Version `0.6.1`.
 
 ---
 
@@ -45,8 +45,9 @@ Evidence (measured, see "Baseline numbers"):
 ### Phase 2 — DONE (shipped). Two-tier streaming: 0.2–0.35 s on screen
 
 Baseline (measured, `CHANNELS=2`): median **4.23 s**, p90 5.13 s; single
-channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
-**0.46–0.62 s** dual-channel — inside the 0.5 s / 0.8 s budget with margin.
+channel 2.60 s. Shipped result: provisional median **0.32 s**, p90 **0.53 s**
+dual-channel (single channel 0.23 / 0.32) — inside the 0.5 s / 0.8 s budget
+with margin.
 
 **Design.** Each channel runs two tiers (`src/stream.rs`):
 
@@ -56,9 +57,11 @@ channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
   built only from this tier.** Its lag (~4 s single / ~7 s dual) is invisible:
   the preview already showed the words. Cadence, dedupe and the silence rule
   matter for accuracy — see the traps below.
-- **Provisional tier** = live-edge preview: tail windows ≤ 0.8 s
-  (`audio_ctx=40`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
-  `max_tokens=6`, and no rolling context. It is prompt-free by default; an
+- **Provisional tier** = live-edge preview: tail windows ≤ 1.2 s
+  (`audio_ctx=60`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
+  `max_tokens=20`, and no rolling context. 1.2 s, not 0.8 s: the pass cost is
+  the same but a sub-second window decoded fragments ("(", "H", "P"); at
+  1.2 s the preview reads as words. It is prompt-free by default; an
   explicit Phase-3 domain hint is applied without continuity text. Passes cost
   ~0.10 s; words
   reach stdout in ~0.2–0.4 s and are revised in place as the final tier
@@ -66,6 +69,11 @@ channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
   cursor-up, which breaks on wrapped rows). Display-only: never written to
   the notes. Only spawned when stdout is a TTY — piped output skips the
   worker and behaves exactly like Phase 1.
+- **Preview model** (`--preview-model`, default `auto`): the preview may load
+  `base` while the notes stay on `small`/`medium`/`turbo` (one pass 0.10 s vs
+  0.20–0.40 s measured). Both workers still share the core budget by
+  `split_threads`; `same` opts out. This is display-only, so it is not a notes
+  quality trade.
 
 Acceptance (gated, run it after touching the streaming engine):
 
@@ -239,8 +247,10 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   `https://ollama.com/api`); the token is never stored or logged.
 - AI help: `CreateSession(ai_help)` stores a per-session flag; the Android app
   watches committed lines and auto-calls `StreamAnswer` (questions-only default
-  or every far-side line). Answers appear in the app panel and in
-  `assistant_messages`, never in the transcript.
+  or every far-side line). Each answer is **rendered under the transcript row
+  it answers** and stays there (a fast interviewer's next question gets its own
+  card); questions queue in a small bounded FIFO with one request in flight.
+  Answers are also persisted in `assistant_messages`, never in the transcript.
 - `ai_help` also selects the **interview prompt** (`assistant::context::Mode`):
   the far side asked a question, so the answer is one 10-20 word sentence spoken
   as the candidate, allowed to use general technical knowledge (never invented
@@ -370,8 +380,8 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 | tier | 1 ch | 2 ch | pass cost |
 |---|---|---|---|
-| provisional (on screen) | 0.22 s median / 0.46 s p90 | 0.22–0.33 s / 0.46–0.62 s | 0.10 s |
-| final (into notes) | 4.1 s median | 7.3 s median / 8.5 s p90 | 3.1–3.5 s (2 threads) |
+| provisional (on screen) | 0.23 s median / 0.32 s p90 | 0.32 s / 0.53 s | 0.10 s |
+| final (into notes) | 4.1 s median | 6.9 s median / 7.2 s p90 | 3.1–3.5 s (2 threads) |
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
@@ -466,6 +476,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   fires on `new_audio_s` of new audio (or a full window when behind), silence
   is dropped without a pass (`speech_in_buf`), and "the utterance ended" is
   measured on the channel timeline (`speech_ended`, from `last_speech_s`).
+  Do **not** add a silence-triggered final pass to save latency: a window that
+  ends in 2 s of padding silence makes whisper loop the previous words
+  (measured with `GAP_MS=2000`: 39.4 % accuracy with an idle-triggered pass vs
+  78.8 % without it). The preview may be revised; the notes may not.
 - **The streaming tier does not use the continuity prompt** (`prompt_tail` is
   empty unless `WZ_PROMPT_WORDS=n`). A 12-word tail is text the decoder tries to
   *complete*: measured 2 words committed for 3 s of audio, plus invented
@@ -504,9 +518,15 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   `OLLAMA_CLOUD` = fixed ollama.com URL); never let a client supply a URL.
 - **AI help triggers on committed lines only, and the phone drives it.** The
   server stores `sessions.ai_help` and uses it to pick the interview prompt;
-  there is no server-side auto-answer worker. Only the newest queued question is
-  kept while an answer streams, and the candidate's own (`me`) lines are never
+  there is no server-side auto-answer worker. Answers are anchored to the
+  transcript sequence they answer and render under that row, so they are never
+  overwritten by the next question; pending questions are a bounded FIFO (4)
+  with one request in flight. The candidate's own (`me`) lines are never
   answered. Do not trigger answers from provisional preview text.
+- **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
+  whisper's raw tokens: a rare word is several tokens and continuation tokens
+  carry no leading space. Inserting a space per token rendered "Khan" as
+  "Kh an" on screen (the committed line always concatenated correctly).
 - **`ai_help` is interview mode, not a general "smarter assistant" switch.** It
   lets the model use general technical knowledge for the interviewer's question;
   the meeting prompt must stay transcript-grounded (a meeting answer that
@@ -605,7 +625,9 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
     Release artifacts are built with `--features sync`.
 12. Phase 2 budget (manual, reference machine):
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
-   must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s.
+   must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s. Run it with
+   `CHANNELS=1` too (loopback-only, the single-channel setup): measured
+   0.22 s median / 0.30 s p90, so the same gate passes with margin.
 
 ## Open questions for the human
 
@@ -613,7 +635,8 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   transcript rows stay append-only; only the stdout preview revises (TTY only).
   Opt-in Phase 3 annotations are inserted beneath their transcript row.
 - ~~Phase 2: may a different streaming engine be added?~~ **Moot**: the
-  two-tier design hit the 0.5 s budget inside whisper.cpp; revisit only if
-  the provisional tier needs to get cheaper still (e.g. `tiny.en`).
+  two-tier design hit the 0.5 s budget inside whisper.cpp. `--preview-model`
+  (auto: `base` for a big notes model) covers the remaining "preview too slow"
+  case without touching the notes tier.
 - ~~Phase 3: does `1017` mean output-token budget?~~ **Answered**: yes.
 - ~~Phase 3: where do annotations go?~~ **Answered**: notepad only.

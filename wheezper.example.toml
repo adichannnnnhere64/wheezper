@@ -6,6 +6,7 @@
 
 source = "dual"        # mic | loopback | dual | stdin
 model = "base"         # tiny | base | small | medium | turbo | /path/to/model.bin
+# preview-model = "auto"  # auto | same | tiny | base | ... | path (stdout preview only)
 language = "en"        # or "auto" to detect per segment
 # prompt = "Engineering planning for the Atlas migration"  # domain hint, up to 40 words
 # with-agent = "ollama:gemma3:1b:256"  # async annotations; 256 output tokens

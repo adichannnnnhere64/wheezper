@@ -1,6 +1,6 @@
 [package]
 name = "wheezper"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Live meeting/call transcription to a notepad. Single portable binary, local whisper.cpp inference."
 license = "MIT"

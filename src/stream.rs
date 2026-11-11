@@ -116,11 +116,16 @@ impl Tuning {
     /// Live preview: cheap windows on the live edge. `window_s` must stay
     /// within `audio_ctx * 20 ms` of the provisional profile (see
     /// `transcribe`), or audio past the encoder window is silently cut.
-    /// Tuned on the reference machine for the ≤0.5 s median / ≤0.8 s p90
-    /// dual-channel budget.
+    ///
+    /// 1.2 s, not 0.8 s: the pass cost is unchanged (the encoder window is
+    /// the same fixed cost) but a sub-second window is too short for whisper
+    /// to decode whole words — it emitted fragments ("(", "H", "P") on the
+    /// jfk fixture. At 1.2 s the preview reads as words and still measures
+    /// 0.23 s median / 0.32 s p90 single-channel (0.31 / 0.61 dual) on the
+    /// 6-core reference box, well inside the 0.5 s / 0.8 s budget.
     pub fn provisional() -> Self {
         Self {
-            window_s: 0.8,
+            window_s: 1.2,
             min_window_s: 0.30,
             idle_min_window_s: 0.25,
             new_audio_s: 0.02,
@@ -712,13 +717,17 @@ impl ProvisionalTier {
     }
 
     /// Current preview text (the words decoded past the final boundary).
+    ///
+    /// The list holds whisper *tokens*, not whitespace-split words: a rare
+    /// word is several tokens and continuation tokens carry no leading space.
+    /// Concatenate as-is (exactly like the committed line does) — inserting a
+    /// space after every token turned "Khan" into "Kh an" on screen.
     pub fn preview(&self) -> String {
         let mut out = String::new();
         for (_, w) in &self.words {
-            out.push_str(w.trim_start());
-            out.push(' ');
+            out.push_str(w);
         }
-        out.trim_end().to_string()
+        out.trim().to_string()
     }
 
     pub fn flush(&mut self) {
@@ -789,6 +798,19 @@ mod tests {
         tier.push_16k(&vec![0.1; TARGET_RATE as usize]);
         assert!(tier.maybe_send(0, &tx, "engineering planning"));
         assert_eq!(rx.recv().unwrap().prompt.as_deref(), Some("engineering planning"));
+    }
+
+    #[test]
+    fn preview_joins_continuation_tokens_without_spaces() {
+        let mut tier = ProvisionalTier::new();
+        // whisper tokens carry the leading space of a new word; continuation
+        // tokens do not. Inserting one per token rendered "Khan" as "Kh an".
+        tier.words = vec![
+            (0.4, " Hello".to_string()),
+            (0.5, " Kh".to_string()),
+            (0.6, "an".to_string()),
+        ];
+        assert_eq!(tier.preview(), "Hello Khan");
     }
 
     /// Measures live caption latency: word-end -> on screen, end to end,
