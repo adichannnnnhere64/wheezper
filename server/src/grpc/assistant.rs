@@ -71,23 +71,35 @@ impl AssistantService for AssistantGrpc {
         let model = provider.model.clone();
         let sequence = answered_sequence(&req);
         let detail = req.explain_more;
-        let mut deltas = assistant.stream(session_id, req.question, sequence, provider, detail);
+        let think = options.thinking;
+        let mut deltas =
+            assistant.stream(session_id, req.question, sequence, provider, detail, think);
 
         let stream = async_stream::try_stream! {
-            while let Some(delta) = deltas.next().await {
-                let delta = delta.map_err(Status::from)?;
-                yield proto::AnswerChunk {
-                    delta,
-                    done: false,
-                    provider: provider_name.clone(),
-                    model: model.clone(),
-                };
+            let mut usage = None;
+            while let Some(event) = deltas.next().await {
+                let event = event.map_err(Status::from)?;
+                if let Some(u) = event.usage {
+                    usage = Some(u);
+                }
+                if !event.text.is_empty() {
+                    yield proto::AnswerChunk {
+                        delta: event.text,
+                        done: false,
+                        provider: provider_name.clone(),
+                        model: model.clone(),
+                        ..Default::default()
+                    };
+                }
             }
+            let usage = usage.unwrap_or_default();
             yield proto::AnswerChunk {
                 delta: String::new(),
                 done: true,
                 provider: provider_name,
                 model,
+                prompt_tokens: usage.prompt_tokens,
+                output_tokens: usage.output_tokens,
             };
         };
 
@@ -145,5 +157,6 @@ fn options(request: &proto::AskQuestionRequest) -> Result<AssistantOptions, Stat
         api_key: Some(request.api_key.clone()).filter(|k| !k.trim().is_empty()),
         cloud: backend == proto::AssistantBackend::OllamaCloud,
         detail: request.explain_more,
+        thinking: crate::assistant::provider::Think::parse(&request.thinking).map_err(Status::from)?,
     })
 }

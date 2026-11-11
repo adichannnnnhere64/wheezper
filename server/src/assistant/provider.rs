@@ -34,6 +34,49 @@ pub struct Ollama {
 pub struct Prompt {
     pub system: String,
     pub user: String,
+    /// Ollama `think`: `false` unless the user picked a reasoning level. Cloud
+    /// reasoning models otherwise spend the whole budget in `message.thinking`.
+    pub think: Think,
+}
+
+/// Reasoning budget. Values map 1:1 onto Ollama's `think` field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Think {
+    #[default]
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl Think {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "off" | "false" | "none" => Ok(Self::Off),
+            "low" => Ok(Self::Low),
+            "medium" | "mid" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(Error::invalid(format!(
+                "thinking must be off, low, medium or high (got {other})"
+            ))),
+        }
+    }
+
+    fn json(self) -> serde_json::Value {
+        match self {
+            Self::Off => serde_json::Value::Bool(false),
+            Self::Low => "low".into(),
+            Self::Medium => "medium".into(),
+            Self::High => "high".into(),
+        }
+    }
+}
+
+/// Token usage reported by the provider on the last stream message.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Usage {
+    pub prompt_tokens: i64,
+    pub output_tokens: i64,
 }
 
 impl Ollama {
@@ -69,9 +112,7 @@ impl Ollama {
                 {"role": "user", "content": prompt.user},
             ],
             "stream": stream,
-            // cloud reasoning models otherwise spend the whole budget in
-            // `message.thinking` and return empty content
-            "think": false,
+            "think": prompt.think.json(),
             "options": {"temperature": 0.3, "num_predict": 320},
         });
         let mut req = self
@@ -84,7 +125,7 @@ impl Ollama {
         req
     }
 
-    pub async fn generate(&self, prompt: &Prompt) -> Result<String> {
+    pub async fn generate(&self, prompt: &Prompt) -> Result<(String, Usage)> {
         let response = self
             .request(prompt, false)
             .send()
@@ -116,14 +157,15 @@ impl Ollama {
                 "ollama returned an empty answer (is `think` supported by the model?)",
             ));
         }
-        Ok(content)
+        Ok((content, usage(&body)))
     }
 
-    /// NDJSON streaming (`stream: true`) chunked into content deltas.
+    /// NDJSON streaming (`stream: true`) chunked into content deltas, ending
+    /// with one `Usage` part (empty text) when the provider reports it.
     pub fn stream(
         &self,
         prompt: Prompt,
-    ) -> impl futures_util::Stream<Item = Result<String>> + Send + 'static {
+    ) -> impl futures_util::Stream<Item = Result<StreamPart>> + Send + 'static {
         let this = self.clone();
         async_stream::try_stream! {
             let response = this
@@ -161,14 +203,29 @@ impl Ollama {
                     if let Some(delta) = value.pointer("/message/content").and_then(|v| v.as_str())
                         && !delta.is_empty()
                     {
-                        yield delta.to_string();
+                        yield StreamPart { text: delta.to_string(), usage: None };
                     }
                     if value.get("done").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        yield StreamPart { text: String::new(), usage: Some(usage(&value)) };
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+/// One streamed piece: a content delta, or the final usage report.
+pub struct StreamPart {
+    pub text: String,
+    pub usage: Option<Usage>,
+}
+
+fn usage(value: &serde_json::Value) -> Usage {
+    let get = |key: &str| value.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    Usage {
+        prompt_tokens: get("prompt_eval_count"),
+        output_tokens: get("eval_count"),
     }
 }
 
@@ -186,6 +243,17 @@ mod tests {
     fn local_base_url_is_kept() {
         let local = Ollama::new("http://localhost:11434/", "gemma3:1b", None);
         assert_eq!(local.chat_url(), "http://localhost:11434/api/chat");
+    }
+
+    #[test]
+    fn thinking_levels_parse_and_reject_typos() {
+        assert_eq!(Think::parse("").unwrap(), Think::Off);
+        assert_eq!(Think::parse("off").unwrap(), Think::Off);
+        assert_eq!(Think::parse("MEDIUM").unwrap(), Think::Medium);
+        assert_eq!(Think::parse("high").unwrap(), Think::High);
+        assert!(Think::parse("maximum").is_err());
+        assert_eq!(Think::High.json(), serde_json::json!("high"));
+        assert_eq!(Think::Off.json(), serde_json::json!(false));
     }
 
     #[test]

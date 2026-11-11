@@ -79,11 +79,17 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
     var serverOpen by rememberSaveable { mutableStateOf(false) }
 
     val query = state.transcriptQuery.trim().lowercase()
-    val visible = remember(state.events, query) {
-        if (query.isEmpty()) state.events
-        else state.events.filter {
-            it.content.lowercase().contains(query) || it.speaker.lowercase().contains(query)
+    val visible = remember(state.events, query, state.newestFirst) {
+        val filtered = if (query.isEmpty()) {
+            state.events
+        } else {
+            state.events.filter {
+                it.content.lowercase().contains(query) || it.speaker.lowercase().contains(query)
+            }
         }
+        // Newest-first is a display order only: sequence numbers keep the
+        // answers anchored to their rows either way.
+        if (state.newestFirst) filtered.asReversed() else filtered
     }
     val listState = rememberLazyListState()
 
@@ -103,15 +109,19 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
         }
     }
     val answerChars = state.answers.values.sumOf { it.text.length }
-    LaunchedEffect(visible.size, state.answers.size) {
-        if (follow && visible.isNotEmpty()) {
+    LaunchedEffect(visible.size, state.answers.size, state.newestFirst) {
+        if (!follow || visible.isEmpty()) return@LaunchedEffect
+        if (state.newestFirst) {
+            // The newest block is at the top and grows downward; no overflow
+            // to chase.
+            listState.animateScrollToItem(0)
+        } else {
             listState.scrollToBlockEnd(visible.lastIndex, animate = true)
         }
     }
-    LaunchedEffect(answerChars) {
-        if (follow && visible.isNotEmpty()) {
-            listState.scrollToBlockEnd(visible.lastIndex, animate = false)
-        }
+    LaunchedEffect(answerChars, state.newestFirst) {
+        if (!follow || visible.isEmpty() || state.newestFirst) return@LaunchedEffect
+        listState.scrollToBlockEnd(visible.lastIndex, animate = false)
     }
 
     Scaffold(
@@ -173,6 +183,9 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                 hasBrief = session.aiContext.isNotBlank() || session.aiInstructions.isNotBlank(),
                 briefOpen = briefOpen,
                 onBrief = { briefOpen = !briefOpen },
+                newestFirst = state.newestFirst,
+                onNewestFirst = vm::toggleNewestFirst,
+                tokensUsed = state.tokensUsed,
             )
 
             if (searchOpen) {
@@ -349,6 +362,9 @@ private fun SessionChrome(
     hasBrief: Boolean,
     briefOpen: Boolean,
     onBrief: () -> Unit,
+    newestFirst: Boolean,
+    onNewestFirst: () -> Unit,
+    tokensUsed: Long,
 ) {
     Row(
         modifier = Modifier
@@ -370,6 +386,14 @@ private fun SessionChrome(
         } else {
             Spacer(Modifier.weight(1f))
         }
+        if (tokensUsed > 0) {
+            Text(
+                formatTokens(tokensUsed),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        ChromeChip("Newest", active = newestFirst, onClick = onNewestFirst)
         ChromeChip(
             // A dot marks a saved brief so an empty assistant answer is not
             // mistaken for "the model ignored the context I wrote".
@@ -390,6 +414,11 @@ private fun SessionChrome(
         ChromeChip("Search", active = searchOpen, onClick = onSearch)
     }
 }
+
+/** Tokens are small numbers here; a counter nobody can read at a glance is
+ * worse than none. */
+private fun formatTokens(tokens: Long): String =
+    if (tokens < 1_000) "$tokens tok" else String.format("%.1fk tok", tokens / 1000.0)
 
 @Composable
 private fun ChromeChip(label: String, active: Boolean, onClick: () -> Unit) {

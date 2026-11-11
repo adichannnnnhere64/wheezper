@@ -72,7 +72,9 @@ struct Cli {
     #[arg(long, requires = "lyrics")]
     lyric_sync: bool,
 
-    /// Whisper language code, or "auto" to detect per segment
+    /// Whisper language code, "auto", or a list like "en,tl" for code-switched
+    /// speech (a list means auto-detect per window: whisper.cpp decodes one
+    /// language at a time)
     #[arg(short, long, default_value = "auto")]
     language: String,
 
@@ -239,6 +241,25 @@ fn main() -> Result<()> {
     if let Some(cfg) = config::load(cli.config.as_deref())? {
         apply_config(&mut cli, &matches, &cfg.table);
         eprintln!("wheezper: config <- {}", cfg.path.display());
+    }
+
+    // `--lang en,tl`: whisper.cpp takes one language per window. A list means
+    // code-switched speech, so the only honest mapping is per-window auto
+    // detection; the AI answers are pinned to English by the server prompt.
+    if cli.language.contains(',') {
+        let list: Vec<&str> = cli
+            .language
+            .split(',')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !list.is_empty() {
+            eprintln!(
+                "wheezper: lang={} (multi-language: whisper auto-detects per window; answers stay English)",
+                list.join(",")
+            );
+            cli.language = "auto".into();
+        }
     }
 
     if cli.update {

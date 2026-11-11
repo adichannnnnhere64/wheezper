@@ -11,9 +11,10 @@
 //! cannot be turned into an SSRF probe.
 
 use super::context;
-use super::provider::{OLLAMA_CLOUD_URL, Ollama, Prompt};
+use super::provider::{OLLAMA_CLOUD_URL, Ollama, Prompt, Think, Usage};
 use super::repository;
 use crate::error::{Error, Result};
+use crate::kb::Kb;
 use crate::session::SessionService;
 use crate::transcript::service::TranscriptService;
 use futures_util::{Stream, StreamExt};
@@ -34,12 +35,24 @@ pub struct AssistantOptions {
     pub cloud: bool,
     /// The user asked for a longer answer than the automatic one-liner.
     pub detail: bool,
+    /// Reasoning budget; `Off` is the shipped default (thinking costs tokens
+    /// and delays the answer, and the prompts already ask for a short one).
+    pub thinking: Think,
 }
 
 pub struct Answer {
     pub text: String,
     pub provider: String,
     pub model: String,
+    pub prompt_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// One piece of a streamed answer: text, and (once, at the end) the provider's
+/// token usage for the whole request.
+pub struct StreamEvent {
+    pub text: String,
+    pub usage: Option<Usage>,
 }
 
 /// A provider resolved for one call.
@@ -66,6 +79,8 @@ pub struct AssistantService {
     /// `auto` | `full` | `short`: how much meeting the interview prompt carries
     /// (`WHEEZPER_ASSISTANT_CONTEXT`). See `context::Budget`.
     context_policy: String,
+    /// Personal knowledge base, when configured: background about the user.
+    kb: Option<Kb>,
 }
 
 impl AssistantService {
@@ -74,12 +89,29 @@ impl AssistantService {
         sessions: SessionService,
         provider: Ollama,
         context_policy: String,
+        kb: Option<Kb>,
     ) -> Self {
         Self {
             transcripts,
             sessions,
             provider,
             context_policy,
+            kb,
+        }
+    }
+
+    /// Background about the user from the KB. Never fatal: no KB, no outage or
+    /// no match all mean "answer from the transcript only".
+    async fn kb_notes(&self, question: &str) -> Vec<String> {
+        let Some(kb) = &self.kb else {
+            return Vec::new();
+        };
+        match kb.search(question, 3).await {
+            Ok(hits) => hits,
+            Err(err) => {
+                tracing::warn!(error = %err, "knowledge base search failed");
+                Vec::new()
+            }
         }
     }
 
@@ -116,12 +148,14 @@ impl AssistantService {
             self.full_context(provider.cloud),
         )
         .with_detail(options.detail);
+        let notes = self.kb_notes(&question).await;
         let ctx = context::build(
             &self.transcripts,
             session_id,
             &session.title,
             &session.ai_context,
             &session.ai_instructions,
+            &notes,
             &question,
             budget,
         )
@@ -135,7 +169,10 @@ impl AssistantService {
             "assistant question"
         );
 
-        let answer = provider.ollama.generate(&Prompt { system, user }).await?;
+        let (answer, usage) = provider
+            .ollama
+            .generate(&Prompt { system, user, think: options.thinking })
+            .await?;
         persist(
             &self.transcripts,
             session_id,
@@ -151,6 +188,8 @@ impl AssistantService {
             text: answer,
             provider: provider.name.to_string(),
             model: provider.model,
+            prompt_tokens: usage.prompt_tokens,
+            output_tokens: usage.output_tokens,
         })
     }
 
@@ -163,9 +202,11 @@ impl AssistantService {
         answered_sequence: Option<i64>,
         provider: AssistantProvider,
         detail: bool,
-    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
+        think: Think,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
         let transcripts = self.transcripts.clone();
         let sessions = self.sessions.clone();
+        let kb = self.kb.clone();
         let pool = transcripts.pool().clone();
         let provider_name = provider.provider_name();
         let model = provider.model.clone();
@@ -179,12 +220,17 @@ impl AssistantService {
                 cloud,
             )
             .with_detail(detail);
+            let notes = match &kb {
+                Some(kb) => kb.search(&question, 3).await.unwrap_or_default(),
+                None => Vec::new(),
+            };
             let ctx = context::build(
                 &transcripts,
                 session_id,
                 &session.title,
                 &session.ai_context,
                 &session.ai_instructions,
+                &notes,
                 &question,
                 budget,
             )
@@ -199,11 +245,17 @@ impl AssistantService {
             );
 
             let mut answer = String::new();
-            let mut deltas = Box::pin(provider.ollama.stream(Prompt { system, user }));
-            while let Some(delta) = deltas.next().await {
-                let delta = delta?;
-                answer.push_str(&delta);
-                yield delta;
+            let mut usage = None;
+            let mut deltas = Box::pin(provider.ollama.stream(Prompt { system, user, think }));
+            while let Some(part) = deltas.next().await {
+                let part = part?;
+                if let Some(u) = part.usage {
+                    usage = Some(u);
+                }
+                if !part.text.is_empty() {
+                    answer.push_str(&part.text);
+                    yield StreamEvent { text: part.text, usage: None };
+                }
             }
             if answer.trim().is_empty() {
                 Err(Error::provider("the model returned an empty answer"))?;
@@ -224,6 +276,9 @@ impl AssistantService {
             {
                 tracing::warn!(error = %err, "could not persist assistant message");
             }
+
+            // Last part: the caller turns this into the final (done) chunk.
+            yield StreamEvent { text: String::new(), usage };
         })
     }
 
@@ -375,6 +430,7 @@ mod tests {
                 api_key: Some("user-token".into()),
                 cloud: true,
                 detail: false,
+                thinking: Default::default(),
             },
         )
         .unwrap();

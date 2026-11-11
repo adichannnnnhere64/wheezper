@@ -58,6 +58,10 @@ data class UiState(
     val answers: Map<Long, AiAnswer> = emptyMap(),
     val autoAnsweredSequence: Long = 0,
     val transcriptQuery: String = "",
+    /** Transcript order: newest line first (the list is reversed in the UI). */
+    val newestFirst: Boolean = false,
+    /** Prompt + output tokens the provider reported this session. */
+    val tokensUsed: Long = 0,
     val historyQuery: String = "",
 )
 
@@ -356,6 +360,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 answers = emptyMap(),
                 autoAnsweredSequence = 0,
                 transcriptQuery = "",
+                tokensUsed = 0,
             )
         }
         startStreaming(session.id)
@@ -416,6 +421,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 answers = emptyMap(),
                 autoAnsweredSequence = 0,
                 transcriptQuery = "",
+                tokensUsed = 0,
             )
         }
     }
@@ -436,6 +442,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setTranscriptQuery(query: String) {
         _state.update { it.copy(transcriptQuery = query) }
+    }
+
+    fun toggleNewestFirst() {
+        _state.update { it.copy(newestFirst = !it.newestFirst) }
+    }
+
+    /** Reasoning budget for the assistant; the server validates the value. */
+    fun setAssistantThinking(level: String) {
+        viewModelScope.launch { settingsStore.saveThinking(level) }
     }
 
     fun setHistoryQuery(query: String) {
@@ -481,7 +496,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     settings.assistantModel,
                     settings.assistantToken,
                     settings.assistantCloud,
+                    thinking = settings.assistantThinking,
                 ).collect { chunk ->
+                    if (chunk.done) addTokens(chunk.promptTokens, chunk.outputTokens)
                     if (chunk.provider.isNotBlank()) provider = chunk.provider
                     if (chunk.model.isNotBlank()) model = chunk.model
                     if (chunk.delta.isNotEmpty()) {
@@ -773,7 +790,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     // A manual ask always wants detail: either the line got no
                     // answer at all, or the user tapped an existing one for more.
                     explainMore = !automatic,
+                    thinking = settings.assistantThinking,
                 ).collect { chunk ->
+                    if (chunk.done) addTokens(chunk.promptTokens, chunk.outputTokens)
                     if (chunk.delta.isNotEmpty()) {
                         answer.append(chunk.delta)
                         updateAnswer(sequence) { it.copy(text = answer.toString()) }
@@ -801,6 +820,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         if (automatic) autoJob = job else manualJob = job
+    }
+
+    /** Provider-reported usage for one answer, accumulated for the counter. */
+    private fun addTokens(prompt: Long, output: Long) {
+        if (prompt <= 0 && output <= 0) return
+        _state.update { it.copy(tokensUsed = it.tokensUsed + prompt + output) }
     }
 
     private fun putAnswer(answer: AiAnswer) {

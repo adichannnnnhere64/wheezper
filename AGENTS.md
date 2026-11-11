@@ -289,6 +289,26 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   replaces them (device token only — a session publish token may read its
   session, not edit it), because the useful brief is written after the first
   question.
+- **Notes leave the box two ways on `EndSession`, both best-effort.** Email via
+  SMTP (`WHEEZPER_EMAIL_TO/_FROM/_USER/_PASS/_RELAY`, STARTTLS by default) and a
+  push into the personal knowledge base (`WHEEZPER_KB_URL/_TOKEN/_MEETINGS`,
+  collection `meetings`, source `wheezper://<session id>`). Both run in a
+  detached task after the RPC returns: a slow relay or a KB outage must never
+  fail ending a meeting that is already stored, and both log a warning instead.
+  Off unless configured — a transcript is private and the default is silence.
+- **The KB is read for answers, not just written.** `Kb::search` queries only
+  `WHEEZPER_KB_COLLECTIONS` (default `interviews,learning`): the family-kb also
+  holds `family` and `personal`, and those must not be prefilled into a prompt
+  just because a question matched. Hits become a bounded "background about me"
+  block in the user message (2.4k chars, 3 hits) — background, never transcript
+  evidence. Pointing the assistant at Ollama Cloud sends those excerpts off the
+  box, which is the one thing to think about before enabling both.
+- **family-kb binds loopback only, so the container needs a bridge.** The
+  compose stack adds `host.docker.internal:host-gateway` plus a `kb-bridge`
+  socat service in the host network namespace (host `0.0.0.0:18082` → KB
+  `127.0.0.1:8082`), allowed by ufw only from `172.16.0.0/12`. The KB's bearer
+  token still applies. Do not "simplify" this by rebinding the KB to a public
+  interface — its README refuses that on purpose.
 - TLS clients: `https://` endpoints must set
   `ClientTlsConfig::new().with_webpki_roots()` (crate feature
   `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
@@ -610,6 +630,15 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   *interview* system prompt to 2-4 sentences of concrete detail instead of the
   automatic 10-20 word line. The rules about inventing facts are identical in
   both shapes — detail is a length change, not a licence.
+- **The phone's display order, token counter and thinking level are per-app
+  state, not session data.** "Newest" reverses the list only (answers stay
+  anchored to their sequence number, and the follow logic scrolls to item 0
+  instead of the block end). The token counter sums provider-reported
+  `prompt_tokens + output_tokens` from each done chunk — a provider that reports
+  nothing leaves it at 0 rather than showing an invented number. Thinking is
+  `off|low|medium|high`, sent per request and validated server-side into
+  Ollama's `think`; it stays off by default because reasoning tokens cost
+  latency in an interview.
 - **The transcript follows the newest block by its end, not its top.**
   `scrollToBlockEnd` scrolls to the item and then by the overflow, because
   `animateScrollToItem` alone parks a tall block at the top of the viewport
@@ -619,6 +648,11 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   end — a growing answer must never yank someone who scrolled up. The
   connection, AI-help and search blocks are collapsed into one chrome row of
   chips for the same reason: the notes are the screen.
+- **`--lang en,tl` means auto-detect, not two models.** whisper.cpp decodes one
+  language per window; a comma list is code-switched speech, so the CLI maps it
+  to per-window `auto` and says so once at startup. The *answers* are pinned to
+  English by the server prompt ("always answer in English, even when the
+  transcript is Tagalog or mixed") — the transcript stays in whatever was said.
 - **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
   whisper's raw tokens: a rare word is several tokens and continuation tokens
   carry no leading space. Inserting a space per token rendered "Khan" as

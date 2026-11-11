@@ -262,6 +262,7 @@ async fn main() -> Result<()> {
                         },
                         answered_sequence: 0,
                         explain_more: false,
+                        ..Default::default()
                     },
                     token,
                 ))

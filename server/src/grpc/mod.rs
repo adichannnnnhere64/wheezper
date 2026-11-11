@@ -19,4 +19,9 @@ pub struct AppState {
     pub sessions: SessionService,
     pub transcripts: TranscriptService,
     pub assistant: AssistantService,
+    /// Present only when the operator configured SMTP: notes are mailed on
+    /// `EndSession`, and never when this is `None`.
+    pub email: Option<crate::email::Email>,
+    /// Personal knowledge base, when the operator linked one.
+    pub kb: Option<crate::kb::Kb>,
 }

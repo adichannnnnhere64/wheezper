@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -164,6 +165,16 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             Switch(checked = aiCloud, onCheckedChange = { aiCloud = it })
             Spacer(Modifier.padding(horizontal = 6.dp))
             Text("Use Ollama Cloud (ollama.com)", style = MaterialTheme.typography.bodyMedium)
+        }
+        Text("Thinking", style = MaterialTheme.typography.labelMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("off", "low", "medium", "high").forEach { level ->
+                FilterChip(
+                    selected = state.settings.assistantThinking == level,
+                    onClick = { vm.setAssistantThinking(level) },
+                    label = { Text(level) },
+                )
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),

@@ -167,6 +167,7 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
         cloud: Boolean,
         answeredSequence: Long = 0,
         explainMore: Boolean = false,
+        thinking: String = "",
     ): Flow<AnswerChunk> =
         client.assistant.streamAnswer(
             AskQuestionRequest.newBuilder()
@@ -178,6 +179,8 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
                 .setAnsweredSequence(answeredSequence)
                 // Double-tap: the user wants detail, not the one-liner.
                 .setExplainMore(explainMore)
+                // off / low / medium / high; the server validates it.
+                .setThinking(thinking)
                 .setBackend(
                     if (cloud) {
                         AssistantBackend.ASSISTANT_BACKEND_OLLAMA_CLOUD

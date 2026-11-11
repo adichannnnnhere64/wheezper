@@ -102,6 +102,8 @@ pub struct MeetingContext {
     pub context: String,
     /// Answer guidance the user asked for (may be empty).
     pub instructions: String,
+    /// Background about the user, from the personal knowledge base.
+    pub notes: Vec<String>,
     pub recent: Vec<ContextEntry>,
     pub earlier: Vec<ContextEntry>,
     pub previous: Vec<PreviousAnswer>,
@@ -144,6 +146,16 @@ impl MeetingContext {
             user.push_str("What this session is about (written by the user):\n");
             user.push_str(self.context.trim());
             user.push_str("\n\n");
+        }
+
+        // Background about the user (KB retrieval). It is what the user wrote
+        // about themselves, so it may shape *how* the answer is given — but it
+        // is still not a transcript, and the mode's fact rules stay.
+        if !self.notes.is_empty() {
+            user.push_str("Background about me from my personal notes (use it for my experience \
+                          and preferences; never invent anything beyond it):\n");
+            user.push_str(&render_notes_block(&self.notes, MAX_NOTES_CHARS));
+            user.push('\n');
         }
 
         // Answers already given are part of the assistant's memory: a question
@@ -193,7 +205,8 @@ impl MeetingContext {
                               app. You answer questions about the meeting transcript you are given. \
                               You never invent statements, decisions, names or numbers that are not \
                               in the transcript. Keep answers under 120 words and lead with the direct \
-                              answer."
+                              answer. Always answer in English, even when the transcript is in \
+                              another language."
                     .to_string();
                 (with_guidance(system, &self.instructions), user)
             }
@@ -212,7 +225,8 @@ impl MeetingContext {
                      Use the transcript for context and your own general technical knowledge for \
                      the substance; if the transcript already shows relevant experience, prefer \
                      it. Never invent personal facts, employers, dates or experience that are not \
-                     in the transcript."
+                     in the transcript. Always answer in English, even when the transcript is \
+                     Tagalog or mixed."
                 } else {
                     "You are helping the candidate in a live interview. `them` is the \
                      interviewer, `me` is the candidate. Answer the interviewer's latest line as \
@@ -221,7 +235,8 @@ impl MeetingContext {
                      context and your own general technical knowledge for the substance; if the \
                      transcript already shows relevant experience, prefer it. Never invent \
                      personal facts, employers, dates or experience that are not in the \
-                     transcript."
+                     transcript. Always answer in English, even when the transcript is Tagalog \
+                     or mixed."
                 }
                 .to_string();
                 (with_guidance(system, &self.instructions), user)
@@ -230,7 +245,8 @@ impl MeetingContext {
     }
 }
 
-fn render_entries(entries: &[ContextEntry], max_chars: usize) -> String {    let mut lines: Vec<String> = entries
+fn render_entries(entries: &[ContextEntry], max_chars: usize) -> String {
+    let mut lines: Vec<String> = entries
         .iter()
         .map(|e| {
             let time = e.started_at.format("%H:%M:%S");
@@ -271,6 +287,7 @@ pub async fn build(
     title: &str,
     context: &str,
     instructions: &str,
+    notes: &[String],
     question: &str,
     budget: Budget,
 ) -> crate::error::Result<MeetingContext> {
@@ -311,6 +328,7 @@ pub async fn build(
         title: title.to_string(),
         context: bounded(context, MAX_BRIEF_CHARS),
         instructions: bounded(instructions, MAX_INSTRUCTIONS_CHARS),
+        notes: notes.iter().map(|n| bounded(n, MAX_NOTE_CHARS)).filter(|n| !n.is_empty()).collect(),
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
         previous,
@@ -334,6 +352,26 @@ fn with_guidance(mut system: String, instructions: &str) -> String {
 
 /// Trim and cap a user-written prompt field (defence in depth: the session
 /// service already rejects over-long briefs).
+/// KB excerpts are prefilled on every request and come from a personal corpus,
+/// so they are capped hard: three hits of a few hundred words is the useful
+/// window, and the transcript still has to fit.
+const MAX_NOTES_CHARS: usize = 2_400;
+const MAX_NOTE_CHARS: usize = 900;
+const MAX_NOTES: usize = 3;
+
+fn render_notes_block(notes: &[String], max_chars: usize) -> String {
+    let mut out = String::new();
+    for note in notes.iter().take(MAX_NOTES) {
+        if out.len() + note.len() + 3 > max_chars {
+            break;
+        }
+        out.push_str("- ");
+        out.push_str(note);
+        out.push('\n');
+    }
+    out
+}
+
 fn bounded(value: &str, max_chars: usize) -> String {
     let value = value.trim();
     if value.chars().count() <= max_chars {
@@ -418,6 +456,7 @@ mod tests {
             title: "Review".into(),
             context: String::new(),
             instructions: String::new(),
+            notes: Vec::new(),
             recent,
             earlier,
             previous: Vec::new(),
@@ -444,6 +483,17 @@ mod tests {
             plain.messages("what is a record?", Budget::for_request(Mode::Interview, false));
         assert!(!plain_user.contains("What this session is about"));
         assert!(!plain_system.contains("answer guidance"));
+    }
+
+    #[test]
+    fn knowledge_base_notes_are_background_not_transcript() {
+        let mut meeting = ctx(vec![entry(1, "them", "hello")], Vec::new(), 1);
+        meeting.notes = vec!["[interviews] Resume: five years of Spring Boot.".into()];
+        let (_, user) =
+            meeting.messages("what is a record?", Budget::for_request(Mode::Interview, false));
+        assert!(user.contains("Background about me from my personal notes"));
+        assert!(user.contains("five years of Spring Boot"));
+        assert!(user.contains("never invent anything beyond it"));
     }
 
     #[test]

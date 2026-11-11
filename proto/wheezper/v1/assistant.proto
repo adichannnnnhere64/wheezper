@@ -33,6 +33,9 @@ message AskQuestionRequest {
   // phone's double-tap on a transcript row). Only changes the answer's shape:
   // the mode's rules about inventing facts still apply.
   bool explain_more = 7;
+  // Reasoning budget for models that support it: "" / "off" (default), "low",
+  // "medium", "high". Sent to Ollama as `think`; unknown values are rejected.
+  string thinking = 8;
 }
 
 // One persisted answer, anchored to the transcript row it answers.
@@ -65,6 +68,10 @@ message AnswerChunk {
   bool done = 2;
   string provider = 3;
   string model = 4;
+  // Provider-reported usage, set on the final (done) chunk: what the prompt
+  // cost and what the answer generated. 0 = the provider did not report it.
+  int64 prompt_tokens = 5;
+  int64 output_tokens = 6;
 }
 
 service AssistantService {
