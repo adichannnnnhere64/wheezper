@@ -72,8 +72,16 @@ impl AssistantService for AssistantGrpc {
         let sequence = answered_sequence(&req);
         let detail = req.explain_more;
         let think = options.thinking;
-        let mut deltas =
-            assistant.stream(session_id, req.question, sequence, provider, detail, think);
+        let about_me = req.about_me.clone();
+        let mut deltas = assistant.stream(
+            session_id,
+            req.question,
+            sequence,
+            provider,
+            detail,
+            think,
+            about_me,
+        );
 
         let stream = async_stream::try_stream! {
             let mut usage = None;
@@ -158,5 +166,6 @@ fn options(request: &proto::AskQuestionRequest) -> Result<AssistantOptions, Stat
         cloud: backend == proto::AssistantBackend::OllamaCloud,
         detail: request.explain_more,
         thinking: crate::assistant::provider::Think::parse(&request.thinking).map_err(Status::from)?,
+        about_me: request.about_me.clone(),
     })
 }

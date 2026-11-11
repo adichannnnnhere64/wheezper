@@ -168,6 +168,7 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
         answeredSequence: Long = 0,
         explainMore: Boolean = false,
         thinking: String = "",
+        aboutMe: String = "",
     ): Flow<AnswerChunk> =
         client.assistant.streamAnswer(
             AskQuestionRequest.newBuilder()
@@ -181,6 +182,8 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
                 .setExplainMore(explainMore)
                 // off / low / medium / high; the server validates it.
                 .setThinking(thinking)
+                // "About me" from Settings: prompt background, not session data.
+                .setAboutMe(aboutMe)
                 .setBackend(
                     if (cloud) {
                         AssistantBackend.ASSISTANT_BACKEND_OLLAMA_CLOUD

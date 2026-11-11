@@ -102,8 +102,8 @@ pub struct MeetingContext {
     pub context: String,
     /// Answer guidance the user asked for (may be empty).
     pub instructions: String,
-    /// Background about the user, from the personal knowledge base.
-    pub notes: Vec<String>,
+    /// "About me" text the user typed in Settings; background for answers.
+    pub about_me: String,
     pub recent: Vec<ContextEntry>,
     pub earlier: Vec<ContextEntry>,
     pub previous: Vec<PreviousAnswer>,
@@ -148,14 +148,14 @@ impl MeetingContext {
             user.push_str("\n\n");
         }
 
-        // Background about the user (KB retrieval). It is what the user wrote
-        // about themselves, so it may shape *how* the answer is given — but it
-        // is still not a transcript, and the mode's fact rules stay.
-        if !self.notes.is_empty() {
-            user.push_str("Background about me from my personal notes (use it for my experience \
-                          and preferences; never invent anything beyond it):\n");
-            user.push_str(&render_notes_block(&self.notes, MAX_NOTES_CHARS));
-            user.push('\n');
+        // "About me" from the phone's settings. The user wrote it about
+        // themselves, so it may shape the answer — but it is not a transcript,
+        // and the mode's rules about inventing facts still apply.
+        if !self.about_me.trim().is_empty() {
+            user.push_str("About me, from my own settings (use it for my experience and \
+                          preferences; never invent anything beyond it):\n");
+            user.push_str(self.about_me.trim());
+            user.push_str("\n\n");
         }
 
         // Answers already given are part of the assistant's memory: a question
@@ -287,7 +287,7 @@ pub async fn build(
     title: &str,
     context: &str,
     instructions: &str,
-    notes: &[String],
+    about_me: &str,
     question: &str,
     budget: Budget,
 ) -> crate::error::Result<MeetingContext> {
@@ -328,7 +328,7 @@ pub async fn build(
         title: title.to_string(),
         context: bounded(context, MAX_BRIEF_CHARS),
         instructions: bounded(instructions, MAX_INSTRUCTIONS_CHARS),
-        notes: notes.iter().map(|n| bounded(n, MAX_NOTE_CHARS)).filter(|n| !n.is_empty()).collect(),
+        about_me: bounded(about_me, MAX_ABOUT_ME_CHARS),
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
         previous,
@@ -352,25 +352,9 @@ fn with_guidance(mut system: String, instructions: &str) -> String {
 
 /// Trim and cap a user-written prompt field (defence in depth: the session
 /// service already rejects over-long briefs).
-/// KB excerpts are prefilled on every request and come from a personal corpus,
-/// so they are capped hard: three hits of a few hundred words is the useful
-/// window, and the transcript still has to fit.
-const MAX_NOTES_CHARS: usize = 2_400;
-const MAX_NOTE_CHARS: usize = 900;
-const MAX_NOTES: usize = 3;
-
-fn render_notes_block(notes: &[String], max_chars: usize) -> String {
-    let mut out = String::new();
-    for note in notes.iter().take(MAX_NOTES) {
-        if out.len() + note.len() + 3 > max_chars {
-            break;
-        }
-        out.push_str("- ");
-        out.push_str(note);
-        out.push('\n');
-    }
-    out
-}
+/// "About me" is prefilled on every request, so it is capped like the brief:
+/// a paragraph, not a document. The transcript still has to fit.
+const MAX_ABOUT_ME_CHARS: usize = 2_000;
 
 fn bounded(value: &str, max_chars: usize) -> String {
     let value = value.trim();
@@ -456,7 +440,7 @@ mod tests {
             title: "Review".into(),
             context: String::new(),
             instructions: String::new(),
-            notes: Vec::new(),
+            about_me: String::new(),
             recent,
             earlier,
             previous: Vec::new(),
@@ -486,14 +470,19 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_base_notes_are_background_not_transcript() {
+    fn about_me_is_background_not_transcript() {
         let mut meeting = ctx(vec![entry(1, "them", "hello")], Vec::new(), 1);
-        meeting.notes = vec!["[interviews] Resume: five years of Spring Boot.".into()];
+        meeting.about_me = "Five years of Spring Boot; I prefer short answers.".into();
         let (_, user) =
             meeting.messages("what is a record?", Budget::for_request(Mode::Interview, false));
-        assert!(user.contains("Background about me from my personal notes"));
-        assert!(user.contains("five years of Spring Boot"));
+        assert!(user.contains("About me, from my own settings"));
+        assert!(user.contains("Five years of Spring Boot"));
         assert!(user.contains("never invent anything beyond it"));
+
+        // Empty text changes nothing.
+        let plain = ctx(vec![entry(1, "them", "hello")], Vec::new(), 1);
+        let (_, user) = plain.messages("q", Budget::for_request(Mode::Interview, false));
+        assert!(!user.contains("About me"));
     }
 
     #[test]

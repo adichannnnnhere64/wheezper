@@ -14,7 +14,6 @@ use super::context;
 use super::provider::{OLLAMA_CLOUD_URL, Ollama, Prompt, Think, Usage};
 use super::repository;
 use crate::error::{Error, Result};
-use crate::kb::Kb;
 use crate::session::SessionService;
 use crate::transcript::service::TranscriptService;
 use futures_util::{Stream, StreamExt};
@@ -38,6 +37,8 @@ pub struct AssistantOptions {
     /// Reasoning budget; `Off` is the shipped default (thinking costs tokens
     /// and delays the answer, and the prompts already ask for a short one).
     pub thinking: Think,
+    /// "About me" text from the phone's settings; prompt context, not data.
+    pub about_me: String,
 }
 
 pub struct Answer {
@@ -79,8 +80,6 @@ pub struct AssistantService {
     /// `auto` | `full` | `short`: how much meeting the interview prompt carries
     /// (`WHEEZPER_ASSISTANT_CONTEXT`). See `context::Budget`.
     context_policy: String,
-    /// Personal knowledge base, when configured: background about the user.
-    kb: Option<Kb>,
 }
 
 impl AssistantService {
@@ -89,29 +88,12 @@ impl AssistantService {
         sessions: SessionService,
         provider: Ollama,
         context_policy: String,
-        kb: Option<Kb>,
     ) -> Self {
         Self {
             transcripts,
             sessions,
             provider,
             context_policy,
-            kb,
-        }
-    }
-
-    /// Background about the user from the KB. Never fatal: no KB, no outage or
-    /// no match all mean "answer from the transcript only".
-    async fn kb_notes(&self, question: &str) -> Vec<String> {
-        let Some(kb) = &self.kb else {
-            return Vec::new();
-        };
-        match kb.search(question, 3).await {
-            Ok(hits) => hits,
-            Err(err) => {
-                tracing::warn!(error = %err, "knowledge base search failed");
-                Vec::new()
-            }
         }
     }
 
@@ -148,14 +130,13 @@ impl AssistantService {
             self.full_context(provider.cloud),
         )
         .with_detail(options.detail);
-        let notes = self.kb_notes(&question).await;
         let ctx = context::build(
             &self.transcripts,
             session_id,
             &session.title,
             &session.ai_context,
             &session.ai_instructions,
-            &notes,
+            &options.about_me,
             &question,
             budget,
         )
@@ -203,10 +184,11 @@ impl AssistantService {
         provider: AssistantProvider,
         detail: bool,
         think: Think,
+        about_me: String,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
         let transcripts = self.transcripts.clone();
         let sessions = self.sessions.clone();
-        let kb = self.kb.clone();
+
         let pool = transcripts.pool().clone();
         let provider_name = provider.provider_name();
         let model = provider.model.clone();
@@ -220,17 +202,13 @@ impl AssistantService {
                 cloud,
             )
             .with_detail(detail);
-            let notes = match &kb {
-                Some(kb) => kb.search(&question, 3).await.unwrap_or_default(),
-                None => Vec::new(),
-            };
             let ctx = context::build(
                 &transcripts,
                 session_id,
                 &session.title,
                 &session.ai_context,
                 &session.ai_instructions,
-                &notes,
+                &about_me,
                 &question,
                 budget,
             )
@@ -431,6 +409,7 @@ mod tests {
                 cloud: true,
                 detail: false,
                 thinking: Default::default(),
+                about_me: String::new(),
             },
         )
         .unwrap();

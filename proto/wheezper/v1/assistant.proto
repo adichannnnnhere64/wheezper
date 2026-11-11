@@ -36,6 +36,10 @@ message AskQuestionRequest {
   // Reasoning budget for models that support it: "" / "off" (default), "low",
   // "medium", "high". Sent to Ollama as `think`; unknown values are rejected.
   string thinking = 8;
+  // What the user wrote about themselves in Settings ("about me"): background
+  // for the answer, sent on every request. It is not the session brief and it
+  // is not a transcript row; the server appends it to the prompt as context.
+  string about_me = 9;
 }
 
 // One persisted answer, anchored to the transcript row it answers.

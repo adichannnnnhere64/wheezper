@@ -53,6 +53,9 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
     var aiEveryLine by rememberSaveable(state.settings.assistantEveryLine) {
         mutableStateOf(state.settings.assistantEveryLine)
     }
+    var aiAboutMe by rememberSaveable(state.settings.assistantAboutMe) {
+        mutableStateOf(state.settings.assistantAboutMe)
+    }
 
     Column(
         modifier = Modifier
@@ -166,6 +169,23 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             Spacer(Modifier.padding(horizontal = 6.dp))
             Text("Use Ollama Cloud (ollama.com)", style = MaterialTheme.typography.bodyMedium)
         }
+        OutlinedTextField(
+            value = aiAboutMe,
+            onValueChange = { aiAboutMe = it },
+            label = { Text("About me") },
+            placeholder = {
+                Text("Five years of Java/Spring; led a payments migration; prefer short answers.")
+            },
+            minLines = 3,
+            maxLines = 8,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            "Sent with every AI help request as background (max 2,000 characters). It is " +
+                "prompt context, not transcript: the assistant still may not invent experience.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text("Thinking", style = MaterialTheme.typography.labelMedium)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("off", "low", "medium", "high").forEach { level ->
@@ -186,6 +206,12 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
                 "Answer every far-side line (not only questions)",
                 style = MaterialTheme.typography.bodyMedium,
             )
+        }
+        Button(
+            onClick = { vm.saveAboutMe(aiAboutMe) },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Save about me")
         }
         Button(
             onClick = { vm.saveAssistantSettings(aiModel, aiToken, aiCloud, aiEveryLine) },

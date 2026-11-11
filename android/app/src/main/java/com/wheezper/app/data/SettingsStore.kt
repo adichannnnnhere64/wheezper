@@ -25,6 +25,8 @@ data class Settings(
     val assistantEveryLine: Boolean = false,
     /** Reasoning budget sent to Ollama: off / low / medium / high. */
     val assistantThinking: String = "off",
+    /** "About me": background sent with every AI help request. */
+    val assistantAboutMe: String = "",
 ) {
     val paired: Boolean get() = serverUrl.isNotBlank() && deviceToken.isNotBlank()
 }
@@ -39,6 +41,7 @@ class SettingsStore(private val context: Context) {
         val assistantCloud = booleanPreferencesKey("assistant_cloud")
         val assistantEveryLine = booleanPreferencesKey("assistant_every_line")
         val assistantThinking = stringPreferencesKey("assistant_thinking")
+        val assistantAboutMe = stringPreferencesKey("assistant_about_me")
     }
 
     val flow: Flow<Settings> = context.dataStore.data.map { prefs ->
@@ -51,6 +54,7 @@ class SettingsStore(private val context: Context) {
             assistantCloud = prefs[Keys.assistantCloud] ?: false,
             assistantEveryLine = prefs[Keys.assistantEveryLine] ?: false,
             assistantThinking = prefs[Keys.assistantThinking].orEmpty().ifBlank { "off" },
+            assistantAboutMe = prefs[Keys.assistantAboutMe].orEmpty(),
         )
     }
 
@@ -66,6 +70,10 @@ class SettingsStore(private val context: Context) {
             it[Keys.assistantCloud] = cloud
             it[Keys.assistantEveryLine] = everyLine
         }
+    }
+
+    suspend fun saveAboutMe(text: String) {
+        context.dataStore.edit { it[Keys.assistantAboutMe] = text.trim() }
     }
 
     suspend fun saveThinking(level: String) {

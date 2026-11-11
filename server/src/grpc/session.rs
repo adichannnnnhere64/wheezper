@@ -163,10 +163,10 @@ impl SessionServiceGrpc for SessionGrpc {
             .await
             .map_err(Status::from)?;
         tracing::info!(session = %row.id, "session ended");
-        // Mail and archive the notes after the RPC is answered: a slow SMTP
-        // relay or KB must not hold up the phone, and a failure must not fail
-        // the end of a meeting that is already stored.
-        if self.state.email.is_some() || self.state.kb.is_some() {
+        // Mail the notes after the RPC is answered: a slow SMTP relay must not
+        // hold up the phone, and a failure must not fail the end of a meeting
+        // that is already stored.
+        if self.state.email.is_some() {
             let state = self.state.clone();
             let completed = row.clone();
             tokio::spawn(async move {
@@ -177,30 +177,6 @@ impl SessionServiceGrpc for SessionGrpc {
                             session = %completed.id,
                             error = %err,
                             "could not email notes"
-                        ),
-                    }
-                }
-                if let Some(kb) = &state.kb {
-                    match state.transcripts.recent(completed.id, 20_000).await {
-                        Ok(entries) => {
-                            let notes = crate::email::render_notes(&completed, &entries);
-                            let source = format!("wheezper://{}", completed.id);
-                            match kb.add_note(&completed.title, &notes, &source).await {
-                                Ok(()) => tracing::info!(
-                                    session = %completed.id,
-                                    "meeting pushed to the knowledge base"
-                                ),
-                                Err(err) => tracing::warn!(
-                                    session = %completed.id,
-                                    error = %err,
-                                    "could not push the meeting to the knowledge base"
-                                ),
-                            }
-                        }
-                        Err(err) => tracing::warn!(
-                            session = %completed.id,
-                            error = %err,
-                            "could not read the transcript for the knowledge base"
                         ),
                     }
                 }

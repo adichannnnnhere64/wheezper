@@ -453,6 +453,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { settingsStore.saveThinking(level) }
     }
 
+    /** "About me" is sent with every AI help request. */
+    fun saveAboutMe(text: String) {
+        viewModelScope.launch { settingsStore.saveAboutMe(text) }
+    }
+
     fun setHistoryQuery(query: String) {
         _state.update { it.copy(historyQuery = query) }
     }
@@ -497,6 +502,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     settings.assistantToken,
                     settings.assistantCloud,
                     thinking = settings.assistantThinking,
+                    aboutMe = settings.assistantAboutMe,
                 ).collect { chunk ->
                     if (chunk.done) addTokens(chunk.promptTokens, chunk.outputTokens)
                     if (chunk.provider.isNotBlank()) provider = chunk.provider
@@ -791,6 +797,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     // answer at all, or the user tapped an existing one for more.
                     explainMore = !automatic,
                     thinking = settings.assistantThinking,
+                    aboutMe = settings.assistantAboutMe,
                 ).collect { chunk ->
                     if (chunk.done) addTokens(chunk.promptTokens, chunk.outputTokens)
                     if (chunk.delta.isNotEmpty()) {

@@ -12,7 +12,6 @@ pub mod db;
 pub mod email;
 pub mod error;
 pub mod grpc;
-pub mod kb;
 pub mod session;
 pub mod time;
 pub mod transcript;
@@ -51,19 +50,11 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>> {
         &config.assistant_model,
         config.assistant_api_key.clone(),
     );
-    let kb = kb::Kb::from_env();
-    if let Some(kb) = &kb {
-        tracing::info!(
-            collection = kb.meetings_collection(),
-            "knowledge base linked: meetings are pushed to it and answers may use it"
-        );
-    }
     let assistant = AssistantService::new(
         transcripts.clone(),
         sessions.clone(),
         provider,
         config.assistant_context.clone(),
-        kb.clone(),
     );
 
     let email = email::Email::from_env();
@@ -78,7 +69,6 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>> {
         transcripts,
         assistant,
         email,
-        kb,
     }))
 }
 

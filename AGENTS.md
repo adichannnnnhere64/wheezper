@@ -289,26 +289,14 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   replaces them (device token only — a session publish token may read its
   session, not edit it), because the useful brief is written after the first
   question.
-- **Notes leave the box two ways on `EndSession`, both best-effort.** Email via
-  SMTP (`WHEEZPER_EMAIL_TO/_FROM/_USER/_PASS/_RELAY`, STARTTLS by default) and a
-  push into the personal knowledge base (`WHEEZPER_KB_URL/_TOKEN/_MEETINGS`,
-  collection `meetings`, source `wheezper://<session id>`). Both run in a
-  detached task after the RPC returns: a slow relay or a KB outage must never
-  fail ending a meeting that is already stored, and both log a warning instead.
-  Off unless configured — a transcript is private and the default is silence.
-- **The KB is read for answers, not just written.** `Kb::search` queries only
-  `WHEEZPER_KB_COLLECTIONS` (default `interviews,learning`): the family-kb also
-  holds `family` and `personal`, and those must not be prefilled into a prompt
-  just because a question matched. Hits become a bounded "background about me"
-  block in the user message (2.4k chars, 3 hits) — background, never transcript
-  evidence. Pointing the assistant at Ollama Cloud sends those excerpts off the
-  box, which is the one thing to think about before enabling both.
-- **family-kb binds loopback only, so the container needs a bridge.** The
-  compose stack adds `host.docker.internal:host-gateway` plus a `kb-bridge`
-  socat service in the host network namespace (host `0.0.0.0:18082` → KB
-  `127.0.0.1:8082`), allowed by ufw only from `172.16.0.0/12`. The KB's bearer
-  token still applies. Do not "simplify" this by rebinding the KB to a public
-  interface — its README refuses that on purpose.
+- **Notes are emailed on `EndSession`, best-effort.** SMTP via
+  `WHEEZPER_EMAIL_TO/_FROM/_USER/_PASS/_RELAY` (STARTTLS by default), in a
+  detached task after the RPC returns: a slow relay must never fail ending a
+  meeting that is already stored, and a send failure logs a warning. Off unless
+  configured — a transcript is private and the default is silence. A knowledge
+  base was tried here and removed: every answer paid 0.13-1.15 s of local
+  embedding on the same Ollama queue, so the user's own words belong in
+  Settings, not in a retrieval hop.
 - TLS clients: `https://` endpoints must set
   `ClientTlsConfig::new().with_webpki_roots()` (crate feature
   `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
@@ -638,7 +626,9 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   nothing leaves it at 0 rather than showing an invented number. Thinking is
   `off|low|medium|high`, sent per request and validated server-side into
   Ollama's `think`; it stays off by default because reasoning tokens cost
-  latency in an interview.
+  latency in an interview. "About me" (Settings, max 2,000 chars) is sent as
+  prompt context on every request — the user's own words, capped like the
+  session brief, and still not a licence to invent experience.
 - **The transcript follows the newest block by its end, not its top.**
   `scrollToBlockEnd` scrolls to the item and then by the overflow, because
   `animateScrollToItem` alone parks a tall block at the top of the viewport
