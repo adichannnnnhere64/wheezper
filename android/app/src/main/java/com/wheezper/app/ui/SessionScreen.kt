@@ -5,6 +5,7 @@ package com.wheezper.app.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
@@ -51,6 +52,7 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -237,7 +239,11 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                         // directly beneath it the answer to *that* row (if AI
                         // help answered it). Never a single shared answer slot —
                         // a fast interviewer would keep overwriting it.
-                        TurnBlock(event, state.answers[event.sequenceNumber])
+                        TurnBlock(
+                            event = event,
+                            answer = state.answers[event.sequenceNumber],
+                            onAsk = { vm.askAboutEvent(event) },
+                        )
                     }
                 }
             }
@@ -250,9 +256,19 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
 }
 
 @Composable
-private fun TurnBlock(event: TranscriptEvent, answer: AiAnswer?) {
+private fun TurnBlock(event: TranscriptEvent, answer: AiAnswer?, onAsk: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        TranscriptRow(event)
+        // Double-tap asks about this line: the manual fallback when the
+        // question heuristic saw a statement, and the way to get more than the
+        // automatic one-liner. A single tap stays inert so scrolling and
+        // reading are untouched.
+        Box(
+            modifier = Modifier.pointerInput(event.sequenceNumber, event.content) {
+                detectTapGestures(onDoubleTap = { onAsk() })
+            },
+        ) {
+            TranscriptRow(event)
+        }
         if (answer != null) {
             // A rail down the left edge is what makes the pairing readable at
             // a glance: "them" row, then the suggestion that answers it.
@@ -464,7 +480,7 @@ private fun AiHelpPanel(state: UiState, onEveryLine: (Boolean) -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    "Answers stay under the question they belong to.",
+                    "Answers stay under their line. Double-tap a line to ask about it.",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),

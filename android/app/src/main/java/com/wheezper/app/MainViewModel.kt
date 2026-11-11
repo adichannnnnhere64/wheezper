@@ -74,6 +74,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var assistantJob: Job? = null
     private var autoJob: Job? = null
     /**
+     * One on-demand answer at a time (double-tap on a row). Kept apart from
+     * the auto queue so a manual ask never waits behind the interview FIFO and
+     * never blocks it.
+     */
+    private var manualJob: Job? = null
+    /**
      * Questions waiting for the assistant, in arrival order. A bounded FIFO,
      * not "newest wins": each answer is anchored to its row, so dropping an
      * older question would leave that row unanswered for good.
@@ -333,6 +339,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun openSession(session: Session) {
         assistantJob?.cancel()
         autoJob?.cancel()
+        manualJob?.cancel()
+        manualJob = null
         autoQueue.clear()
         _state.update {
             it.copy(
@@ -391,10 +399,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         statusJob?.cancel()
         assistantJob?.cancel()
         autoJob?.cancel()
+        manualJob?.cancel()
         streamJob = null
         statusJob = null
         assistantJob = null
         autoJob = null
+        manualJob = null
         autoQueue.clear()
         _state.update {
             it.copy(
@@ -687,12 +697,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startAutoAnswer(event: TranscriptEvent) {
+        answerRow(event, event.content, automatic = true)
+    }
+
+    /**
+     * Double-tap on a transcript row: ask the assistant about *that* line.
+     *
+     * This is the manual version of AI help. It exists because the question
+     * heuristic is a heuristic — a far-side prompt that reads like a statement
+     * gets no answer automatically — and because a user may want more than the
+     * automatic one-liner. The answer is anchored to the row like every other
+     * one, and marked `explain_more` so the server answers with a few sentences
+     * of detail instead of a 10-20 word line.
+     */
+    fun askAboutEvent(event: TranscriptEvent) {
+        val session = _state.value.openSession ?: return
+        if (event.content.isBlank()) return
+        // The candidate's own lines are not the thing being asked.
+        if (event.speaker.equals("me", ignoreCase = true)) return
+        // Ignore re-taps while an answer for this row is already streaming, and
+        // never stack several manual asks on top of each other.
+        if (_state.value.answers[event.sequenceNumber]?.streaming == true) return
+        if (manualJob?.isActive == true) return
+        // A queued automatic answer for this row would overwrite the manual
+        // one when the queue reaches it; the user just asked in person.
+        autoQueue.removeAll { it.sequenceNumber == event.sequenceNumber }
+        val existing = _state.value.answers[event.sequenceNumber]
+        val prompt = if (!existing?.text.isNullOrBlank()) {
+            // There is already an answer: ask for depth, not a repeat.
+            "${event.content}\n\nExplain this in more depth: the trade-offs, and a " +
+                "concrete example."
+        } else {
+            event.content
+        }
+        answerRow(event, prompt, automatic = false)
+    }
+
+    private fun answerRow(event: TranscriptEvent, prompt: String, automatic: Boolean) {
         val repo = repository
         val session = _state.value.openSession
         if (repo == null || session == null) {
             // Nothing to talk to: do not leave the queue stuck (drainAutoQueue
             // already removed this event).
-            autoQueue.clear()
+            if (automatic) autoQueue.clear()
             return
         }
         val settings = _state.value.settings
@@ -707,22 +754,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     error = "AI help is on, but Ollama Cloud needs a token. Add one in Settings.",
                 )
             )
-            drainAutoQueue()
+            if (automatic) drainAutoQueue()
             return
         }
 
         putAnswer(AiAnswer(sequence = sequence, question = event.content))
 
-        autoJob = viewModelScope.launch {
+        val job = viewModelScope.launch {
             val answer = StringBuilder()
             try {
                 repo.streamAnswer(
                     session.id,
-                    event.content,
+                    prompt,
                     settings.assistantModel,
                     settings.assistantToken,
                     settings.assistantCloud,
                     answeredSequence = sequence,
+                    // A manual ask always wants detail: either the line got no
+                    // answer at all, or the user tapped an existing one for more.
+                    explainMore = !automatic,
                 ).collect { chunk ->
                     if (chunk.delta.isNotEmpty()) {
                         answer.append(chunk.delta)
@@ -737,15 +787,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     it.copy(streaming = false, error = friendly(error))
                 }
             } finally {
-                autoJob = null
-                // openSession/closeSession own clearing the queue; here we only
-                // continue it when the same meeting is still on screen.
-                val stillOpen = _state.value.openSession
-                if (stillOpen?.id == session.id && stillOpen.aiHelp) {
-                    drainAutoQueue()
+                if (automatic) {
+                    autoJob = null
+                    // openSession/closeSession own clearing the queue; here we
+                    // only continue it when the same meeting is still on screen.
+                    val stillOpen = _state.value.openSession
+                    if (stillOpen?.id == session.id && stillOpen.aiHelp) {
+                        drainAutoQueue()
+                    }
+                } else {
+                    manualJob = null
                 }
             }
         }
+        if (automatic) autoJob = job else manualJob = job
     }
 
     private fun putAnswer(answer: AiAnswer) {

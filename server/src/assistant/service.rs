@@ -32,6 +32,8 @@ pub struct AssistantOptions {
     pub api_key: Option<String>,
     /// Answer through `https://ollama.com/api` instead of the configured URL.
     pub cloud: bool,
+    /// The user asked for a longer answer than the automatic one-liner.
+    pub detail: bool,
 }
 
 pub struct Answer {
@@ -112,7 +114,8 @@ impl AssistantService {
         let budget = context::Budget::for_request(
             context::Mode::for_session(session.ai_help),
             self.full_context(provider.cloud),
-        );
+        )
+        .with_detail(options.detail);
         let ctx = context::build(
             &self.transcripts,
             session_id,
@@ -159,6 +162,7 @@ impl AssistantService {
         question: String,
         answered_sequence: Option<i64>,
         provider: AssistantProvider,
+        detail: bool,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
         let transcripts = self.transcripts.clone();
         let sessions = self.sessions.clone();
@@ -173,7 +177,8 @@ impl AssistantService {
             let budget = context::Budget::for_request(
                 context::Mode::for_session(session.ai_help),
                 cloud,
-            );
+            )
+            .with_detail(detail);
             let ctx = context::build(
                 &transcripts,
                 session_id,
@@ -369,6 +374,7 @@ mod tests {
                 model: Some("deepseek-v4.1-flash".into()),
                 api_key: Some("user-token".into()),
                 cloud: true,
+                detail: false,
             },
         )
         .unwrap();

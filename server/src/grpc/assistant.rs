@@ -70,7 +70,8 @@ impl AssistantService for AssistantGrpc {
         let provider_name = provider.name.to_string();
         let model = provider.model.clone();
         let sequence = answered_sequence(&req);
-        let mut deltas = assistant.stream(session_id, req.question, sequence, provider);
+        let detail = req.explain_more;
+        let mut deltas = assistant.stream(session_id, req.question, sequence, provider, detail);
 
         let stream = async_stream::try_stream! {
             while let Some(delta) = deltas.next().await {
@@ -143,5 +144,6 @@ fn options(request: &proto::AskQuestionRequest) -> Result<AssistantOptions, Stat
         model: Some(request.model.clone()).filter(|m| !m.trim().is_empty()),
         api_key: Some(request.api_key.clone()).filter(|k| !k.trim().is_empty()),
         cloud: backend == proto::AssistantBackend::OllamaCloud,
+        detail: request.explain_more,
     })
 }

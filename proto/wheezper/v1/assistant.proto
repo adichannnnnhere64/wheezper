@@ -29,6 +29,10 @@ message AskQuestionRequest {
   // a restart or on another device, and so the assistant can read back the
   // questions it already answered in this meeting.
   int64 answered_sequence = 6;
+  // The user asked for more detail than the automatic one-line answer (the
+  // phone's double-tap on a transcript row). Only changes the answer's shape:
+  // the mode's rules about inventing facts still apply.
+  bool explain_more = 7;
 }
 
 // One persisted answer, anchored to the transcript row it answers.

@@ -166,6 +166,7 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
         apiKey: String,
         cloud: Boolean,
         answeredSequence: Long = 0,
+        explainMore: Boolean = false,
     ): Flow<AnswerChunk> =
         client.assistant.streamAnswer(
             AskQuestionRequest.newBuilder()
@@ -175,6 +176,8 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
                 .setApiKey(apiKey.trim())
                 // 0 = the free-form sheet, which answers no single transcript row.
                 .setAnsweredSequence(answeredSequence)
+                // Double-tap: the user wants detail, not the one-liner.
+                .setExplainMore(explainMore)
                 .setBackend(
                     if (cloud) {
                         AssistantBackend.ASSISTANT_BACKEND_OLLAMA_CLOUD

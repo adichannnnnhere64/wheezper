@@ -601,6 +601,15 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   A false positive costs one wasted answer; a false negative costs the answer
   the user needed — do not tighten it back to a prefix match, and keep
   `QuestionHeuristicTest` honest with the real transcript shapes.
+- **Double-tap is the manual escape hatch for the heuristic.** `askAboutEvent`
+  answers *that* row on demand: a far-side line that reads like a statement (a
+  heuristic false negative) or an existing answer the user wants expanded. It
+  runs on `manualJob`, not the automatic FIFO, so it never waits behind a
+  queue; it drops a queued automatic answer for the same row so the manual one
+  is not overwritten; and it sets `explain_more`, which switches the
+  *interview* system prompt to 2-4 sentences of concrete detail instead of the
+  automatic 10-20 word line. The rules about inventing facts are identical in
+  both shapes — detail is a length change, not a licence.
 - **The transcript follows the newest block by its end, not its top.**
   `scrollToBlockEnd` scrolls to the item and then by the overflow, because
   `animateScrollToItem` alone parks a tall block at the top of the viewport

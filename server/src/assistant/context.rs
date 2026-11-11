@@ -55,9 +55,17 @@ pub struct Budget {
     /// Previous question/answer pairs of this meeting carried in the prompt.
     pub previous_answers: i64,
     pub max_chars: usize,
+    /// The user asked for detail (double-tap on the row), not the automatic
+    /// one-liner. Only the answer's shape changes, never the fact rules.
+    pub detail: bool,
 }
 
 impl Budget {
+    pub fn with_detail(mut self, detail: bool) -> Self {
+        self.detail = detail;
+        self
+    }
+
     pub fn for_request(mode: Mode, cloud: bool) -> Self {
         let short = mode == Mode::Interview && !cloud;
         Self {
@@ -74,6 +82,7 @@ impl Budget {
             } else {
                 MAX_CONTEXT_CHARS
             },
+            detail: false,
         }
     }
 }
@@ -192,15 +201,29 @@ impl MeetingContext {
                 user.push_str("\nThe interviewer just said: ");
                 user.push_str(question.trim());
                 user.push_str("\n\nAnswer it as the candidate would out loud.");
-                let system = "You are helping the candidate in a live interview. `them` is the \
-                              interviewer, `me` is the candidate. Answer the interviewer's latest \
-                              line as the candidate: one conversational sentence of 10-20 words, \
-                              accurate and concrete, no preamble, no lists, no \"as an AI\". Use the \
-                              transcript for context and your own general technical knowledge for \
-                              the substance; if the transcript already shows relevant experience, \
-                              prefer it. Never invent personal facts, employers, dates or experience \
-                              that are not in the transcript."
-                    .to_string();
+                let system = if budget.detail {
+                    // The user tapped the row for more: the automatic 10-20
+                    // word line is the wrong shape now, but the rules about
+                    // inventing facts are not negotiable.
+                    "You are helping the candidate in a live interview. `them` is the \
+                     interviewer, `me` is the candidate. Explain the interviewer's latest line \
+                     as the candidate: 2-4 sentences of concrete technical detail — what it is, \
+                     the trade-offs, and a brief example. No preamble, no lists, no \"as an AI\". \
+                     Use the transcript for context and your own general technical knowledge for \
+                     the substance; if the transcript already shows relevant experience, prefer \
+                     it. Never invent personal facts, employers, dates or experience that are not \
+                     in the transcript."
+                } else {
+                    "You are helping the candidate in a live interview. `them` is the \
+                     interviewer, `me` is the candidate. Answer the interviewer's latest line as \
+                     the candidate: one conversational sentence of 10-20 words, accurate and \
+                     concrete, no preamble, no lists, no \"as an AI\". Use the transcript for \
+                     context and your own general technical knowledge for the substance; if the \
+                     transcript already shows relevant experience, prefer it. Never invent \
+                     personal facts, employers, dates or experience that are not in the \
+                     transcript."
+                }
+                .to_string();
                 (with_guidance(system, &self.instructions), user)
             }
         }

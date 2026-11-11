@@ -292,6 +292,7 @@ async fn request_can_choose_its_model_and_supply_its_own_token() {
                 api_key: "user-secret-token".into(),
                 backend: proto::AssistantBackend::Default as i32,
                 answered_sequence: 0,
+                ..Default::default()
             },
             &device,
         ))
@@ -514,5 +515,69 @@ async fn session_brief_and_guidance_reach_the_prompt() {
         .unwrap()
         .into_inner();
     assert!(sync.events.is_empty());
+    server.stop().await;
+}
+
+/// Double-tapping a row asks for detail: the interview prompt switches to a
+/// few sentences with trade-offs, while the default stays the one-liner and
+/// the "never invent personal facts" rule is unchanged in both.
+#[tokio::test(flavor = "multi_thread")]
+async fn explain_more_asks_for_a_deeper_answer() {
+    let Some(db) = database_url() else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let mock = mock_ollama(vec!["A record is a shallow immutable carrier.", "Deeper answer."], false).await;
+    let Some(server) = TestServer::start_with(db, mock.url.clone()).await else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let channel = server.channel().await;
+    let device = pair(&channel, "phone").await;
+    let (session_id, _) = create_session_with_ai(&channel, &device, "Interview", true).await;
+    let mut assistant = AssistantServiceClient::new(channel);
+
+    assistant
+        .ask_question(request(
+            proto::AskQuestionRequest {
+                session_id: session_id.clone(),
+                question: "What is a record in Java?".into(),
+                explain_more: true,
+                ..Default::default()
+            },
+            &device,
+        ))
+        .await
+        .expect("explain more");
+    assistant
+        .ask_question(request(
+            proto::AskQuestionRequest {
+                session_id: session_id.clone(),
+                question: "What is a record in Java?".into(),
+                ..Default::default()
+            },
+            &device,
+        ))
+        .await
+        .expect("plain question");
+
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[0].contains("2-4 sentences of concrete technical detail"),
+        "the detail prompt did not reach the model: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains("one conversational sentence of 10-20 words"),
+        "the default prompt changed: {}",
+        bodies[1]
+    );
+    for body in &bodies {
+        assert!(
+            body.contains("Never invent personal facts"),
+            "the fact rule must survive both shapes: {body}"
+        );
+    }
     server.stop().await;
 }

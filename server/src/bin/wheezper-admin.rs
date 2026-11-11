@@ -261,6 +261,7 @@ async fn main() -> Result<()> {
                             proto::AssistantBackend::Default as i32
                         },
                         answered_sequence: 0,
+                        explain_more: false,
                     },
                     token,
                 ))
