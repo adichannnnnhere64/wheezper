@@ -45,9 +45,10 @@ Evidence (measured, see "Baseline numbers"):
 ### Phase 2 — DONE (shipped). Two-tier streaming: 0.2–0.35 s on screen
 
 Baseline (measured, `CHANNELS=2`): median **4.23 s**, p90 5.13 s; single
-channel 2.60 s. Shipped result: provisional median **0.32 s**, p90 **0.53 s**
-dual-channel (single channel 0.23 / 0.32) — inside the 0.5 s / 0.8 s budget
-with margin.
+channel 2.60 s. Shipped result after the final-tier thread rebalance:
+provisional median **0.42 s**, p90 **0.77 s** dual-channel (single channel
+0.25 / 0.35) — inside the 0.5 s / 0.8 s budget (the preview lost a thread to
+the final tier on the 6-core reference box; the notes lead time halved).
 
 **Design.** Each channel runs two tiers (`src/stream.rs`):
 
@@ -108,13 +109,22 @@ THREADS=4 nix-shell --run \
    windows decode to the 220-token cap, costing ~0.7–2.6 s per pass.
 4. **Thread budget decides the tail.** Two ggml workers oversubscribing the
    box spin-barrier convoy and double every pass: 4+4 measured p90 > 1 s.
-   The shipped split on 6 cores is 2 (final) + 3 (provisional) + 1 (capture/
-   main loop) — see `stream::split_threads`. On ≥9-thread laptops the
-   provisional tier is capped at 3 threads (a 4th only adds jitter: measured
-   0.17 s/0.30 s p90 vs 0.15/0.31 at 3) and the spare budget goes to the
-   final tier (up to 4), because low-frequency laptop cores make the final
-   pass the backlog risk, not the preview. When stdout is piped the final
-   tier is alone and gets the old full share (`cores.min(4)`).
+   `stream::split_threads` now gives the **final tier half the box** (capped
+   at 6) and the preview the rest (capped at 3), always leaving one core for
+   the capture/main loop. It used to give the final tier the leftovers
+   (1 thread on a 4-core box, 2 on 6, 3–4 on a 16-thread laptop) and that is
+   exactly what produced "inference is not keeping up": the final tier could
+   not decode faster than the audio arrived, its 30 s buffer filled, and
+   speech was dropped from the notes. On 6 cores the shipped split is
+   3 (final) + 2 (provisional) + 1: the final pass dropped from 3.1–3.5 s to
+   2.0 s and the preview still measured 0.42 s median / 0.77 s p90 dual
+   (inside 0.5 / 0.8, but with less margin than the old 3-thread preview).
+   The preview gains nothing past 3 threads (a 4th only adds jitter:
+   measured 0.17 s/0.30 s p90 vs 0.15/0.31 at 3), so everything above that
+   goes to the final tier. When stdout is piped the final tier is alone and
+   keeps the old full share (`cores.min(4)`). The split is printed at
+   startup (`stream: threads final=N preview=M of C cores`) — without it the
+   "not keeping up" warning is undiagnosable.
 5. Append-only whisper cannot reach 0.5 s at acceptable quality: stable
    decode needs ≥ ~2 s of window, and every fast small-window config
    measured (0.86–1.22 s median) commits permanent garbage ("Esk not",
@@ -391,8 +401,8 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 | tier | 1 ch | 2 ch | pass cost |
 |---|---|---|---|
-| provisional (on screen) | 0.23 s median / 0.32 s p90 | 0.32 s / 0.53 s | 0.10 s |
-| final (into notes) | 4.1 s median | 6.9 s median / 7.2 s p90 | 3.1–3.5 s (2 threads) |
+| provisional (on screen) | 0.23 s median / 0.32 s p90 | 0.42 s / 0.77 s (2 threads) | 0.10 s |
+| final (into notes) | 4.1 s median | 6.9 s median / 7.2 s p90 | 2.0 s (3 threads) |
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
@@ -562,7 +572,12 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   catch-up after opening the app answers the backlog of a **live** session
   (joining an interview late should not leave its questions unanswered) but
   never a completed one, and the bounded queue means only the newest few of a
-  long backlog are answered.
+  long backlog are answered. The live screen's AI HELP strip toggles the mode
+  ("questions only" / "every far-side line"); switching it on also queues the
+  far-side rows already on screen that have no answer yet, because the
+  watermark skipped them while the mode was off. The layout is one visual
+  block per line (row + its answer under a rail) — never a single shared
+  answer slot, which a fast interviewer would keep overwriting.
 - **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
   whisper's raw tokens: a rare word is several tokens and continuation tokens
   carry no leading space. Inserting a space per token rendered "Khan" as
@@ -735,7 +750,10 @@ scripts/publish-android.sh
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
    must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s. Run it with
    `CHANNELS=1` too (loopback-only, the single-channel setup): measured
-   0.22 s median / 0.30 s p90, so the same gate passes with margin.
+   0.25 s median / 0.35 s p90, so the same gate passes with margin. The final
+   tier now takes half the box, so the preview runs on 2 threads on the
+   6-core reference machine and its dual-channel p90 is close to the gate —
+   check both numbers after touching the split.
 
 ## Open questions for the human
 

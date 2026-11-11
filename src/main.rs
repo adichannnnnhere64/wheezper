@@ -1370,6 +1370,15 @@ fn run_stream(
         _ if live => stream::split_threads(cores, 0),
         _ => (cores.min(4), 0),
     };
+    // Printed because "inference is not keeping up" is unfixable without
+    // knowing the split: the final tier is the one that loses notes, and a
+    // wide laptop left half its cores idle here before this was visible.
+    let preview = if prov_threads > 0 {
+        format!(" preview={prov_threads}")
+    } else {
+        String::new()
+    };
+    eprintln!("wheezper: stream: threads final={threads}{preview} of {cores} cores");
     let model_path = models::resolve(Some(&cli.model))
         .with_context(|| format!("resolving model '{}'", cli.model))?;
     let (tx, rx) = stream::spawn_worker(
