@@ -240,24 +240,32 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   publishing). Device tokens read/list/use the assistant; a session token may
   only publish to, and read, its own session.
 - Assistant (`assistant/`): recent 250 lines + up to 20 older full-text matches
-  (`to_tsvector`), ~12k-char prompt bound, Ollama `stream: true` NDJSON,
-  `think: false`. Answers are persisted separately and never touch transcript
-  rows. `AskQuestion`/`StreamAnswer` accept a per-request model, provider token
-  and backend (`DEFAULT` = configured URL, `OLLAMA_CLOUD` = fixed
-  `https://ollama.com/api`); the token is never stored or logged.
+  (`to_tsvector`) + the meeting's previous answers, bounded by
+  `context::Budget` (local interview: last 12 lines / 12k chars; cloud: whole
+  meeting / 48k chars), Ollama `stream: true` NDJSON, `think: false`. Answers
+  are persisted separately and never touch transcript rows.
+  `AskQuestion`/`StreamAnswer` accept a per-request model, provider token,
+  backend (`DEFAULT` = configured URL, `OLLAMA_CLOUD` = fixed
+  `https://ollama.com/api`) and `answered_sequence`; the token is never stored
+  or logged. `ListAnswers` returns the stored answers anchored to their
+  transcript rows (`DISTINCT ON (answered_sequence)`, newest wins).
 - AI help: `CreateSession(ai_help)` stores a per-session flag; the Android app
   watches committed lines and auto-calls `StreamAnswer` (questions-only default
   or every far-side line). Each answer is **rendered under the transcript row
   it answers** and stays there (a fast interviewer's next question gets its own
   card); questions queue in a small bounded FIFO with one request in flight.
-  Answers are also persisted in `assistant_messages`, never in the transcript.
+  Answers are also persisted in `assistant_messages` (with
+  `answered_sequence`), never in the transcript, and the app calls
+  `ListAnswers` on open so the rows get their answers back after a restart.
 - `ai_help` also selects the **interview prompt** (`assistant::context::Mode`):
   the far side asked a question, so the answer is one 10-20 word sentence spoken
   as the candidate, allowed to use general technical knowledge (never invented
-  personal facts), and the context is trimmed to the last 12 lines so a small
-  local model on a 2-core box can prefill it in seconds. Sessions without
-  `ai_help` keep the strict transcript-only prompt. Both paths still persist the
-  answer separately and never touch `transcript_entries`.
+  personal facts). `context::Budget::for_request(mode, cloud)` decides how much
+  is sent: a small local model answering an interview still gets only the last
+  12 lines (prefill is the latency there), while a cloud backend gets the whole
+  meeting plus its earlier answers. Sessions without `ai_help` keep the strict
+  transcript-only prompt. Both paths still persist the answer separately and
+  never touch `transcript_entries`.
 - TLS clients: `https://` endpoints must set
   `ClientTlsConfig::new().with_webpki_roots()` (crate feature
   `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
@@ -304,6 +312,8 @@ src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
 src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
 src/remote.rs      optional gRPC session sink (feature `sync`): fsync'd pending
                    queue + background retry/reconnect/ack worker
+src/update.rs      `--update`: GitHub release → raw binary + SHA256SUMS →
+                   verified in-place replacement of the running executable
 proto/             versioned gRPC contract (wheezper.v1) + Rust codegen
 server/            wheezper-server: sessions/transcripts/assistant over
                    PostgreSQL (SQLx), migrations/, wheezper-admin operator CLI
@@ -506,6 +516,28 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 - **`sqlx::migrate!` is runtime**, so `cargo build`/`cargo test` need no
   database. Integration tests skip (with a printed skip line) when
   `WHEEZPER_TEST_DATABASE_URL` is unset — CI sets it via a postgres service.
+- **Self-update installs verified bytes or nothing.** `--update` reads the
+  release's raw binary asset (`wheezper-linux-amd64` /
+  `wheezper-windows-x64.exe`, published by `release.yml` next to the archives)
+  plus `SHA256SUMS` from *the same release*, and refuses to install when the
+  asset or its hash is missing. The names are a table in `src/update.rs`; the
+  release job must keep publishing them (`fail_on_unmatched_files: false` is
+  there for the optional Android APK, not for the binaries). Windows cannot
+  replace a running `.exe`: the new binary is staged as `wheezper.exe.new` and
+  a detached `cmd` moves it into place after the process exits — do not
+  "simplify" that into a rename, it fails with a sharing violation.
+- **Android updates go through Google Play, not a downloaded APK.** The app
+  ships as a Play custom/private app with Play App Signing, so the installed
+  APK is signed by *Google's* key: a self-downloaded APK signed with the upload
+  key is a different signer and the installer rejects it
+  (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). The "Check for updates" button
+  therefore uses Play's in-app update API
+  (`com.google.android.play:app-update`), and a sideloaded/debug build reports
+  "not from Play" instead. Do not re-add a `REQUEST_INSTALL_PACKAGES` download
+  path. CI builds the signed APK + AAB (`wheezper-android-release` artifact)
+  only when the `ANDROID_KEYSTORE_B64` / `_PASSWORD` / `_KEY_ALIAS` /
+  `_KEY_PASSWORD` secrets exist, and `versionCode` must be bumped for every
+  Play upload — Play refuses a repeated one.
 - **One server instance per database.** The live fan-out is an in-process
   `broadcast` channel; scaling out needs a shared bus (LISTEN/NOTIFY) first.
 - **Edit `proto/wheezper/v1/*.proto`, never the Android mirror.** Gradle's
@@ -522,17 +554,42 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   transcript sequence they answer and render under that row, so they are never
   overwritten by the next question; pending questions are a bounded FIFO (4)
   with one request in flight. The candidate's own (`me`) lines are never
-  answered. Do not trigger answers from provisional preview text.
+  answered. Do not trigger answers from provisional preview text. The first
+  catch-up after opening the app answers the backlog of a **live** session
+  (joining an interview late should not leave its questions unanswered) but
+  never a completed one, and the bounded queue means only the newest few of a
+  long backlog are answered.
 - **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
   whisper's raw tokens: a rare word is several tokens and continuation tokens
   carry no leading space. Inserting a space per token rendered "Khan" as
   "Kh an" on screen (the committed line always concatenated correctly).
+- **The Ollama Cloud URL already ends in `/api`.** `OLLAMA_CLOUD_URL` is
+  `https://ollama.com/api`, so request paths must be joined to `api_base(url)`
+  (which strips a trailing `/api`), never `format!("{url}/api/chat")` — that
+  posts to `/api/api/chat` and ollama.com answers `404 path "/api/api/chat"
+  not found`, which reads like a wrong model name. Both providers (`src/llm.rs`
+  and `server/src/assistant/provider.rs`) normalise; keep it that way.
 - **`ai_help` is interview mode, not a general "smarter assistant" switch.** It
   lets the model use general technical knowledge for the interviewer's question;
   the meeting prompt must stay transcript-grounded (a meeting answer that
   invents a decision is a bug, an interview answer that explains Java is the
-  feature). Keep the interview context short: prefill, not decoding, is the
-  latency on a small box.
+  feature). Keep the *local* interview context short: prefill, not decoding, is
+  the latency on a small box. That is what `Budget::for_request(mode, cloud)`
+  encodes; do not give a local model the whole meeting just because a cloud one
+  can take it. Earlier answers are part of the context on purpose: a follow-up
+  must not get an answer that contradicts the one the user already read.
+- **An answer must stay anchored to its transcript row.** `answered_sequence`
+  is the anchor (NULL/0 = the free-form sheet); the insert stores it, the phone
+  sends it on ask, and `ListAnswers` hands them back on open. Losing the anchor
+  means the app has no idea where to render an answer again, and a restarted
+  phone shows an empty interview. Answers are never inserted into
+  `transcript_entries`.
+- **A WASAPI Xrun is noise, not a failure.** `cpal` reports
+  `ErrorKind::Xrun` ("A buffer underrun or overrun occurred") whenever Windows
+  sets `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` — which happens every time a
+  loopback stream resumes after silence. `src/capture.rs` prints it once per
+  capture and continues; do not turn it into a fatal error and do not print it
+  per packet.
 - `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
   conditioning; without it whisper loops on music (143 inserted words vs 6).
   The explicit `initial_prompt` still applies.
@@ -613,8 +670,13 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
 9. `cargo test -p wheezper-server` with a PostgreSQL
    (`WHEEZPER_TEST_DATABASE_URL`): pairing, idempotent publish, sequence order,
    restart durability, stream resume, assistant context/immutability, `ai_help`
-   round-trip, and per-request model/token overrides (the mock asserts the
-   `Authorization` header and the model body field).
+   round-trip, anchored answers + `ListAnswers` + previous-answer context, and
+   per-request model/token overrides (the mock asserts the `Authorization`
+   header and the model body field).
+9b. `cargo test --release update::` — version comparison, asset/hash parsing,
+   and a real in-place update against a local HTTP server (the old binary must
+   survive a checksum mismatch). `wheezper --update` on a current build must
+   print "already up to date" against the live release.
 10. `scripts/test-session-sync.sh`: the CLI buffers events while the server is
     down and drains them, in order and without duplicates, after reconnect;
     local markdown is written either way.
