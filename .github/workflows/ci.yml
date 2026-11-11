@@ -87,15 +87,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      # setup-android installs the retired `tools` package by default and the
+      # job dies before gradle runs; name the packages the app actually needs.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
       - uses: gradle/actions/setup-gradle@v4
-      # The runner image already ships cmdline-tools; setup-android@v3 tries to
-      # install the retired `tools` package and fails. Use sdkmanager directly.
-      - name: Install SDK platform used by the app
-        run: |
-          set -euo pipefail
-          sdkmanager --version
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
       - name: Build
         run: ./gradlew --no-daemon assembleDebug
       - uses: actions/upload-artifact@v4
