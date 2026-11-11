@@ -48,13 +48,57 @@ Tick **Enable AI help** in the new-meeting dialog:
 Only committed lines trigger an answer: the provisional preview is not
 published, so answers follow the firm transcript. One request runs at a time;
 while it streams, only the newest queued line is kept, so a slow model cannot
-build a backlog. The answer appears in the AI-help panel above the transcript.
+build a backlog. Each answer is rendered **under the transcript row it
+answers**, and it is stored by the server anchored to that row: reopening the
+meeting (or restarting the app) calls `ListAnswers` and puts every earlier
+answer back under its line. Tapping **Ask AI** opens the free-form sheet, which
+is not anchored to a row. Opening the app in the middle of a live interview
+answers the far side's pending questions too (the queue keeps the newest few);
+a finished meeting is never re-answered.
 
 The dialog (and Settings) hold the **model** and an optional **Ollama token**;
 toggle **Use Ollama Cloud** to send requests to `https://ollama.com/api` (the
 token is required there). The token stays on the phone (DataStore) and travels
 with each request; the server never stores or logs it. Choosing Ollama Cloud
 sends transcript text to ollama.com — the dialog says so explicitly.
+
+## Updating the app
+
+Release builds are distributed through Google Play (custom/private app), so Play
+delivers the updates. **Settings → App → Check for updates** uses Play's in-app
+update API (`com.google.android.play:app-update`): it asks Play whether a newer
+build exists and, if so, opens Play's own full-screen update flow.
+
+An app cannot update itself from a downloaded APK here: Play App Signing means
+the installed app is signed with Google's key, so an APK signed with your upload
+key is a different signer and the installer rejects it
+(`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). That is why there is no APK download
+path in the app. A debug/sideloaded build has no Play record either, so the
+screen reports "this build did not come from Google Play" instead of offering a
+button that cannot work.
+
+For the Play upload the app must be signed with a **stable upload key**:
+
+```bash
+keytool -genkeypair -v -keystore wheezper-release.jks -alias wheezper \
+  -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=wheezper"
+base64 -w0 wheezper-release.jks   # -> ANDROID_KEYSTORE_B64
+# repository secrets: ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD,
+#                     ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+```
+
+CI then builds and uploads `wheezper-android.apk` + `wheezper-android.aab` as
+the `wheezper-android-release` artifact for your Play pipeline (skipped when the
+secrets are absent). Locally the same variables work:
+
+```bash
+WHEEZPER_ANDROID_KEYSTORE=wheezper-release.jks \
+WHEEZPER_ANDROID_KEYSTORE_PASSWORD=... WHEEZPER_ANDROID_KEY_ALIAS=wheezper \
+WHEEZPER_ANDROID_KEY_PASSWORD=... ./gradlew assembleRelease bundleRelease
+```
+
+Bump `versionCode`/`versionName` in `app/build.gradle.kts` for every upload —
+Play refuses a repeated `versionCode`.
 
 ## Build
 

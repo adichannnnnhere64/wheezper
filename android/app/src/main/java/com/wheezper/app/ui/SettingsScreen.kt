@@ -193,15 +193,10 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        SectionHeader("App")
+
         Spacer(Modifier.height(4.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text("wheezper companion", style = MaterialTheme.typography.labelSmall)
-            Text("0.1.0", style = MaterialTheme.typography.labelSmall)
-        }
+        UpdateSection()
         TextButton(onClick = vm::refresh) { Text("Reload meetings") }
     }
 }

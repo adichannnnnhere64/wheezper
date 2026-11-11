@@ -11,12 +11,33 @@ android {
     namespace = "com.wheezper.app"
     compileSdk = 36
 
+    // Release signing comes from the environment so the released APK keeps one
+    // stable key (an update only installs over a build signed with the same
+    // key). CI exports these from repository secrets; a local build without
+    // them simply has no `release` signing config.
+    val keystore = System.getenv("WHEEZPER_ANDROID_KEYSTORE")
+    val keystorePassword = System.getenv("WHEEZPER_ANDROID_KEYSTORE_PASSWORD")
+    val keyAliasName = System.getenv("WHEEZPER_ANDROID_KEY_ALIAS")
+    val keyPasswordValue = System.getenv("WHEEZPER_ANDROID_KEY_PASSWORD")
+    val hasReleaseKey = keystore != null && keystorePassword != null && keyAliasName != null
+
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = file(keystore!!)
+                storePassword = keystorePassword
+                keyAlias = keyAliasName
+                keyPassword = keyPasswordValue ?: keystorePassword
+            }
+        }
+    }
+
     defaultConfig {
         applicationId = "com.wheezper.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -27,6 +48,9 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (hasReleaseKey) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -37,6 +61,8 @@ android {
 
     buildFeatures {
         compose = true
+        // the update check compares the manifest's version_code with this build
+        buildConfig = true
     }
 
     packaging {
@@ -113,6 +139,10 @@ dependencies {
     implementation("com.google.protobuf:protobuf-java:3.25.5")
     implementation("javax.annotation:javax.annotation-api:1.3.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // In-app update button: asks Google Play for the newest build (Play is the
+    // installer and signer, so it is the only in-app path that can replace it).
+    implementation("com.google.android.play:app-update:2.1.0")
 
     // JVM unit tests: the gRPC client is pure JVM, so it can be exercised
     // against a live server without an emulator.

@@ -101,6 +101,38 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
+      # Release-signed artifacts for the Play pipeline (custom app upload).
+      # Skipped without the keystore secrets: a randomly-signed APK is worse
+      # than none, because it can never be updated over.
+      - name: Signed release APK + AAB (skipped without a keystore)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "no ANDROID_KEYSTORE_B64 secret: skipping the signed release build"
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/wheezper.jks"
+          export WHEEZPER_ANDROID_KEYSTORE="$RUNNER_TEMP/wheezper.jks"
+          export WHEEZPER_ANDROID_KEYSTORE_PASSWORD="$KEYSTORE_PASSWORD"
+          export WHEEZPER_ANDROID_KEY_ALIAS="$KEY_ALIAS"
+          export WHEEZPER_ANDROID_KEY_PASSWORD="$KEY_PASSWORD"
+          ./gradlew --no-daemon assembleRelease bundleRelease
+          cp app/build/outputs/apk/release/app-release.apk wheezper-android.apk
+          cp app/build/outputs/bundle/release/app-release.aab wheezper-android.aab
+          ls -la wheezper-android.apk wheezper-android.aab
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-android-release
+          path: |
+            wheezper-android.apk
+            wheezper-android.aab
+          if-no-files-found: ignore
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Linux: build, unit tests, accuracy gate, package
