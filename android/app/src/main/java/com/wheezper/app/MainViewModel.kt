@@ -227,6 +227,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Switch interview help between "questions only" and "every far-side
+     * line" from the live screen. Turning it on also answers the lines that
+     * are already on screen: the watermark skipped them while the mode was
+     * off, and waiting for the next sentence looks like the toggle is broken.
+     */
+    fun setAssistantEveryLine(enabled: Boolean) {
+        val settings = _state.value.settings
+        saveAssistantSettings(
+            settings.assistantModel,
+            settings.assistantToken,
+            settings.assistantCloud,
+            enabled,
+        )
+        if (!enabled) return
+        val session = _state.value.openSession ?: return
+        if (!session.aiHelp || MeetingRepository.isCompleted(session)) return
+        val current = _state.value
+        val backlog = current.events.filter { event ->
+            event.speaker.equals("them", ignoreCase = true) &&
+                current.answers[event.sequenceNumber] == null
+        }
+        if (backlog.isEmpty()) return
+        backlog.forEach(autoQueue::addLast)
+        while (autoQueue.size > AUTO_QUEUE_LIMIT) autoQueue.removeFirst()
+        drainAutoQueue()
+    }
+
     fun createSession(title: String, aiHelp: Boolean = false) {
         val repo = repository ?: return
         val settings = _state.value.settings

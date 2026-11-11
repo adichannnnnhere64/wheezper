@@ -8,14 +8,17 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -69,10 +72,15 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
     }
     val listState = rememberLazyListState()
 
-    LaunchedEffect(visible.size) {
-        if (visible.isNotEmpty()) {
-            listState.animateScrollToItem(visible.lastIndex)
-        }
+    // Follow the live transcript, but never yank the view away from someone
+    // reading an answer further up: a new line (or an answer streaming under
+    // an older row) only scrolls when they are already at the bottom.
+    LaunchedEffect(visible.size, state.answers.size) {
+        if (visible.isEmpty()) return@LaunchedEffect
+        val info = listState.layoutInfo
+        val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+        val atBottom = lastVisible >= visible.lastIndex - 1
+        if (atBottom) listState.animateScrollToItem(visible.lastIndex)
     }
 
     Scaffold(
@@ -118,7 +126,7 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
             ConnectionStrip(state.connection, state.settings.serverUrl)
 
             if (session.aiHelp && !completed) {
-                AiHelpStrip(state)
+                AiHelpStrip(state) { everyLine -> vm.setAssistantEveryLine(everyLine) }
             }
 
             state.laptopCommand?.let { command ->
@@ -169,10 +177,11 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(visible, key = { it.sequenceNumber }) { event ->
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            TranscriptRow(event)
-                            state.answers[event.sequenceNumber]?.let { AnswerCard(it) }
-                        }
+                        // One block per far-side line: the transcript row, and
+                        // directly beneath it the answer to *that* row (if AI
+                        // help answered it). Never a single shared answer slot —
+                        // a fast interviewer would keep overwriting it.
+                        TurnBlock(event, state.answers[event.sequenceNumber])
                     }
                 }
             }
@@ -181,6 +190,30 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
 
     if (assistantOpen) {
         AssistantSheet(state, vm) { assistantOpen = false }
+    }
+}
+
+@Composable
+private fun TurnBlock(event: TranscriptEvent, answer: AiAnswer?) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        TranscriptRow(event)
+        if (answer != null) {
+            // A rail down the left edge is what makes the pairing readable at
+            // a glance: "them" row, then the suggestion that answers it.
+            Row(
+                modifier = Modifier
+                    .padding(start = 14.dp)
+                    .height(IntrinsicSize.Min),
+            ) {
+                Box(
+                    Modifier
+                        .width(2.dp)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.45f))
+                )
+                AnswerCard(answer)
+            }
+        }
     }
 }
 
@@ -227,15 +260,19 @@ private fun TranscriptRow(event: TranscriptEvent) {
  * Status strip for interview help. The answers themselves render under the
  * transcript row they answer (see [AnswerCard]); this strip never holds a
  * single shared answer slot, which a fast interviewer would keep overwriting.
+ *
+ * The mode is a toggle here, not only in Settings: "questions only" leaves the
+ * lines that are not questions without an answer, and that is the first thing
+ * anyone wants to change when they expected help under every far-side line.
  */
 @Composable
-private fun AiHelpStrip(state: UiState) {
+private fun AiHelpStrip(state: UiState, onEveryLine: (Boolean) -> Unit) {
     val accent = MaterialTheme.colorScheme.primary
     val answers = state.answers.values
     val thinking = answers.count { it.streaming }
     val status = when {
         thinking > 0 -> "answering…"
-        answers.isEmpty() -> "waiting for the next question"
+        answers.isEmpty() -> "waiting for a line to answer"
         answers.size == 1 -> "1 answer below"
         else -> "${answers.size} answers below"
     }
@@ -256,11 +293,24 @@ private fun AiHelpStrip(state: UiState) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text("AI HELP", style = MaterialTheme.typography.labelSmall, color = accent)
-                Text(
-                    if (state.settings.assistantEveryLine) "every far-side line" else "questions only",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Surface(
+                    color = accent.copy(alpha = 0.16f),
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.clickable {
+                        onEveryLine(!state.settings.assistantEveryLine)
+                    },
+                ) {
+                    Text(
+                        if (state.settings.assistantEveryLine) {
+                            "every far-side line"
+                        } else {
+                            "questions only"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = accent,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
                 Spacer(Modifier.weight(1f))
                 Text(
                     state.settings.assistantModel.ifBlank { "server default" },
@@ -304,7 +354,7 @@ private fun AnswerCard(answer: AiAnswer) {
         shape = MaterialTheme.shapes.medium,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(start = 12.dp),
+            .padding(start = 6.dp),
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -315,19 +365,14 @@ private fun AnswerCard(answer: AiAnswer) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                Text("↳ AI HELP", style = MaterialTheme.typography.labelSmall, color = accent)
                 Text(
-                    "AI SUGGESTION — NOT PART OF THE TRANSCRIPT",
+                    if (answer.streaming) "answering…" else "not part of the transcript",
                     style = MaterialTheme.typography.labelSmall,
-                    color = accent,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
                 )
                 Spacer(Modifier.weight(1f))
-                if (answer.streaming) {
-                    Text(
-                        "thinking…",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
             when {
                 answer.error != null -> Text(
