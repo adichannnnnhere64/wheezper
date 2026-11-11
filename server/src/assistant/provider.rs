@@ -12,6 +12,15 @@ use std::time::Duration;
 /// turn the assistant RPC into an SSRF probe, so it is deliberately fixed.
 pub const OLLAMA_CLOUD_URL: &str = "https://ollama.com/api";
 
+/// Both URL shapes are accepted: a bare base (`http://localhost:11434`) and the
+/// `ollama.com/api` form users copy from the cloud docs. Keeping `/api` would
+/// make every request `…/api/api/chat`, which the server answers with 404
+/// (`path "/api/api/chat" not found`).
+pub fn api_base(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    url.strip_suffix("/api").unwrap_or(url).to_string()
+}
+
 #[derive(Clone)]
 pub struct Ollama {
     /// Base URL without the `/api/...` suffix.
@@ -36,11 +45,16 @@ impl Ollama {
             .build()
             .expect("reqwest client");
         Self {
-            url: url.trim_end_matches('/').to_string(),
+            url: api_base(url),
             model: model.to_string(),
             api_key,
             client,
         }
+    }
+
+    /// Full `/api/chat` endpoint, for error messages and tests.
+    pub fn chat_url(&self) -> String {
+        format!("{}/api/chat", self.url)
     }
 
     pub fn model(&self) -> &str {
@@ -62,7 +76,7 @@ impl Ollama {
         });
         let mut req = self
             .client
-            .post(format!("{}/api/chat", self.url))
+            .post(self.chat_url())
             .json(&body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -155,5 +169,29 @@ impl Ollama {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_api_suffix_is_not_doubled() {
+        let cloud = Ollama::new(OLLAMA_CLOUD_URL, "gpt-oss:20b", Some("k".into()));
+        assert_eq!(cloud.chat_url(), "https://ollama.com/api/chat");
+    }
+
+    #[test]
+    fn local_base_url_is_kept() {
+        let local = Ollama::new("http://localhost:11434/", "gemma3:1b", None);
+        assert_eq!(local.chat_url(), "http://localhost:11434/api/chat");
+    }
+
+    #[test]
+    fn operator_cloud_url_is_normalised() {
+        // WHEEZPER_ASSISTANT_URL=https://ollama.com/api is a documented value.
+        assert_eq!(api_base("https://ollama.com/api/"), "https://ollama.com");
+        assert_eq!(api_base("https://ollama.com"), "https://ollama.com");
     }
 }

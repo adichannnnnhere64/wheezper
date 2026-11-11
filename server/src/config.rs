@@ -17,6 +17,10 @@ pub struct Config {
     pub assistant_url: String,
     pub assistant_model: String,
     pub assistant_api_key: Option<String>,
+    /// Interview context policy: `auto` (short for a local model, whole meeting
+    /// for a cloud one), `full` (always the whole meeting) or `short`.
+    /// Prefill, not decoding, is the latency on a small local model.
+    pub assistant_context: String,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
 }
@@ -45,6 +49,12 @@ impl Config {
             .to_string();
         let assistant_model = env("WHEEZPER_ASSISTANT_MODEL").unwrap_or_else(|| "gemma3:1b".into());
         let assistant_api_key = env("OLLAMA_API_KEY").or_else(|| env("WHEEZPER_ASSISTANT_API_KEY"));
+        let assistant_context = env("WHEEZPER_ASSISTANT_CONTEXT")
+            .unwrap_or_else(|| "auto".into())
+            .to_ascii_lowercase();
+        if !matches!(assistant_context.as_str(), "auto" | "full" | "short") {
+            bail!("WHEEZPER_ASSISTANT_CONTEXT must be auto, full or short");
+        }
         let (tls_cert, tls_key) = match (env("WHEEZPER_TLS_CERT"), env("WHEEZPER_TLS_KEY")) {
             (Some(cert), Some(key)) => (Some(PathBuf::from(cert)), Some(PathBuf::from(key))),
             (None, None) => (None, None),
@@ -59,6 +69,7 @@ impl Config {
             assistant_url,
             assistant_model,
             assistant_api_key,
+            assistant_context,
             tls_cert,
             tls_key,
         })

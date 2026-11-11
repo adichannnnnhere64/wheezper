@@ -49,7 +49,12 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>> {
         &config.assistant_model,
         config.assistant_api_key.clone(),
     );
-    let assistant = AssistantService::new(transcripts.clone(), sessions.clone(), provider);
+    let assistant = AssistantService::new(
+        transcripts.clone(),
+        sessions.clone(),
+        provider,
+        config.assistant_context.clone(),
+    );
 
     Ok(Arc::new(AppState {
         auth: Authenticator::new(pool.clone()),

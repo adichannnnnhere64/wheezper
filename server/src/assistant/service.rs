@@ -45,6 +45,9 @@ pub struct AssistantProvider {
     ollama: Ollama,
     pub name: &'static str,
     pub model: String,
+    /// Answers through Ollama Cloud: no local prefill budget, so the prompt
+    /// may carry the whole meeting (see `context::Budget`).
+    pub cloud: bool,
 }
 
 impl AssistantProvider {
@@ -58,14 +61,33 @@ pub struct AssistantService {
     transcripts: TranscriptService,
     sessions: SessionService,
     provider: Ollama,
+    /// `auto` | `full` | `short`: how much meeting the interview prompt carries
+    /// (`WHEEZPER_ASSISTANT_CONTEXT`). See `context::Budget`.
+    context_policy: String,
 }
 
 impl AssistantService {
-    pub fn new(transcripts: TranscriptService, sessions: SessionService, provider: Ollama) -> Self {
+    pub fn new(
+        transcripts: TranscriptService,
+        sessions: SessionService,
+        provider: Ollama,
+        context_policy: String,
+    ) -> Self {
         Self {
             transcripts,
             sessions,
             provider,
+            context_policy,
+        }
+    }
+
+    /// A cloud provider is the default "whole meeting" case; a local one keeps
+    /// the short interview window unless the operator asked otherwise.
+    fn full_context(&self, cloud: bool) -> bool {
+        match self.context_policy.as_str() {
+            "full" => true,
+            "short" => false,
+            _ => cloud,
         }
     }
 
@@ -81,15 +103,19 @@ impl AssistantService {
         &self,
         session_id: Uuid,
         question: String,
+        answered_sequence: Option<i64>,
         options: &AssistantOptions,
     ) -> Result<Answer> {
         let provider = self.resolve(options)?;
         let question = validate(question)?;
         let session = self.sessions.get(session_id).await?;
-        let mode = context::Mode::for_session(session.ai_help);
-        let ctx = context::build(&self.transcripts, session_id, &session.title, &question, mode)
+        let budget = context::Budget::for_request(
+            context::Mode::for_session(session.ai_help),
+            self.full_context(provider.cloud),
+        );
+        let ctx = context::build(&self.transcripts, session_id, &session.title, &question, budget)
             .await?;
-        let (system, user) = ctx.messages(&question, mode);
+        let (system, user) = ctx.messages(&question, budget);
         tracing::info!(
             session = %session_id,
             entries = ctx.total_entries,
@@ -106,6 +132,7 @@ impl AssistantService {
             &answer,
             provider.provider_name(),
             &provider.model,
+            answered_sequence,
         )
         .await;
 
@@ -122,6 +149,7 @@ impl AssistantService {
         &self,
         session_id: Uuid,
         question: String,
+        answered_sequence: Option<i64>,
         provider: AssistantProvider,
     ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
         let transcripts = self.transcripts.clone();
@@ -129,14 +157,18 @@ impl AssistantService {
         let pool = transcripts.pool().clone();
         let provider_name = provider.provider_name();
         let model = provider.model.clone();
+        let cloud = self.full_context(provider.cloud);
 
         Box::pin(async_stream::try_stream! {
             let question = validate(question)?;
             let session = sessions.get(session_id).await?;
-            let mode = context::Mode::for_session(session.ai_help);
-            let ctx = context::build(&transcripts, session_id, &session.title, &question, mode)
+            let budget = context::Budget::for_request(
+                context::Mode::for_session(session.ai_help),
+                cloud,
+            );
+            let ctx = context::build(&transcripts, session_id, &session.title, &question, budget)
                 .await?;
-            let (system, user) = ctx.messages(&question, mode);
+            let (system, user) = ctx.messages(&question, budget);
             tracing::info!(
                 session = %session_id,
                 entries = ctx.total_entries,
@@ -165,6 +197,7 @@ impl AssistantService {
                 answer.trim(),
                 provider_name,
                 &model,
+                answered_sequence,
             )
             .await
             {
@@ -175,6 +208,14 @@ impl AssistantService {
 
     pub async fn message_count(&self, session_id: Uuid) -> Result<i64> {
         repository::count(self.transcripts.pool(), session_id).await
+    }
+
+    /// Answers anchored to transcript rows, for a client that reopens the
+    /// meeting (the phone renders them under their row again).
+    pub async fn answers(&self, session_id: Uuid) -> Result<Vec<repository::AssistantMessageRow>> {
+        // A session that does not exist must not silently return an empty list.
+        self.sessions.get(session_id).await?;
+        repository::answers_for_rows(self.transcripts.pool(), session_id).await
     }
 }
 
@@ -220,6 +261,7 @@ fn validate_token(token: &str) -> Result<String> {
 }
 
 /// Store the question/answer pair; never fatal for the caller.
+#[allow(clippy::too_many_arguments)]
 async fn persist(
     transcripts: &TranscriptService,
     session_id: Uuid,
@@ -227,6 +269,7 @@ async fn persist(
     answer: &str,
     provider: &str,
     model: &str,
+    answered_sequence: Option<i64>,
 ) {
     if let Err(err) = repository::save(
         transcripts.pool(),
@@ -235,6 +278,7 @@ async fn persist(
         answer.trim(),
         provider,
         model,
+        answered_sequence,
     )
     .await
     {
@@ -280,11 +324,13 @@ fn resolve_provider(default: &Ollama, options: &AssistantOptions) -> Result<Assi
         ollama: Ollama::new(url, &model, key),
         name,
         model,
+        cloud: options.cloud,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::assistant::provider::api_base;
     use super::*;
 
     fn service() -> Ollama {
@@ -312,7 +358,8 @@ mod tests {
         .unwrap();
         assert_eq!(provider.name, "ollama-cloud");
         assert_eq!(provider.model, "deepseek-v4.1-flash");
-        assert_eq!(provider.ollama.url, OLLAMA_CLOUD_URL);
+        assert_eq!(provider.ollama.url, api_base(OLLAMA_CLOUD_URL));
+        assert_eq!(provider.ollama.chat_url(), "https://ollama.com/api/chat");
         assert_eq!(provider.ollama.api_key.as_deref(), Some("user-token"));
     }
 

@@ -34,10 +34,11 @@ impl AssistantService for AssistantGrpc {
         let req = request.into_inner();
         let session_id = parse_uuid(&req.session_id, "session_id").map_err(Status::from)?;
         let options = options(&req)?;
+        let sequence = answered_sequence(&req);
         let answer = self
             .state
             .assistant
-            .ask(session_id, req.question, &options)
+            .ask(session_id, req.question, sequence, &options)
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::AskQuestionResponse {
@@ -68,7 +69,8 @@ impl AssistantService for AssistantGrpc {
         let provider = assistant.resolve(&options).map_err(Status::from)?;
         let provider_name = provider.name.to_string();
         let model = provider.model.clone();
-        let mut deltas = assistant.stream(session_id, req.question, provider);
+        let sequence = answered_sequence(&req);
+        let mut deltas = assistant.stream(session_id, req.question, sequence, provider);
 
         let stream = async_stream::try_stream! {
             while let Some(delta) = deltas.next().await {
@@ -90,6 +92,47 @@ impl AssistantService for AssistantGrpc {
 
         Ok(Response::new(Box::pin(stream) as Self::StreamAnswerStream))
     }
+
+    /// Answers this session already holds, one per transcript row, so a phone
+    /// that just opened the meeting renders them under their rows instead of
+    /// showing an interview with no answers.
+    async fn list_answers(
+        &self,
+        request: Request<proto::ListAnswersRequest>,
+    ) -> Result<Response<proto::ListAnswersResponse>, Status> {
+        self.state
+            .auth
+            .authenticate_device(request.metadata())
+            .await
+            .map_err(Status::from)?;
+        let req = request.into_inner();
+        let session_id = parse_uuid(&req.session_id, "session_id").map_err(Status::from)?;
+        let rows = self
+            .state
+            .assistant
+            .answers(session_id)
+            .await
+            .map_err(Status::from)?;
+        let answers = rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(proto::AssistantAnswer {
+                    answered_sequence: row.answered_sequence?,
+                    question: row.question,
+                    answer: row.answer,
+                    provider: row.provider,
+                    model: row.model,
+                    created_at: row.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        Ok(Response::new(proto::ListAnswersResponse { answers }))
+    }
+}
+
+/// 0 is "this question is not about one transcript row" (the free-form sheet).
+fn answered_sequence(request: &proto::AskQuestionRequest) -> Option<i64> {
+    (request.answered_sequence > 0).then_some(request.answered_sequence)
 }
 
 #[allow(clippy::result_large_err)]

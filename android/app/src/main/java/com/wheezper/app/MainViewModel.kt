@@ -242,6 +242,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         startStatusPolling(session.id)
     }
 
+    /**
+     * Re-render the answers the server already stored under their transcript
+     * rows. Answers used to exist only in this map, so closing the app lost a
+     * whole interview's help; live streaming still wins for a row that is
+     * answering right now.
+     */
+    private fun loadAnswers(sessionId: String) {
+        val repo = repository ?: return
+        viewModelScope.launch {
+            val stored = runCatching { repo.listAnswers(sessionId) }.getOrNull() ?: return@launch
+            if (stored.isEmpty()) return@launch
+            _state.update { current ->
+                if (current.openSession?.id != sessionId) return@update current
+                val fresh = stored
+                    .filter { it.answeredSequence > 0 && current.answers[it.answeredSequence] == null }
+                    .associate { row ->
+                        row.answeredSequence to AiAnswer(
+                            sequence = row.answeredSequence,
+                            question = row.question,
+                            text = row.answer,
+                            streaming = false,
+                        )
+                    }
+                if (fresh.isEmpty()) {
+                    current
+                } else {
+                    current.copy(answers = current.answers + fresh)
+                }
+            }
+        }
+    }
+
     fun closeSession() {
         streamJob?.cancel()
         statusJob?.cancel()
@@ -390,8 +422,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 try {
                     // Durable catch-up first: the server is the source of truth
                     // after a sleep, a network drop or a sequence gap. The very
-                    // first catch-up must not auto-answer the meeting's history.
-                    catchUp(repo, sessionId, autoAnswer = seededAuto)
+                    // first catch-up must not auto-answer a *finished* meeting's
+                    // history, but joining a running interview late should still
+                    // get its unanswered questions answered (the queue is bounded,
+                    // so the newest few win).
+                    val live = _state.value.openSession
+                        ?.let { !MeetingRepository.isCompleted(it) } == true
+                    catchUp(repo, sessionId, autoAnswer = seededAuto || live)
+                    // Another device may have answered rows of this meeting
+                    // while this phone was closed; those answers are persisted.
+                    loadAnswers(sessionId)
                     if (!seededAuto) {
                         seededAuto = true
                         // Reconnects keep this watermark, so lines that arrived
@@ -574,6 +614,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     settings.assistantModel,
                     settings.assistantToken,
                     settings.assistantCloud,
+                    answeredSequence = sequence,
                 ).collect { chunk ->
                     if (chunk.delta.isNotEmpty()) {
                         answer.append(chunk.delta)

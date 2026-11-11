@@ -92,6 +92,7 @@ All configuration is environment variables (12-factor; no config file).
 | `WHEEZPER_ASSISTANT_URL` | `http://localhost:11434` | Ollama base URL (local or `ollama.com/api`) |
 | `WHEEZPER_ASSISTANT_MODEL` | `gemma3:1b` | Ollama model name |
 | `OLLAMA_API_KEY` / `WHEEZPER_ASSISTANT_API_KEY` | unset | bearer key for a cloud provider |
+| `WHEEZPER_ASSISTANT_CONTEXT` | `auto` | interview prompt size: `auto` (short for a local model, whole meeting for a cloud one), `full`, `short` |
 | `WHEEZPER_TLS_CERT` / `WHEEZPER_TLS_KEY` | unset | PEM files; both or neither |
 | `RUST_LOG` | `info` | tracing filter |
 
@@ -171,12 +172,22 @@ falls back to the server's `OLLAMA_API_KEY` when the request has none.
 `AskQuestion` / `StreamAnswer`:
 
 1. load the session,
-2. take the most recent 250 transcript entries plus up to 20 older full-text
+2. take the most recent transcript entries plus up to 20 older full-text
    matches for the question (`to_tsvector` / `plainto_tsquery`; the MVP stand-in
-   for embeddings),
-3. cap the prompt at ~12k characters,
+   for embeddings) plus the answers already given in this meeting,
+3. apply the context budget (`assistant::context::Budget`): a local interview
+   keeps the last 12 lines and 12k chars because a small model must prefill them
+   before it answers; a cloud request (`OLLAMA_CLOUD`) gets the whole meeting up
+   to 48k chars,
 4. stream the answer from Ollama (NDJSON),
-5. persist the question/answer pair (best-effort).
+5. persist the question/answer pair with its `answered_sequence` (best-effort).
+
+`ListAnswers` returns those pairs anchored to their transcript row
+(`DISTINCT ON (answered_sequence)`, newest wins), so a phone that reopens the
+meeting renders each answer under the line it answers instead of showing an
+interview with no answers. The app sends `answered_sequence` on
+`AskQuestion`/`StreamAnswer`; `0` means "not about one transcript row" (the
+free-form Ask-AI sheet).
 
 The system prompt forbids inventing meeting content, and answers are stored
 outside the transcript. `think: false` is set because cloud reasoning models

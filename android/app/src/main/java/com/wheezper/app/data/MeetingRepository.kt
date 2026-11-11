@@ -8,6 +8,7 @@ import io.grpc.stub.MetadataUtils
 import java.net.URI
 import java.util.concurrent.TimeUnit
 import com.wheezper.v1.AnswerChunk
+import com.wheezper.v1.AssistantAnswer
 import com.wheezper.v1.AssistantBackend
 import com.wheezper.v1.AssistantServiceGrpcKt
 import com.wheezper.v1.AuthServiceGrpcKt
@@ -24,6 +25,7 @@ import com.wheezper.v1.SyncTranscriptsResponse
 import com.wheezper.v1.TranscriptEvent
 import com.wheezper.v1.TranscriptServiceGrpcKt
 import com.wheezper.v1.AskQuestionRequest
+import com.wheezper.v1.ListAnswersRequest
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -138,6 +140,7 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
         model: String,
         apiKey: String,
         cloud: Boolean,
+        answeredSequence: Long = 0,
     ): Flow<AnswerChunk> =
         client.assistant.streamAnswer(
             AskQuestionRequest.newBuilder()
@@ -145,6 +148,8 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
                 .setQuestion(question)
                 .setModel(model.trim())
                 .setApiKey(apiKey.trim())
+                // 0 = the free-form sheet, which answers no single transcript row.
+                .setAnsweredSequence(answeredSequence)
                 .setBackend(
                     if (cloud) {
                         AssistantBackend.ASSISTANT_BACKEND_OLLAMA_CLOUD
@@ -154,6 +159,16 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
                 )
                 .build()
         )
+
+    /**
+     * Answers the server already has for this meeting, one per transcript row.
+     * Rendering them under their rows is what makes an answer survive a restart
+     * (they used to live only in the app's memory).
+     */
+    suspend fun listAnswers(sessionId: String): List<AssistantAnswer> =
+        client.assistant.listAnswers(
+            ListAnswersRequest.newBuilder().setSessionId(sessionId).build()
+        ).answersList
 
     override fun close() = client.close()
 

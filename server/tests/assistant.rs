@@ -291,6 +291,7 @@ async fn request_can_choose_its_model_and_supply_its_own_token() {
                 model: "deepseek-v4.1-flash".into(),
                 api_key: "user-secret-token".into(),
                 backend: proto::AssistantBackend::Default as i32,
+                answered_sequence: 0,
             },
             &device,
         ))
@@ -338,5 +339,94 @@ async fn unreachable_provider_is_reported_as_unavailable() {
         .await
         .expect_err("no provider is running on the test port");
     assert_eq!(err.code(), tonic::Code::Unavailable);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_are_anchored_to_their_row_and_become_model_context() {
+    let Some(db) = database_url() else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let mock = mock_ollama(vec!["Guard it with a mutex."], false).await;
+    let Some(server) = TestServer::start_with(db, mock.url.clone()).await else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let channel = server.channel().await;
+    let device = pair(&channel, "phone").await;
+    let (session_id, _) = seed_meeting(&channel, &device).await;
+
+    let mut assistant = AssistantServiceClient::new(channel.clone());
+    assistant
+        .ask_question(request(
+            proto::AskQuestionRequest {
+                session_id: session_id.clone(),
+                question: "How would you handle concurrency?".into(),
+                // The far side's line is sequence 1 in seed_meeting.
+                answered_sequence: 1,
+                ..Default::default()
+            },
+            &device,
+        ))
+        .await
+        .expect("ask about a transcript row");
+
+    // The answer comes back anchored, so the phone can render it under the row
+    // again after a restart instead of losing it with the app process.
+    let answers = assistant
+        .list_answers(request(
+            proto::ListAnswersRequest {
+                session_id: session_id.clone(),
+            },
+            &device,
+        ))
+        .await
+        .expect("list answers")
+        .into_inner()
+        .answers;
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].answered_sequence, 1);
+    assert_eq!(answers[0].question, "How would you handle concurrency?");
+    assert_eq!(answers[0].answer, "Guard it with a mutex.");
+
+    // A follow-up question carries the earlier answer as context: the assistant
+    // must not contradict itself just because it cannot see its own reply.
+    assistant
+        .ask_question(request(
+            proto::AskQuestionRequest {
+                session_id: session_id.clone(),
+                question: "And for reads?".into(),
+                ..Default::default()
+            },
+            &device,
+        ))
+        .await
+        .expect("follow-up question");
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[1].contains("What you already answered in this meeting"),
+        "the previous answer is missing from the prompt: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[1].contains("Guard it with a mutex."),
+        "the previous answer text is missing: {}",
+        bodies[1]
+    );
+
+    // A session that does not exist is an error, not a silent empty list.
+    assert!(
+        assistant
+            .list_answers(request(
+                proto::ListAnswersRequest {
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                },
+                &device,
+            ))
+            .await
+            .is_err()
+    );
     server.stop().await;
 }

@@ -24,6 +24,30 @@ message AskQuestionRequest {
   // the server never stores or logs it. Over TLS only, like every credential.
   string api_key = 4;
   AssistantBackend backend = 5;
+  // Transcript sequence number of the line this question answers (0 = none).
+  // Stored with the answer so the phone can show it under that row again after
+  // a restart or on another device, and so the assistant can read back the
+  // questions it already answered in this meeting.
+  int64 answered_sequence = 6;
+}
+
+// One persisted answer, anchored to the transcript row it answers.
+message AssistantAnswer {
+  int64 answered_sequence = 1;
+  string question = 2;
+  string answer = 3;
+  string provider = 4;
+  string model = 5;
+  // RFC 3339, UTC.
+  string created_at = 6;
+}
+
+message ListAnswersRequest {
+  string session_id = 1;
+}
+
+message ListAnswersResponse {
+  repeated AssistantAnswer answers = 1;
 }
 
 message AskQuestionResponse {
@@ -42,4 +66,6 @@ message AnswerChunk {
 service AssistantService {
   rpc AskQuestion(AskQuestionRequest) returns (AskQuestionResponse);
   rpc StreamAnswer(AskQuestionRequest) returns (stream AnswerChunk);
+  // Answers already given in this session, newest per transcript row.
+  rpc ListAnswers(ListAnswersRequest) returns (ListAnswersResponse);
 }

@@ -1,9 +1,10 @@
 //! Bounded meeting context for a question.
 //!
 //! MVP retrieval is "recent transcript window + PostgreSQL full-text matches
-//! for older lines". That is enough to answer questions about an ongoing
-//! meeting without embeddings, and it is deterministic (no vector index to
-//! keep in sync). Swap in embeddings later behind this same `MeetingContext`.
+//! for older lines + the answers already given in this meeting". That is enough
+//! to answer questions about an ongoing meeting without embeddings, and it is
+//! deterministic (no vector index to keep in sync). Swap in embeddings later
+//! behind this same `MeetingContext`; `Budget` stays the size knob.
 
 use crate::transcript::StoredEvent;
 use crate::transcript::service::TranscriptService;
@@ -14,13 +15,19 @@ use uuid::Uuid;
 const RECENT_ENTRIES: i64 = 250;
 /// Interview answers follow the last question, not the whole meeting. A small
 /// model on a laptop-class box has to prefill this context before it answers,
-/// so a long interview must not turn into a 30 s prompt.
+/// so a long interview must not turn into a 30 s prompt. A cloud model is not
+/// prefill-bound, so it gets the whole meeting instead — see `Budget`.
 const INTERVIEW_RECENT_ENTRIES: i64 = 12;
 /// Older full-text matches added when the question has keywords.
 const OLDER_MATCHES: i64 = 20;
 /// Hard cap on transcript characters sent to the model.
 const MAX_CONTEXT_CHARS: usize = 12_000;
+/// Cloud models have the context window for the whole meeting; 12k chars is
+/// only the local model's prefill budget.
+const CLOUD_CONTEXT_CHARS: usize = 48_000;
 const MAX_EARLIER_CHARS: usize = 2_000;
+/// Cap on the "what you already said" block (previous Q&A pairs).
+const MAX_PREVIOUS_CHARS: usize = 8_000;
 
 #[derive(Clone, Debug)]
 pub struct ContextEntry {
@@ -30,12 +37,57 @@ pub struct ContextEntry {
     pub started_at: DateTime<Utc>,
 }
 
+/// How much context one request carries.
+///
+/// Two tiers, for the same reason the transcript has two: prefill, not decoding,
+/// is the latency on a small box. A local model answering an interview gets the
+/// last few lines plus the last few answers; a cloud model (or a meeting
+/// assistant) gets the whole meeting and its earlier answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub mode: Mode,
+    pub recent_entries: i64,
+    pub searches_older_lines: bool,
+    /// Previous question/answer pairs of this meeting carried in the prompt.
+    pub previous_answers: i64,
+    pub max_chars: usize,
+}
+
+impl Budget {
+    pub fn for_request(mode: Mode, cloud: bool) -> Self {
+        let short = mode == Mode::Interview && !cloud;
+        Self {
+            mode,
+            recent_entries: if short {
+                INTERVIEW_RECENT_ENTRIES
+            } else {
+                RECENT_ENTRIES
+            },
+            searches_older_lines: !short,
+            previous_answers: if cloud { 20 } else { 4 },
+            max_chars: if cloud {
+                CLOUD_CONTEXT_CHARS
+            } else {
+                MAX_CONTEXT_CHARS
+            },
+        }
+    }
+}
+
+/// One earlier answer of this meeting, as carried in the prompt.
+#[derive(Clone, Debug)]
+pub struct PreviousAnswer {
+    pub question: String,
+    pub answer: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct MeetingContext {
     pub session_id: Uuid,
     pub title: String,
     pub recent: Vec<ContextEntry>,
     pub earlier: Vec<ContextEntry>,
+    pub previous: Vec<PreviousAnswer>,
     pub total_entries: i64,
 }
 
@@ -57,28 +109,25 @@ impl Mode {
     pub fn for_session(ai_help: bool) -> Self {
         if ai_help { Self::Interview } else { Self::Meeting }
     }
-
-    /// How much transcript the prompt carries.
-    pub fn recent_entries(self) -> i64 {
-        match self {
-            Self::Meeting => RECENT_ENTRIES,
-            Self::Interview => INTERVIEW_RECENT_ENTRIES,
-        }
-    }
-
-    /// Older full-text matches: useful for "what was decided last hour", noise
-    /// for "answer the question you just heard".
-    pub fn searches_older_lines(self) -> bool {
-        matches!(self, Self::Meeting)
-    }
 }
 
 impl MeetingContext {
     /// Assemble the two prompt messages. The system prompt forbids inventing
     /// meeting content: an answer is a suggestion, never a transcript edit.
-    pub fn messages(&self, question: &str, mode: Mode) -> (String, String) {
+    pub fn messages(&self, question: &str, budget: Budget) -> (String, String) {
+        let mode = budget.mode;
         let mut user = String::new();
         user.push_str(&format!("Meeting: {}\n", self.title));
+
+        // Answers already given are part of the assistant's memory: a question
+        // asked twice, or a follow-up to one of our own answers, must not get
+        // a contradicting answer just because the model cannot see the last one.
+        if !self.previous.is_empty() {
+            user.push_str("What you already answered in this meeting (stay consistent, do not repeat):\n");
+            user.push_str(&render_previous(&self.previous, MAX_PREVIOUS_CHARS));
+            user.push('\n');
+        }
+
         if self.total_entries == 0 {
             user.push_str("The meeting has no transcript yet.\n");
         } else {
@@ -100,7 +149,7 @@ impl MeetingContext {
             user.push_str("Most recent transcript:\n");
             user.push_str(&render_entries(
                 &self.recent,
-                MAX_CONTEXT_CHARS - MAX_EARLIER_CHARS,
+                budget.max_chars.saturating_sub(MAX_EARLIER_CHARS),
             ));
         }
         match mode {
@@ -181,15 +230,15 @@ pub async fn build(
     session_id: Uuid,
     title: &str,
     question: &str,
-    mode: Mode,
+    budget: Budget,
 ) -> crate::error::Result<MeetingContext> {
-    let recent = transcripts.recent(session_id, mode.recent_entries()).await?;
+    let recent = transcripts.recent(session_id, budget.recent_entries).await?;
     let total_entries =
         crate::transcript::repository::count(transcripts.pool(), session_id).await?;
 
     // Older lines only matter when the recent window does not cover the whole
     // meeting; searching for every question would cost a GIN lookup for free.
-    let earlier = if mode.searches_older_lines() && total_entries > recent.len() as i64 {
+    let earlier = if budget.searches_older_lines && total_entries > recent.len() as i64 {
         let before = recent
             .first()
             .map(|e| e.sequence_number)
@@ -201,13 +250,55 @@ pub async fn build(
         Vec::new()
     };
 
+    let previous = if budget.previous_answers > 0 {
+        crate::assistant::repository::previous_answers(
+            transcripts.pool(),
+            session_id,
+            budget.previous_answers,
+        )
+        .await?
+        .into_iter()
+        .map(|(question, answer)| PreviousAnswer { question, answer })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(MeetingContext {
         session_id,
         title: title.to_string(),
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
+        previous,
         total_entries,
     })
+}
+
+/// Render earlier answers, keeping the newest pairs when over budget.
+fn render_previous(previous: &[PreviousAnswer], max_chars: usize) -> String {
+    let mut lines: Vec<String> = previous
+        .iter()
+        .map(|p| format!("Q: {}\nA: {}", p.question.trim(), p.answer.trim()))
+        .collect();
+    let mut total = 0usize;
+    let mut first = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        total += line.len() + 2;
+        if total > max_chars {
+            break;
+        }
+        first = i;
+    }
+    if first > 0 {
+        lines.drain(..first);
+    }
+    if lines.is_empty() && !previous.is_empty() {
+        let newest = &previous[previous.len() - 1];
+        lines.push(format!("Q: {}", newest.question.trim()));
+    }
+    let mut out = lines.join("\n\n");
+    out.push('\n');
+    out
 }
 
 fn to_entry(event: StoredEvent) -> ContextEntry {
@@ -253,16 +344,26 @@ mod tests {
         assert!(!text.contains("old old"));
     }
 
-    #[test]
-    fn prompt_separates_earlier_excerpts_and_forbids_invention() {
-        let ctx = MeetingContext {
+    fn ctx(recent: Vec<ContextEntry>, earlier: Vec<ContextEntry>, total: i64) -> MeetingContext {
+        MeetingContext {
             session_id: Uuid::nil(),
             title: "Review".into(),
-            recent: vec![entry(5, "them", "deploy on tuesday")],
-            earlier: vec![entry(1, "me", "budget is fixed")],
-            total_entries: 9,
-        };
-        let (system, user) = ctx.messages("what about the budget?", Mode::Meeting);
+            recent,
+            earlier,
+            previous: Vec::new(),
+            total_entries: total,
+        }
+    }
+
+    #[test]
+    fn prompt_separates_earlier_excerpts_and_forbids_invention() {
+        let ctx = ctx(
+            vec![entry(5, "them", "deploy on tuesday")],
+            vec![entry(1, "me", "budget is fixed")],
+            9,
+        );
+        let budget = Budget::for_request(Mode::Meeting, false);
+        let (system, user) = ctx.messages("what about the budget?", budget);
         assert!(user.contains("Relevant earlier excerpts:"));
         assert!(user.contains("budget is fixed"));
         assert!(user.contains("Most recent transcript:"));
@@ -273,43 +374,61 @@ mod tests {
 
     #[test]
     fn interview_mode_answers_the_far_side_from_general_knowledge() {
-        let ctx = MeetingContext {
-            session_id: Uuid::nil(),
-            title: "Interview".into(),
-            recent: vec![entry(1, "them", "What is Java?")],
-            earlier: vec![],
-            total_entries: 1,
-        };
-        let (system, user) = ctx.messages("What is Java?", Mode::Interview);
+        let ctx = ctx(vec![entry(1, "them", "What is Java?")], vec![], 1);
+        let budget = Budget::for_request(Mode::Interview, false);
+        let (system, user) = ctx.messages("What is Java?", budget);
         assert!(user.contains("interviewer just said: What is Java?"));
         assert!(user.contains("Answer it as the candidate"));
         assert!(system.contains("general technical knowledge"));
         assert!(system.contains("Never invent personal facts"));
         // Meeting mode must never invite outside knowledge: it is a record.
-        let (meeting_system, _) = ctx.messages("What is Java?", Mode::Meeting);
+        let (meeting_system, _) = ctx.messages("What is Java?", Budget::for_request(Mode::Meeting, false));
         assert!(!meeting_system.contains("general technical knowledge"));
+    }
+
+    #[test]
+    fn previous_answers_are_carried_as_assistant_memory() {
+        let mut ctx = ctx(vec![entry(7, "them", "and the second one?")], vec![], 7);
+        ctx.previous = vec![PreviousAnswer {
+            question: "What is a HashMap?".into(),
+            answer: "A hash table keyed by object hashes.".into(),
+        }];
+        let (_, user) = ctx.messages(
+            "and the second one?",
+            Budget::for_request(Mode::Interview, true),
+        );
+        assert!(user.contains("What you already answered in this meeting"));
+        assert!(user.contains("A hash table keyed by object hashes."));
+        // ...and it comes before the transcript, so the model reads it as prior state.
+        assert!(
+            user.find("A hash table").unwrap() < user.find("Most recent transcript").unwrap()
+        );
     }
 
     #[test]
     fn ai_help_sessions_use_interview_mode() {
         assert_eq!(Mode::for_session(true), Mode::Interview);
         assert_eq!(Mode::for_session(false), Mode::Meeting);
-        // A long interview must not ship the whole meeting to a small model.
-        assert!(Mode::Interview.recent_entries() < Mode::Meeting.recent_entries());
-        assert!(!Mode::Interview.searches_older_lines());
-        assert!(Mode::Meeting.searches_older_lines());
+    }
+
+    #[test]
+    fn local_interview_stays_short_and_cloud_sees_the_whole_meeting() {
+        let local = Budget::for_request(Mode::Interview, false);
+        let cloud = Budget::for_request(Mode::Interview, true);
+        // A small local model has to prefill this before it answers.
+        assert!(local.recent_entries < cloud.recent_entries);
+        assert!(!local.searches_older_lines);
+        assert!(cloud.searches_older_lines);
+        assert!(cloud.max_chars > local.max_chars);
+        assert!(cloud.previous_answers > local.previous_answers);
+        // Meetings are not latency-critical the same way; both get the window.
+        assert_eq!(Budget::for_request(Mode::Meeting, false).recent_entries, RECENT_ENTRIES);
     }
 
     #[test]
     fn empty_meeting_is_stated_not_implied() {
-        let ctx = MeetingContext {
-            session_id: Uuid::nil(),
-            title: "Empty".into(),
-            recent: vec![],
-            earlier: vec![],
-            total_entries: 0,
-        };
-        let (_, user) = ctx.messages("summarize", Mode::Meeting);
+        let ctx = ctx(vec![], vec![], 0);
+        let (_, user) = ctx.messages("summarize", Budget::for_request(Mode::Meeting, false));
         assert!(user.contains("no transcript yet"));
     }
 
@@ -319,5 +438,22 @@ mod tests {
         let text = render_entries(&[entry(1, "them", &long)], 50);
         assert!(text.contains('x'), "the only line must not disappear");
         assert!(text.trim_end().chars().count() <= 50);
+    }
+
+    #[test]
+    fn earlier_answers_keep_the_newest_pairs_when_over_budget() {
+        let previous = vec![
+            PreviousAnswer {
+                question: "old ".repeat(20),
+                answer: "old answer".into(),
+            },
+            PreviousAnswer {
+                question: "newest question".into(),
+                answer: "newest answer".into(),
+            },
+        ];
+        let text = render_previous(&previous, 60);
+        assert!(text.contains("newest answer"));
+        assert!(!text.contains("old answer"));
     }
 }

@@ -49,6 +49,9 @@ impl TestServer {
             assistant_url,
             assistant_model: "test-model".to_string(),
             assistant_api_key: None,
+            // Tests hit a mock on 127.0.0.1, so `auto` would keep the short
+            // interview window; `full` exercises the whole-meeting prompt.
+            assistant_context: "full".to_string(),
             tls_cert: None,
             tls_key: None,
         };
