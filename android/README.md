@@ -112,7 +112,10 @@ scripts/publish-android.sh --build-only # just the signed APK
 ```
 
 It refuses to publish a debuggable build or to run without the release key, and
-prints the versionCode, sha256 and the store's own confirmation. The store
+prints the versionCode, sha256 and the store's own confirmation. CI checks the
+same thing on every push to `main` (`android / store build is published`), so a
+version bump that was never published fails the pipeline — publish first, then
+push. The store
 tooling defaults to the sibling `google-play-temu` checkout
 (`WHEEZPER_STORE_PUBLISH` to override), the listing check uses
 https://wheezper-dl.pumpkinforge.de/store (override with `WHEEZPER_STORE_URL`).

@@ -677,6 +677,11 @@ scripts/publish-android.sh
 - Verify before reporting done: the store listing shows the new `versionCode`
   and the APK URL answers `200`. Report the versionCode/versionName, the
   download URL and the sha256.
+- CI enforces the ordering: the `android / store build is published` job fails a
+  push to `main` when the store's `versionCode` is lower than the repo's (or the
+  package is absent, or the listing is unreadable). So publish *first*, then
+  push — a pushed version bump with no store build is a red pipeline, on
+  purpose. PRs and tags are exempt (they build, they do not publish).
 - If the key or the store tooling is not on this machine (fresh clone, another
   developer), say so — do not invent a new key or ship an unsigned APK. Bumping
   the version and pushing the code without publishing leaves the phone stale.
@@ -723,7 +728,9 @@ scripts/publish-android.sh
     Release artifacts are built with `--features sync`.
 12. Android changes ship a bumped, release-signed APK to the APK store
    (`scripts/publish-android.sh`, see "Android: every change ends with a store
-   publish"); the store listing showing the new `versionCode` is the receipt.
+   publish"). The `android / store build is published` job gates a push to
+   `main`: the store's `versionCode` must be >= the one in
+   `android/app/build.gradle.kts`. Publish before you push.
 13. Phase 2 budget (manual, reference machine):
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
    must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s. Run it with

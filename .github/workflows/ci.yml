@@ -15,6 +15,8 @@ name: ci
 #   5. wheezper-server integration tests against a real PostgreSQL (pairing,
 #      idempotency, restart durability, stream resume, assistant)
 #   6. the Android companion compiles against the shared v1 protobuf contract
+#   7. the APK store carries the versionCode committed in android/ (the publish
+#      rule in AGENTS.md, checked instead of trusted)
 
 on:
   push:
@@ -133,6 +135,73 @@ jobs:
             wheezper-android.aab
           if-no-files-found: ignore
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Android: the store must already carry the versionCode in the repo
+  # (AGENTS.md: "a change under android/ is not finished until a signed release
+  # APK is the newest entry in the APK store"). Cheap on purpose: one public
+  # API call, so the rule is checked instead of trusted.
+  # ---------------------------------------------------------------------------
+  android-store:
+    name: android / store build is published
+    # PRs build the app but do not publish; a tag comes from a release, whose
+    # artifact was published by the time it is tagged.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Store has this versionCode
+        env:
+          STORE_URL: ${{ vars.WHEEZPER_STORE_URL || 'https://wheezper-dl.pumpkinforge.de/store' }}
+          PACKAGE: com.wheezper.app
+        run: |
+          set -euo pipefail
+          want=$(grep -m1 'versionCode' android/app/build.gradle.kts | grep -oE '[0-9]+')
+          name=$(grep -m1 'versionName' android/app/build.gradle.kts | sed -E 's/.*"(.*)".*/\1/')
+          echo "repo : $PACKAGE versionCode $want ($name)"
+
+          # One public API call, retried: a flaky store must not look like a
+          # missing publish, and a missing publish must not look like a flake.
+          if ! have=$(python3 - <<'PY'
+          import json, os, sys, time, urllib.request
+
+          url = os.environ["STORE_URL"].rstrip("/") + "/api/apps"
+          package = os.environ["PACKAGE"]
+          last = None
+          for attempt in range(3):
+              try:
+                  # Cloudflare rejects python-urllib's default user agent.
+                  request = urllib.request.Request(
+                      url, headers={"User-Agent": "wheezper-ci-store-gate"}
+                  )
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      apps = json.loads(response.read()).get("apps", [])
+                  print(next((a.get("versionCode", -1) for a in apps if a.get("package") == package), -1))
+                  break
+              except Exception as error:  # network, HTML error page, bad JSON
+                  last = error
+                  time.sleep(3)
+          else:
+              print(f"could not read {url}: {last}", file=sys.stderr)
+              sys.exit(1)
+          PY
+          ); then
+            echo "::error::the store gate cannot verify anything: $STORE_URL/api/apps is unreadable (publish with scripts/publish-android.sh, or investigate the store)"
+            exit 1
+          fi
+          echo "store: $PACKAGE versionCode $have"
+
+          if [ "$have" -lt 0 ]; then
+            echo "::error::$PACKAGE is not in the store at all — run scripts/publish-android.sh"
+            exit 1
+          fi
+          if [ "$have" -lt "$want" ]; then
+            echo "::error::store has versionCode $have but the repo is at $want — run scripts/publish-android.sh after bumping, and push only once it succeeded"
+            exit 1
+          fi
+          echo "OK: the store already carries versionCode $want (store: $have)"
 
   # ---------------------------------------------------------------------------
   # Linux: build, unit tests, accuracy gate, package
