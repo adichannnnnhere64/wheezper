@@ -147,6 +147,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * "Test connection": actually talk to the server the user typed in, and say
+     * what happened. It used to be `refresh()`, which returned silently when the
+     * phone was not paired and gave no visible result when it was — a dead button.
+     */
+    fun testConnection(serverUrl: String) {
+        val url = serverUrl.trim()
+        if (url.isBlank()) {
+            _state.update { it.copy(error = "Enter the server address first, e.g. https://host:50051") }
+            return
+        }
+        val token = _state.value.settings.deviceToken
+        if (token.isBlank()) {
+            _state.update {
+                it.copy(
+                    error = "Not paired yet. On the server run `wheezper-server --print-pairing-code`, " +
+                        "then enter that code above.",
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, error = null, notice = null) }
+            // Test the address as typed, not the saved one: pressing "Test
+            // connection" right after editing the field must test the edit.
+            runCatching {
+                MeetingRepository(WheezperClient(url, token)).use { repo ->
+                    repo.listSessions(activeOnly = false)
+                }
+            }.onSuccess { sessions ->
+                val active = sessions.count { !MeetingRepository.isCompleted(it) }
+                _state.update {
+                    it.copy(
+                        busy = false,
+                        notice = "Connected to $url — ${sessions.size} meeting(s), $active active.",
+                        error = null,
+                    )
+                }
+            }.onFailure { error ->
+                _state.update {
+                    it.copy(busy = false, error = "Cannot reach $url: ${friendly(error)}")
+                }
+            }
+        }
+    }
+
     fun refresh() {
         val repo = repository ?: return
         if (_state.value.settings.deviceToken.isBlank()) return

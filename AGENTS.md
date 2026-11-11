@@ -511,7 +511,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   handler re-reads the backlog.
 - **Credentials are hashes in the database and bearer tokens on the wire.**
   Never log a token or a pairing code; `EndSession` revokes the session token by
-  rotating its hash. TLS is required for anything non-local; the Android release
+  rotating its hash. A pairing code that was not configured is generated once
+  and kept in a `0600` file (`WHEEZPER_PAIRING_CODE_FILE`), and
+  `wheezper-server --print-pairing-code` writes it to the operator's terminal —
+  startup logging only says which of the two sources is in use. TLS is required for anything non-local; the Android release
   build refuses cleartext, the debug build allows it for LAN testing.
 - **`sqlx::migrate!` is runtime**, so `cargo build`/`cargo test` need no
   database. Integration tests skip (with a printed skip line) when

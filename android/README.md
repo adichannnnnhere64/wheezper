@@ -120,7 +120,10 @@ edit the repo-root files only.
 
 ## Pairing workflow
 
-1. Run `wheezper-server` with `WHEEZPER_PAIRING_CODE` set.
+1. Get the pairing code from the server:
+   `wheezper-server --print-pairing-code` (it is generated on first start and
+   kept in `$XDG_STATE_HOME/wheezper/pairing-code`; setting
+   `WHEEZPER_PAIRING_CODE` overrides it).
 2. On the phone: enter the server address + pairing code → **Pair**.
 3. **New meeting** → the server creates the session and shows the command to
    paste on the laptop:

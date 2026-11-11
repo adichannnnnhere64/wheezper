@@ -13,11 +13,28 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
+    // `--print-pairing-code`: show the code the phone has to type, then exit.
+    // It is a secret, so it goes to this terminal and nowhere else — never into
+    // the log stream, which is what the flag exists to avoid.
+    if std::env::args().any(|arg| arg == "--print-pairing-code") {
+        let config = Config::from_env()?;
+        println!("{}", config.pairing_code);
+        return Ok(());
+    }
+
     let config = Config::from_env()?;
     eprintln!(
         "wheezper-server: bind={} assistant={} ({}) retention={}d",
         config.bind, config.assistant_url, config.assistant_model, config.retention_days
     );
+    match &config.pairing_code_file {
+        Some(path) => eprintln!(
+            "wheezper-server: pairing code generated and kept in {} (show it with \
+             `wheezper-server --print-pairing-code`)",
+            path.display()
+        ),
+        None => eprintln!("wheezper-server: pairing code from WHEEZPER_PAIRING_CODE"),
+    }
 
     wheezper_server::serve(config, shutdown_signal()).await
 }

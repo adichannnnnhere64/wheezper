@@ -40,9 +40,17 @@ target already has the same glibc.
 
 ```bash
 export WHEEZPER_DATABASE_URL=postgres://wheezper:wheezper@localhost/wheezper
-export WHEEZPER_PAIRING_CODE="$(openssl rand -base64 24)"
+export WHEEZPER_PAIRING_CODE="$(openssl rand -base64 24)"   # optional
 cargo run -p wheezper-server
 # migrations run automatically at startup
+```
+
+Without `WHEEZPER_PAIRING_CODE` the server generates a `XXXX-XXXX-XXXX-XXXX`
+code on first start and keeps it in `$XDG_STATE_HOME/wheezper/pairing-code`
+(`0600`). Print it for the phone with:
+
+```bash
+wheezper-server --print-pairing-code   # terminal only, never the log stream
 ```
 
 Operate it with the bundled CLI:
@@ -85,7 +93,8 @@ All configuration is environment variables (12-factor; no config file).
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHEEZPER_DATABASE_URL` | **required** | PostgreSQL URL (`DATABASE_URL` also accepted) |
-| `WHEEZPER_PAIRING_CODE` | **required** | shared secret exchanged for a device token; min 12 chars |
+| `WHEEZPER_PAIRING_CODE` | generated | shared secret exchanged for a device token; min 12 chars. Unset: one is generated once and kept in `WHEEZPER_PAIRING_CODE_FILE` |
+| `WHEEZPER_PAIRING_CODE_FILE` | `$XDG_STATE_HOME/wheezper/pairing-code` | where a generated pairing code is stored (`0600`) |
 | `WHEEZPER_BIND` | `0.0.0.0:50051` | gRPC listen address |
 | `WHEEZPER_DEVICE_TTL_HOURS` | `168` | device-token lifetime |
 | `WHEEZPER_RETENTION_DAYS` | `0` | delete completed sessions older than N days (0 = forever) |

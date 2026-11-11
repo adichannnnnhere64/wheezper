@@ -81,7 +81,10 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             ) {
                 Text("Save address")
             }
-            OutlinedButton(onClick = vm::refresh, enabled = state.settings.paired) {
+            OutlinedButton(
+                onClick = { vm.testConnection(server) },
+                enabled = !state.busy && server.isNotBlank(),
+            ) {
                 Text("Test connection")
             }
         }
@@ -92,7 +95,9 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
                 "Paired as \"${state.settings.deviceName}\". The server issued a short-lived " +
                     "device token; no permanent credential is stored in the app."
             } else {
-                "Not paired. Use the pairing code printed by wheezper-server."
+                "Not paired. On the server run `wheezper-server --print-pairing-code` and type " +
+                    "what it prints above (the code is generated once and kept there; setting " +
+                    "WHEEZPER_PAIRING_CODE overrides it)."
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -109,6 +114,7 @@ fun SettingsScreen(state: UiState, vm: MainViewModel) {
             value = code,
             onValueChange = { code = it },
             label = { Text("Pairing code") },
+            placeholder = { Text("XXXX-XXXX-XXXX-XXXX") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )

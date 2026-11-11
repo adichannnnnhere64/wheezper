@@ -44,6 +44,7 @@ impl TestServer {
             database_url: db_url.clone(),
             bind: addr.parse().expect("addr"),
             pairing_code: PAIRING_CODE.to_string(),
+            pairing_code_file: None,
             device_ttl: Duration::from_secs(3600),
             retention_days: 0,
             assistant_url,
