@@ -31,6 +31,11 @@ VC++ redistributable needed).
   transcript lines without delaying transcription. Add `--knowledgebase FILE`
   to turn it into an interview assistant that answers as the candidate in one
   concise 10-20 word sentence.
+- **Remote sessions (optional)**: `--session` publishes committed lines to a
+  `wheezper-server` (gRPC + PostgreSQL) that stores the meeting, streams it to
+  an Android companion app and answers questions about it with Ollama. Offline
+  lines queue on disk and drain on reconnect. Without `--session` nothing
+  changes and no network is touched. See [Remote sessions](#remote-sessions-optional).
 
 ## Usage
 
@@ -97,6 +102,51 @@ stdout, so you can watch it live:
 Loopback notes: on Linux it captures the default sink's PulseAudio monitor
 source (works under PipeWire). On Windows, WASAPI loopback opens the default
 output device as an input stream. On hosts without loopback, pipe via ffmpeg.
+
+## Remote sessions (optional)
+
+`notes/*.md` stays the source of truth on the laptop. If you also want a live
+view on a phone (or a durable meeting record), run the optional backend and
+start wheezper with a session:
+
+```bash
+# release artifacts include this; a local build needs `--features sync`
+wheezper --source dual \
+  --session SESSION_ID --server https://meeting.example.com:50051 \
+  --session-token TOKEN
+```
+
+- Only **committed** lines are uploaded — never provisional preview text, never
+  audio.
+- No `--session` = no network at all; the local pipeline is unchanged.
+- Offline is the normal case: events queue in
+  `$XDG_STATE_HOME/wheezper/pending/<session>.jsonl` (fsynced), gRPC retries
+  with backoff, and the queue drains on reconnect. The server is idempotent on
+  the client's event id, so a lost acknowledgement cannot duplicate a line.
+- The server also exposes an AI assistant over the meeting transcript (Ollama).
+  The Android companion pairs with a short-lived device token and shows the
+  live transcript, history and assistant answers.
+- **AI help** (Android, per session): tick "Enable AI help" when creating a
+  meeting. As committed far-side lines arrive, the app asks the server's
+  assistant and shows the suggested answer live — either only when the line
+  looks like a question (default) or on every far-side line. The model is
+  chosen in the app, and an optional Ollama token (needed for Ollama Cloud) is
+  stored on the phone and sent per request: the server never stores or logs it.
+  Only committed text triggers an answer, so the answer follows the firm
+  transcript, not the provisional preview.
+
+Build/run the backend and app:
+
+```bash
+cp server/.env.example server/.env   # set the pairing code
+docker compose -f server/compose.yml up --build
+./scripts/test-server.sh             # backend integration tests (throwaway db)
+cd android && ./gradlew assembleDebug
+```
+
+See [server/README.md](server/README.md) for env vars, the auth model, delivery
+semantics and the versioned gRPC contract, and [android/README.md](android/README.md)
+for the companion app and its pairing flow.
 
 ## Live latency (measured, not estimated)
 
@@ -227,13 +277,18 @@ cargo build --release        # -> wheezper.exe, no installer, no extra DLLs
 # or cross-build the Windows exe from Linux
 nix-shell --run 'scripts/build-windows.sh'
 
-# Termux / Android (no llama.cpp: that needs the Android NDK)
+# Termux / Android (no llama.cpp: needs the NDK; this also drops the optional
+# remote-session client, so --session is refused instead of silently ignored)
 pkg install rust binutils cmake clang
 cargo build --release --no-default-features
 
 # anywhere, if you do not want the embedded LLM (≈4 MB smaller binary; a
-# --ollama <server> still works, only the bundled model runner goes away)
+# --ollama <server> still works, only the bundled model runner goes away).
+# This also drops the optional remote-session client.
 cargo build --release --no-default-features
+
+# build with remote sessions (release artifacts ship this way)
+cargo build --release --features sync
 ```
 
 ## CI / CD: tested artifacts only

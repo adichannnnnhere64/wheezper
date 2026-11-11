@@ -1,0 +1,46 @@
+# Local end-to-end stack: PostgreSQL + wheezper-server.
+#
+#   cp server/.env.example server/.env && edit it
+#   docker compose -f server/compose.yml up --build
+#
+# The gRPC port is plaintext here: terminate TLS in front of it (Caddy, nginx,
+# a cloud load balancer) or mount certs and set WHEEZPER_TLS_* instead.
+
+services:
+  db:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wheezper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in server/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-wheezper}
+    volumes:
+      - wheezper-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    env_file: .env
+    environment:
+      WHEEZPER_BIND: 0.0.0.0:50051
+      WHEEZPER_DATABASE_URL: postgres://${POSTGRES_USER:-wheezper}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-wheezper}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${WHEEZPER_PORT:-50051}:50051"
+    extra_hosts:
+      # so a local Ollama on the host is reachable from the container
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  wheezper-db:

@@ -1,0 +1,17 @@
+# Docker context for server/Dockerfile: only the Rust workspace is needed.
+target/
+target-*/
+android/
+bench/
+notes/
+models/
+test/
+interview-dummy/
+.git/
+*.opus
+*.lyrics
+*.lyeics
+*.tar.gz
+*.zip
+wheezper.prev
+PLAN*.md

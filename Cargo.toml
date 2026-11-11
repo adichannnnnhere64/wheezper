@@ -1,6 +1,6 @@
 [package]
 name = "wheezper"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "Live meeting/call transcription to a notepad. Single portable binary, local whisper.cpp inference."
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 build = "build.rs"
 
 [workspace]
-members = ["llm-worker"]
+members = ["llm-worker", "proto", "server"]
 
 [features]
 default = ["llm"]
@@ -17,6 +17,11 @@ default = ["llm"]
 # off for Termux/Android or a much smaller binary: `--ollama <server>` keeps
 # working, only the bundled model runner goes away.
 llm = ["dep:llama-cpp-2"]
+# Remote meeting sessions: gRPC client for wheezper-server. Not part of the
+# default build on purpose: it pulls in tonic/tokio/rustls, and a local-only
+# user should not pay for a network stack. Release artifacts build with
+# `--features sync`; `--session` on a build without it fails loudly.
+sync = ["dep:tonic", "dep:tokio", "dep:wheezper-proto", "dep:serde", "dep:serde_json", "dep:prost-types", "dep:uuid"]
 
 [dependencies]
 whisper-rs = "0.16"
@@ -28,6 +33,15 @@ ctrlc = { version = "3", features = ["termination"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "1.2.1"
 llama-cpp-2 = { version = "0.1.161", optional = true }
+
+# optional remote-session transport (feature `sync`)
+tonic = { version = "0.12", optional = true, default-features = false, features = ["transport", "codegen", "prost", "tls", "tls-webpki-roots"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "net", "time", "macros"] }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+prost-types = { version = "0.13", optional = true }
+uuid = { version = "1", optional = true, features = ["v4"] }
+wheezper-proto = { path = "proto", optional = true }
 
 # vendored to pin whisper.cpp and force /MT (static CRT) on Windows so the
 # exe runs with zero redistributable installs

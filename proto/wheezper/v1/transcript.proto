@@ -1,0 +1,61 @@
+// Append-only committed transcript events (contract version: wheezper.v1).
+syntax = "proto3";
+
+package wheezper.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "com.wheezper.v1";
+option java_outer_classname = "TranscriptProto";
+
+// One *committed* utterance. Provisional preview text is never published: it
+// can still change, and the notes are append-only.
+message TranscriptEvent {
+  // Idempotency key: the server ignores an event_id it already persisted.
+  string event_id = 1; // UUID
+  string session_id = 2; // UUID
+  // Assigned by the server on first persistence, monotonic per session.
+  // Ordering and gap detection live here, not in timestamps.
+  int64 sequence_number = 3;
+  string speaker = 4; // "me", "them", or "" for single-source capture
+  string content = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp received_at = 7;
+  string source = 8; // "wheezper"
+}
+
+message PublishTranscriptResponse {
+  string event_id = 1;
+  int64 sequence_number = 2;
+  // True when the event was already stored under this id (safe retry).
+  bool duplicate = 3;
+}
+
+message StreamTranscriptsRequest {
+  string session_id = 1;
+  // Send everything after this sequence, then live events. 0 = from the start.
+  int64 from_sequence = 2;
+}
+
+message SyncTranscriptsRequest {
+  string session_id = 1;
+  int64 from_sequence = 2;
+  int32 limit = 3; // 0 = server default (500)
+}
+
+message SyncTranscriptsResponse {
+  repeated TranscriptEvent events = 1;
+  int64 latest_sequence = 2;
+  // True when more entries exist after the last returned event.
+  bool has_more = 3;
+}
+
+service TranscriptService {
+  // Laptop -> server. Persist-then-ack; duplicates are harmless.
+  rpc PublishTranscript(TranscriptEvent) returns (PublishTranscriptResponse);
+  // Android (or any viewer) subscribes to committed events in order.
+  rpc StreamTranscripts(StreamTranscriptsRequest) returns (stream TranscriptEvent);
+  // Reconnect / gap recovery: catch up on a bounded range.
+  rpc SyncTranscripts(SyncTranscriptsRequest) returns (SyncTranscriptsResponse);
+}

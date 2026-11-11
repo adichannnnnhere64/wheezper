@@ -5,6 +5,8 @@ mod dsp;
 mod llm;
 mod models;
 mod notepad;
+#[cfg(feature = "sync")]
+mod remote;
 mod segmenter;
 mod sink;
 mod stream;
@@ -153,6 +155,20 @@ struct Cli {
     #[arg(long)]
     polish: bool,
 
+    /// Publish committed lines to a wheezper-server meeting session (UUID).
+    /// Omit it and wheezper is exactly as local as before: no network is used.
+    #[arg(long, value_name = "SESSION_ID", requires_all = ["server", "session_token"])]
+    session: Option<String>,
+
+    /// wheezper-server gRPC endpoint, e.g. https://meeting.example.com:50051
+    #[arg(long, value_name = "URL", requires = "session")]
+    server: Option<String>,
+
+    /// Session-scoped credential (from the agent that created the session).
+    /// Also read from WHEEZPER_SESSION_TOKEN.
+    #[arg(long, value_name = "TOKEN", env = "WHEEZPER_SESSION_TOKEN", requires = "session", hide_env_values = true)]
+    session_token: Option<String>,
+
     /// Config file (TOML). Without this flag, ./wheezper.toml then
     /// ~/.config/wheezper/config.toml (or %APPDATA%\wheezper) are used if present.
     #[arg(long)]
@@ -270,6 +286,7 @@ fn main() -> Result<()> {
     engine.flush_agent_annotations(Duration::from_secs(2));
     summarize_session(&mut engine)?;
     engine.drain_agent_annotations();
+    engine.finish_remote();
     Ok(())
 }
 
@@ -296,6 +313,9 @@ struct Engine {
     domain_prompt: Option<String>,
     recent_lines: std::collections::VecDeque<String>,
     webhook: Option<sink::Webhook>,
+    /// Optional remote meeting session (feature `sync`).
+    #[cfg(feature = "sync")]
+    remote: Option<remote::Remote>,
     partial: bool,
     /// Live-caption channel: Some when --partial. try_send only — if the
     /// worker is still inferring, this preview is dropped (whisper pads
@@ -342,6 +362,18 @@ impl Engine {
             })
             .transpose()?;
         let webhook = cli.webhook.as_deref().map(sink::Webhook::new);
+        #[cfg(feature = "sync")]
+        let remote = remote::Remote::from_cli(
+            cli.session.as_deref(),
+            cli.server.as_deref(),
+            cli.session_token.as_deref(),
+        )?;
+        #[cfg(not(feature = "sync"))]
+        if cli.session.is_some() {
+            anyhow::bail!(
+                "this build has no remote-session support; rebuild with `--features sync`"
+            );
+        }
 
         let llm: Option<llm::Llm> = if let Some(url) = cli.ollama.as_deref() {
             let server = llm::Ollama::new(url, &cli.ollama_model);
@@ -468,6 +500,8 @@ impl Engine {
             domain_prompt,
             recent_lines: Default::default(),
             webhook,
+            #[cfg(feature = "sync")]
+            remote,
             partial: cli.partial,
             partial_tx,
             llm,
@@ -509,6 +543,12 @@ impl Engine {
     fn append_line(&mut self, label: Option<&str>, text: &str) -> Result<bool> {
         let target = self.notepad.append_with_key(label, text)?;
         let Some(target) = target else { return Ok(false) };
+        // Committed text only: the provisional preview never reaches the
+        // server, exactly as it never reaches the notes.
+        #[cfg(feature = "sync")]
+        if let Some(remote) = &self.remote {
+            remote.publish(label, text);
+        }
         if let Some(agent) = &mut self.agent {
             let current = match label {
                 Some(channel) => format!("{channel}: {text}"),
@@ -545,6 +585,15 @@ impl Engine {
             {
                 eprintln!("wheezper: warning: writing agent annotation failed: {error:#}");
             }
+        }
+    }
+
+    /// Give the remote session a short chance to drain; unsent events stay on
+    /// disk and are retried on the next run.
+    fn finish_remote(&mut self) {
+        #[cfg(feature = "sync")]
+        if let Some(remote) = self.remote.take() {
+            remote.finish();
         }
     }
 
@@ -715,6 +764,21 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("webhook").and_then(|v| v.as_str())
     {
         cli.webhook = Some(v.to_string());
+    }
+    if !given("session")
+        && let Some(v) = get("session").and_then(|v| v.as_str())
+    {
+        cli.session = Some(v.to_string());
+    }
+    if !given("server")
+        && let Some(v) = get("server").and_then(|v| v.as_str())
+    {
+        cli.server = Some(v.to_string());
+    }
+    if !given("session_token")
+        && let Some(v) = get("session-token").or_else(|| get("session_token")).and_then(|v| v.as_str())
+    {
+        cli.session_token = Some(v.to_string());
     }
     if !given("rate")
         && let Some(v) = get("rate").and_then(|v| v.as_integer())

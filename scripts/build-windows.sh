@@ -25,7 +25,7 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 # 2) wheezper with the worker embedded
 WHEEZPER_LLM_WORKER="target-xwin/x86_64-pc-windows-msvc/release/wheezper-llm.exe" \
 RUSTFLAGS="-C target-feature=+crt-static" \
-    cargo xwin build --release --target x86_64-pc-windows-msvc
+    cargo xwin build --release --features sync --target x86_64-pc-windows-msvc
 
 echo
 echo "=> target-xwin/x86_64-pc-windows-msvc/release/wheezper.exe (worker embedded)"

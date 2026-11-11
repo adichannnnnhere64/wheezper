@@ -6,7 +6,7 @@ must not regress.
 
 **wheezper** is a single-binary CLI that listens to a meeting/call and writes a
 timestamped markdown transcript as it happens: local whisper.cpp inference, no
-cloud, no install, Linux / Windows / Android(Termux). Version `0.5.1`.
+cloud, no install, Linux / Windows / Android(Termux). Version `0.6.0`.
 
 ---
 
@@ -183,6 +183,89 @@ scripts/bench-interview-dummy.sh /path/to/interview-dummy turbo
 The harness transcribes both `.webm` files with their `.en.vtt` references and
 requires 95% word accuracy by default. Output goes to ignored `bench/out/`.
 
+### Phase 4 — DONE (PLAN2). Optional remote sessions: server + Android
+
+The CLI stays a local transcription engine. On top of it, an **optional**
+transport publishes committed lines to a Rust backend, and an Android companion
+displays/searches them and asks an AI assistant about the meeting. All of this
+is off unless `--session` is passed.
+
+**Contract** (`proto/wheezper/v1/*.proto`, package `wheezper.v1`): one
+versioned protobuf contract for Rust and Kotlin. Rust stubs come from
+`proto/build.rs` (vendored `protoc`, no system dependency); Android generates
+Java + Kotlin stubs from the same files via a Gradle `Sync` into
+`android/app/src/main/proto` (gitignored).
+
+**CLI** (`src/remote.rs`, feature `sync` — opt-in: release artifacts build with
+it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
+
+- `--session UUID --server URL --session-token TOKEN` (also
+  `WHEEZPER_SESSION_TOKEN`). Without `--session` the module is never entered
+  and no network call is made.
+- Only `Engine::append_line` publishes — i.e. committed text, both streaming and
+  segmenter paths. Provisional preview text is never published.
+- Delivery: notepad write → fsync'd pending queue
+  (`$XDG_STATE_HOME/wheezper/pending/<session>.jsonl`) → worker thread →
+  server ack → queue entry removed. A lost ack resends the same event id; the
+  server collapses it. Publish never blocks on the network; the queue survives
+  restarts.
+- `--no-default-features` drops `sync` (Termux build); so does a plain
+  `cargo build` — `--session` then fails loudly instead of silently ignoring
+  the flag. Release scripts and CI build with `--features sync`.
+
+**Backend** (`server/`, `wheezper-server` + `wheezper-admin`):
+
+- gRPC (tonic), SQLx/PostgreSQL, runtime-checked queries, migrations run at
+  startup (`sqlx::migrate!`; no database needed to compile).
+- `sessions` (`created → active → completed`, durable across laptop
+  disconnects), `transcript_entries` (append-only, `event_id` unique =
+  idempotency, `(session_id, sequence_number)` unique), `assistant_messages`,
+  `devices` (token hashes + expiry).
+- Server assigns sequence numbers under `SELECT … FOR UPDATE` on the session
+  row; it persists inside a transaction and only then acks and broadcasts.
+- `StreamTranscripts` sends the DB backlog first, then live events. The
+  in-memory `broadcast` channel is a hint, never storage: on `Lagged` or a
+  sequence gap the handler re-reads PostgreSQL.
+- Auth: `PairDevice(pairing_code)` → short-lived device token;
+  `CreateSession` → session-scoped publish token. Only SHA-256 hashes are
+  stored. `EndSession` rotates the session token (a stale laptop stops
+  publishing). Device tokens read/list/use the assistant; a session token may
+  only publish to, and read, its own session.
+- Assistant (`assistant/`): recent 250 lines + up to 20 older full-text matches
+  (`to_tsvector`), ~12k-char prompt bound, Ollama `stream: true` NDJSON,
+  `think: false`. Answers are persisted separately and never touch transcript
+  rows. `AskQuestion`/`StreamAnswer` accept a per-request model, provider token
+  and backend (`DEFAULT` = configured URL, `OLLAMA_CLOUD` = fixed
+  `https://ollama.com/api`); the token is never stored or logged.
+- AI help: `CreateSession(ai_help)` stores a per-session flag; the Android app
+  watches committed lines and auto-calls `StreamAnswer` (questions-only default
+  or every far-side line). Answers appear in the app panel and in
+  `assistant_messages`, never in the transcript.
+- `ai_help` also selects the **interview prompt** (`assistant::context::Mode`):
+  the far side asked a question, so the answer is one 10-20 word sentence spoken
+  as the candidate, allowed to use general technical knowledge (never invented
+  personal facts), and the context is trimmed to the last 12 lines so a small
+  local model on a 2-core box can prefill it in seconds. Sessions without
+  `ai_help` keep the strict transcript-only prompt. Both paths still persist the
+  answer separately and never touch `transcript_entries`.
+- TLS clients: `https://` endpoints must set
+  `ClientTlsConfig::new().with_webpki_roots()` (crate feature
+  `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
+  "Connecting to HTTPS without TLS enabled", which is easy to misread as a
+  server or firewall problem.
+
+**Android** (`android/`, Kotlin + Compose, no audio/no model): dashboard,
+live transcript (auto-reconnect + `SyncTranscripts` gap recovery), history with
+search, streaming AI assistant, settings/pairing. DataStore holds the server
+address + device token; debug builds allow cleartext gRPC to a LAN laptop,
+release builds do not.
+
+Evidence: `server/tests/{api,assistant}.rs` (pairing, idempotency, restart
+durability, stream resume, mock-Ollama answers, transcript immutability),
+`src/remote.rs` unit tests (queue round-trip/restart/corruption), and
+`scripts/test-session-sync.sh` (real CLI: server down → 3 events buffered on
+disk → server up → all 6 events on the server, no duplicates).
+
 ---
 
 ## Repository map
@@ -209,6 +292,13 @@ src/agent.rs       async per-line annotation worker, interview knowledgebase
                    mode, and --with-agent provider parser
 src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
 src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
+src/remote.rs      optional gRPC session sink (feature `sync`): fsync'd pending
+                   queue + background retry/reconnect/ack worker
+proto/             versioned gRPC contract (wheezper.v1) + Rust codegen
+server/            wheezper-server: sessions/transcripts/assistant over
+                   PostgreSQL (SQLx), migrations/, wheezper-admin operator CLI
+android/           Kotlin/Compose companion: dashboard, live transcript,
+                   history, AI assistant, settings (no audio, no model)
 knowledgebase.example.md  sample Java Spring interview profile for --knowledgebase
 llm-worker/        helper binary for the embedded LLM (separate ggml)
 vendor/            pinned whisper-rs-sys / llama-cpp-sys-2 sources
@@ -216,7 +306,8 @@ bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
                    RESULTS.md, fixtures, song sweep, score tests
 scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
                    windows}, bench-interview-dummy.sh, test-cloud-agent.sh,
-                   termux-build.sh
+                   termux-build.sh, test-server.sh, test-session-sync.sh,
+                   deploy-image.sh (build locally, ship the image over ssh)
 .github/workflows/ ci.yml (gates), termux.yml, release.yml
 PLAN.md            original design intent (partly diverged; this file wins)
 ```
@@ -226,11 +317,19 @@ PLAN.md            original design intent (partly diverged; this file wins)
 ```bash
 # NixOS dev shell (cmake/libclang/alsa/pulse present)
 nix-shell --run 'cargo build --release'          # -> target/release/wheezper
-nix-shell --run 'cargo test  --release --workspace' # 30 pass; 5 ignored
+nix-shell --run 'cargo test  --release --workspace' # 31 pass; 5 ignored
+nix-shell --run 'cargo test  --release -p wheezper --features sync' # 36 pass (remote sink)
 nix-shell --run 'cargo build --release --no-default-features'   # no LLM (Termux)
 
 # plain Linux with deps installed
 cargo test --release --workspace
+
+# backend: throwaway PostgreSQL + gRPC integration tests
+nix-shell --run './scripts/test-server.sh'
+# end-to-end remote session: offline queue, reconnect, drain, no duplicates
+nix-shell --run './scripts/test-session-sync.sh'
+# Android companion (JDK 17 + Android SDK 36; local.properties -> sdk.dir)
+cd android && ./gradlew assembleDebug
 
 # portable Linux artifact (docker, glibc 2.35) / Windows cross-build
 nix-shell --run 'scripts/build-linux.sh'
@@ -373,6 +472,47 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   continuations ("asked me to come back to the"). Off: 91.7 % mean over ten
   alignments, min 83.3; 12 words: 88.5 % mean, min 78.8. `--lyrics` still passes
   its own prompt.
+- **Remote sync is opt-in and must stay that way.** `--session` is the only
+  trigger; without it no socket is opened. The publish call lives *only* in
+  `Engine::append_line`, after the notepad write. Never publish provisional
+  text, and never make the notepad write wait on the network.
+- **The pending queue is the reliability story, not the gRPC client.** The line
+  is fsynced to `pending/<session>.jsonl` before the worker sees it; an entry is
+  removed only after the server ack. Retries reuse the same `event_id`, so the
+  server's unique index is what prevents duplicates. Do not switch to
+  "fire and forget" or drop the queue when offline.
+- **Sequence numbers are server-assigned**, under a `FOR UPDATE` session lock.
+  Clients must never invent them; viewers detect gaps by them and re-sync from
+  PostgreSQL. The in-memory broadcast channel is not durable — on `Lagged` the
+  handler re-reads the backlog.
+- **Credentials are hashes in the database and bearer tokens on the wire.**
+  Never log a token or a pairing code; `EndSession` revokes the session token by
+  rotating its hash. TLS is required for anything non-local; the Android release
+  build refuses cleartext, the debug build allows it for LAN testing.
+- **`sqlx::migrate!` is runtime**, so `cargo build`/`cargo test` need no
+  database. Integration tests skip (with a printed skip line) when
+  `WHEEZPER_TEST_DATABASE_URL` is unset — CI sets it via a postgres service.
+- **One server instance per database.** The live fan-out is an in-process
+  `broadcast` channel; scaling out needs a shared bus (LISTEN/NOTIFY) first.
+- **Edit `proto/wheezper/v1/*.proto`, never the Android mirror.** Gradle's
+  `syncProtos` copies the repo-root contract into
+  `android/app/src/main/proto` (gitignored) before codegen.
+- **Provider tokens are per-request and ephemeral.** `AskQuestionRequest.api_key`
+  is used for one call; never log it, never store it (no DB column), never echo
+  it in an error. `AssistantOptions` deliberately does not implement `Debug`.
+  The assistant endpoint is an allowlist (`DEFAULT` = operator URL,
+  `OLLAMA_CLOUD` = fixed ollama.com URL); never let a client supply a URL.
+- **AI help triggers on committed lines only, and the phone drives it.** The
+  server stores `sessions.ai_help` and uses it to pick the interview prompt;
+  there is no server-side auto-answer worker. Only the newest queued question is
+  kept while an answer streams, and the candidate's own (`me`) lines are never
+  answered. Do not trigger answers from provisional preview text.
+- **`ai_help` is interview mode, not a general "smarter assistant" switch.** It
+  lets the model use general technical knowledge for the interviewer's question;
+  the meeting prompt must stay transcript-grounded (a meeting answer that
+  invents a decision is a bug, an interview answer that explains Java is the
+  feature). Keep the interview context short: prefill, not decoding, is the
+  latency on a small box.
 - `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
   conditioning; without it whisper loops on music (143 inserted words vs 6).
   The explicit `initial_prompt` still applies.
@@ -450,7 +590,20 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
    provisional preview text is stdout-only (TTY).
 8. Do not commit song audio or lyrics: `*.opus`, `*.lyrics`, `*.lyeics`,
    `bench/out/` are gitignored and not redistributable.
-9. Phase 2 budget (manual, reference machine):
+9. `cargo test -p wheezper-server` with a PostgreSQL
+   (`WHEEZPER_TEST_DATABASE_URL`): pairing, idempotent publish, sequence order,
+   restart durability, stream resume, assistant context/immutability, `ai_help`
+   round-trip, and per-request model/token overrides (the mock asserts the
+   `Authorization` header and the model body field).
+10. `scripts/test-session-sync.sh`: the CLI buffers events while the server is
+    down and drains them, in order and without duplicates, after reconnect;
+    local markdown is written either way.
+11. `android/` must keep building (`./gradlew assembleDebug`) against
+    `proto/wheezper/v1`; both the default (local-only) and
+    `--no-default-features` CLI builds must keep working, and
+    `cargo test -p wheezper --features sync` gates the transport.
+    Release artifacts are built with `--features sync`.
+12. Phase 2 budget (manual, reference machine):
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
    must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s.
 

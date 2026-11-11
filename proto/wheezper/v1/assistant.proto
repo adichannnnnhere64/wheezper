@@ -1,0 +1,45 @@
+// Meeting-aware AI assistant (contract version: wheezper.v1).
+syntax = "proto3";
+
+package wheezper.v1;
+
+option java_multiple_files = true;
+option java_package = "com.wheezper.v1";
+option java_outer_classname = "AssistantProto";
+
+// Where the request should be answered. The endpoint is never supplied by the
+// client (no SSRF): the server either uses its configured Ollama URL or the
+// fixed Ollama Cloud endpoint.
+enum AssistantBackend {
+  ASSISTANT_BACKEND_DEFAULT = 0;      // server's WHEEZPER_ASSISTANT_URL
+  ASSISTANT_BACKEND_OLLAMA_CLOUD = 1; // https://ollama.com/api
+}
+
+message AskQuestionRequest {
+  string session_id = 1;
+  string question = 2;
+  // Optional per-request model name ("" = server default).
+  string model = 3;
+  // Optional per-request API token for the provider. Used for this call only:
+  // the server never stores or logs it. Over TLS only, like every credential.
+  string api_key = 4;
+  AssistantBackend backend = 5;
+}
+
+message AskQuestionResponse {
+  string answer = 1;
+  string provider = 2;
+  string model = 3;
+}
+
+message AnswerChunk {
+  string delta = 1;
+  bool done = 2;
+  string provider = 3;
+  string model = 4;
+}
+
+service AssistantService {
+  rpc AskQuestion(AskQuestionRequest) returns (AskQuestionResponse);
+  rpc StreamAnswer(AskQuestionRequest) returns (stream AnswerChunk);
+}

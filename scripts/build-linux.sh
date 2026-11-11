@@ -52,7 +52,7 @@ docker run --rm \
 
         echo "==> building wheezper (worker embedded)"
         WHEEZPER_LLM_WORKER=/app/'"$TARGET_DIR"'/release/wheezper-llm \
-            cargo build --release
+            cargo build --release --features sync
     '
 
 BIN="$TARGET_DIR/release/wheezper"

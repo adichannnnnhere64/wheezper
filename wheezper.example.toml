@@ -12,6 +12,12 @@ language = "en"        # or "auto" to detect per segment
 # knowledgebase = "knowledgebase.example.md"  # interview answers (with-agent)
 # notes = "notes/work.md"
 # webhook = "http://192.168.1.20:8399/hook"
+# Remote meeting session (optional; needs a wheezper-server). Only committed
+# lines are published, and local notes are written whether or not the network
+# is up. Omit all three to stay fully local.
+# session = "00000000-0000-0000-0000-000000000000"
+# server = "https://meeting.example.com:50051"
+# session-token = "..."     # or WHEEZPER_SESSION_TOKEN in the environment
 # device = "hdmi"           # substring match, see --list-devices
 # host = "pulseaudio"       # pulseaudio | wasapi | alsa | ...
 

@@ -12,6 +12,9 @@ name: ci
 #      it from a scratch directory — Linux as a plain user, Windows as a
 #      standard (non-admin) account with no installer and no PATH changes
 #   4. optional song/lyric benchmark (see the last job)
+#   5. wheezper-server integration tests against a real PostgreSQL (pairing,
+#      idempotency, restart durability, stream resume, assistant)
+#   6. the Android companion compiles against the shared v1 protobuf contract
 
 on:
   push:
@@ -33,6 +36,70 @@ env:
   GGML_NATIVE: "OFF"
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Backend: the gRPC server against a real PostgreSQL (PLAN2 phases 1/2/4)
+  # ---------------------------------------------------------------------------
+  server:
+    name: server / integration tests (PostgreSQL)
+    runs-on: ubuntu-22.04
+    env:
+      WHEEZPER_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/wheezper_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wheezper_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'vendor/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Integration tests
+        run: cargo test -p wheezper-server -- --test-threads=4
+
+  # ---------------------------------------------------------------------------
+  # Android: the companion app compiles against proto/wheezper/v1
+  # ---------------------------------------------------------------------------
+  android:
+    name: android / assembleDebug
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install SDK platform used by the app
+        run: yes | sdkmanager "platforms;android-36" "build-tools;36.0.0" >/dev/null
+      - name: Build
+        run: ./gradlew --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheezper-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
   # ---------------------------------------------------------------------------
   # Linux: build, unit tests, accuracy gate, package
   # ---------------------------------------------------------------------------
@@ -61,12 +128,14 @@ jobs:
           path: ~/.local/share/wheezper
           key: whisper-models-base
       - name: Unit tests
-        run: cargo test --release --workspace
-      - name: Build (LLM worker embedded)
+        run: |
+          cargo test --release --workspace
+          cargo test --release -p wheezper --features sync
+      - name: Build (LLM worker embedded, remote sessions on)
         run: |
           set -euo pipefail
           cargo build --release -p llm-worker
-          WHEEZPER_LLM_WORKER="$PWD/target/release/wheezper-llm" cargo build --release
+          WHEEZPER_LLM_WORKER="$PWD/target/release/wheezper-llm" cargo build --release --features sync
       - name: Accuracy gate (speech fixture, >= 90% word accuracy)
         run: |
           MIN_ACCURACY=90 ./bench/run.sh bench/fixtures/jfk.f32 bench/fixtures/jfk.txt \
@@ -166,12 +235,14 @@ jobs:
           path: ~\AppData\Roaming\wheezper
           key: whisper-models-base-win
       - name: Unit tests
-        run: cargo test --release --workspace
-      - name: Build (LLM worker embedded)
+        run: |
+          cargo test --release --workspace
+          cargo test --release -p wheezper --features sync
+      - name: Build (LLM worker embedded, remote sessions on)
         run: |
           cargo build --release -p llm-worker
           $env:WHEEZPER_LLM_WORKER = "$pwd\target\release\wheezper-llm.exe"
-          cargo build --release
+          cargo build --release --features sync
       - name: Accuracy gate (speech fixture, >= 90% word accuracy)
         shell: bash
         env:
