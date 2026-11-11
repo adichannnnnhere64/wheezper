@@ -680,14 +680,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun wantsAnswer(event: TranscriptEvent, everyLine: Boolean): Boolean {
         // The candidate's own lines are not questions to answer.
         if (event.speaker.equals("me", ignoreCase = true)) return false
-        return if (everyLine) true else looksLikeQuestion(event.content)
-    }
-
-    private fun looksLikeQuestion(text: String): Boolean {
-        val normalized = text.trim().lowercase()
-        if (normalized.isEmpty()) return false
-        if ('?' in normalized) return true
-        return QUESTION_STARTERS.any { normalized.startsWith(it) }
+        // Committed ASR lines usually have no '?', and an interviewer often
+        // starts with a setup sentence, so this is a generous heuristic rather
+        // than a prefix match — see QuestionHeuristic.
+        return if (everyLine) true else QuestionHeuristic.looksLikeQuestion(event.content)
     }
 
     private fun startAutoAnswer(event: TranscriptEvent) {
@@ -775,13 +771,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
          * Cheap question heuristic for interview help. Committed lines are the
          * only input, so this is a filter, not a semantic classifier.
          */
-        val QUESTION_STARTERS = listOf(
-            "what", "why", "how", "when", "where", "who", "which",
-            "can you", "could you", "would you", "will you",
-            "do you", "did you", "are you", "have you", "is it", "are there",
-            "tell me", "explain", "describe", "walk me through", "talk about",
-            "give me an example", "suppose", "imagine",
-        )
     }
 
     private fun friendly(error: Throwable): String {

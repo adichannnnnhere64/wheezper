@@ -591,6 +591,16 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   watermark skipped them while the mode was off. The layout is one visual
   block per line (row + its answer under a rail) — never a single shared
   answer slot, which a fast interviewer would keep overwriting.
+- **"Questions only" is a generous heuristic, not a `?` check.** Committed
+  lines are lowercase and usually lose their punctuation, and an interviewer
+  often buries the question behind a setup sentence ("consequences of being a
+  non-deterministic number four, explain temperature and top p how would you
+  get a reliable structured output"). `QuestionHeuristic` answers when the line
+  has a `?`, starts with a question word after a filler ("and what about…"),
+  contains an asking phrase anywhere, or is a long turn addressed at "you".
+  A false positive costs one wasted answer; a false negative costs the answer
+  the user needed — do not tighten it back to a prefix match, and keep
+  `QuestionHeuristicTest` honest with the real transcript shapes.
 - **The transcript follows the newest block by its end, not its top.**
   `scrollToBlockEnd` scrolls to the item and then by the overflow, because
   `animateScrollToItem` alone parks a tall block at the top of the viewport

@@ -36,8 +36,8 @@ android {
         applicationId = "com.wheezper.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.2.5"
+        versionCode = 9
+        versionName = "0.2.6"
     }
 
     buildTypes {
