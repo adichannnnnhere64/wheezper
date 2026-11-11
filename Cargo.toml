@@ -21,7 +21,15 @@ llm = ["dep:llama-cpp-2"]
 # default build on purpose: it pulls in tonic/tokio/rustls, and a local-only
 # user should not pay for a network stack. Release artifacts build with
 # `--features sync`; `--session` on a build without it fails loudly.
-sync = ["dep:tonic", "dep:tokio", "dep:wheezper-proto", "dep:serde", "dep:serde_json", "dep:prost-types", "dep:uuid"]
+sync = ["dep:tonic", "dep:tokio", "dep:wheezper-proto", "dep:serde", "dep:prost-types", "dep:uuid"]
+# GPU offload for whisper.cpp (opt-in, not portable: the artifact then needs
+# the driver's Vulkan/CUDA runtime). Vulkan covers NVIDIA/AMD/Intel on Windows
+# and Linux; a 6-core CPU pass is ~3 s, a laptop GPU is well under 1 s, which is
+# what makes `small`/`medium` usable as the *notes* model in real time.
+# Build with: cargo build --release --features vulkan,llm
+# (needs the Vulkan SDK + glslc; CUDA needs the toolkit).
+vulkan = ["whisper-rs/vulkan"]
+cuda = ["whisper-rs/cuda"]
 
 [dependencies]
 whisper-rs = "0.16"
@@ -31,6 +39,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cpal = { version = "0.18", features = ["pulseaudio"] }
 ctrlc = { version = "3", features = ["termination"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# --update: release metadata + SHA256SUMS verification (both already in the
+# dependency graph through the optional sync feature; no new crates to fetch)
+serde_json = "1"
+sha2 = "0.10"
 toml = "1.2.1"
 llama-cpp-2 = { version = "0.1.161", optional = true }
 
@@ -38,7 +50,6 @@ llama-cpp-2 = { version = "0.1.161", optional = true }
 tonic = { version = "0.12", optional = true, default-features = false, features = ["transport", "codegen", "prost", "tls", "tls-webpki-roots"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt", "net", "time", "macros"] }
 serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
 prost-types = { version = "0.13", optional = true }
 uuid = { version = "1", optional = true, features = ["v4"] }
 wheezper-proto = { path = "proto", optional = true }

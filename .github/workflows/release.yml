@@ -48,11 +48,24 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      # `wheezper --update` installs a raw binary, not an archive: publish the
+      # same bytes the tarball/zip carry, with one checksum list covering all of
+      # them. Asset names are the updater's platform table — do not rename.
+      - name: Raw binaries for self-update
+        run: |
+          set -euo pipefail
+          mkdir -p raw-linux raw-windows
+          tar xzf wheezper-linux-amd64.tar.gz -C raw-linux
+          unzip -o -q wheezper-windows-x64.zip -d raw-windows
+          cp raw-linux/wheezper wheezper-linux-amd64
+          cp raw-windows/wheezper.exe wheezper-windows-x64.exe
+          chmod +x wheezper-linux-amd64
       - name: Checksums
         run: |
           set -euo pipefail
           ls -la
-          sha256sum wheezper-linux-amd64.tar.gz wheezper-windows-x64.zip > SHA256SUMS
+          sha256sum wheezper-linux-amd64.tar.gz wheezper-windows-x64.zip \
+                    wheezper-linux-amd64 wheezper-windows-x64.exe > SHA256SUMS
           cat SHA256SUMS
       - name: Publish
         uses: softprops/action-gh-release@v2
@@ -60,8 +73,11 @@ jobs:
           files: |
             wheezper-linux-amd64.tar.gz
             wheezper-windows-x64.zip
+            wheezper-linux-amd64
+            wheezper-windows-x64.exe
             SHA256SUMS
           fail_on_unmatched_files: true
+          preserve_order: true
           generate_release_notes: true
           body: |
             Validated build — these exact files passed the CI gates:
@@ -72,5 +88,11 @@ jobs:
             - Windows artifact unpacked and run on real Windows VMs (2022, 2025)
               as a **standard, non-administrator user** from a user-writable
               directory: no installer, no PATH changes, no redistributables
+
+            Update in place: `wheezper --update` (reads `SHA256SUMS` and replaces
+            the running binary; on Windows the swap happens as the process exits).
+            The Android companion is distributed through Google Play, which
+            delivers its updates; its Settings screen uses Play's in-app update
+            flow.
 
             Verify with `sha256sum -c SHA256SUMS` (Windows: `Get-FileHash`).

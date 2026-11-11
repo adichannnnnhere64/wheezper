@@ -11,6 +11,7 @@ mod segmenter;
 mod sink;
 mod stream;
 mod transcribe;
+mod update;
 mod vad;
 
 use anyhow::{Context, Result};
@@ -186,6 +187,13 @@ struct Cli {
     #[arg(long)]
     list_devices: bool,
 
+    /// Update this binary to the latest published release and exit. Downloads
+    /// the raw binary + SHA256SUMS from the GitHub release, verifies the hash
+    /// and replaces the running executable (on Windows the swap happens as the
+    /// process exits, because a running .exe is locked)
+    #[arg(long)]
+    update: bool,
+
     /// stdin input sample rate (Hz); stdin must be mono f32le
     #[arg(long, default_value_t = 16000)]
     rate: u32,
@@ -231,6 +239,10 @@ fn main() -> Result<()> {
     if let Some(cfg) = config::load(cli.config.as_deref())? {
         apply_config(&mut cli, &matches, &cfg.table);
         eprintln!("wheezper: config <- {}", cfg.path.display());
+    }
+
+    if cli.update {
+        return update::run();
     }
 
     if cli.list_devices {

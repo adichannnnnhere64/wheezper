@@ -78,6 +78,11 @@ wheezper --model small
 wheezper --list-devices
 wheezper --source loopback --device hdmi
 
+# update this binary in place from the latest validated GitHub release
+# (downloads the raw binary + SHA256SUMS, verifies, swaps; on Windows the swap
+# happens as the process exits because a running .exe is locked)
+wheezper --update
+
 # any recording or exotic source: pipe mono f32le PCM
 ffmpeg -i recording.wav -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
 
@@ -277,6 +282,33 @@ curl -L -o ~/.local/share/wheezper/ggml-base-q5_1.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin
 ```
 
+## Faster transcription (GPU)
+
+Every whisper pass is ~fixed cost (whisper.cpp pads to a 30 s window), so the
+knobs that matter are the model and whether the encoder runs on the GPU:
+
+- `--model base --preview-model auto` (the defaults) is the best CPU setup: the
+  preview stays on `base` while the notes can use `small`.
+- On a machine with a real GPU, build with Vulkan (NVIDIA/AMD/Intel, Windows and
+  Linux) or CUDA:
+
+```bash
+cargo build --release --features vulkan   # needs the Vulkan SDK + glslc
+cargo build --release --features cuda     # needs the CUDA toolkit
+```
+
+  whisper-rs enables GPU offload by default when it is built in, so there is no
+  flag to add. A 6-core CPU final pass is ~3 s; a laptop GPU is well under 1 s,
+  which is what makes `small` (or `medium` on a strong GPU) usable as the
+  **notes** model in real time. The GPU build is opt-in because the binary then
+  needs the driver's Vulkan/CUDA runtime — the shipped artifacts stay portable
+  CPU builds, and a software Vulkan device (mesa llvmpipe) is slower than the
+  CPU path.
+- Do not raise `--threads` past the split the app picks: two ggml workers
+  oversubscribing the box convoy on their spin barriers and every pass gets
+  slower, not faster (see `AGENTS.md`, "Two ggml workers must not
+  oversubscribe the box").
+
 ## Install / build
 
 ```bash
@@ -302,6 +334,23 @@ cargo build --release --no-default-features
 # build with remote sessions (release artifacts ship this way)
 cargo build --release --features sync
 ```
+
+## Updating
+
+`wheezper --update` replaces the binary you are running. It reads
+`https://github.com/adichannnnnhere64/wheezper/releases/latest`, downloads
+`wheezper-linux-amd64` (or `wheezper-windows-x64.exe`) plus `SHA256SUMS` from
+that release, verifies the hash and renames the new binary over the old one. No
+installer, no admin rights; it does need write access to the directory the
+binary lives in. Linux/macOS swap atomically; Windows stages
+`wheezper.exe.new` and a detached shell moves it into place after the process
+exits, so the update is on disk the next time you start it.
+
+The Android companion is distributed through Google Play, so Play delivers its
+updates. **Settings → App → Check for updates** uses Play's in-app update API,
+which is the only in-app path that can replace a Play-installed app (Play holds
+the signing key, so a self-downloaded APK is a different signer and the
+installer rejects it).
 
 ## CI / CD: tested artifacts only
 
