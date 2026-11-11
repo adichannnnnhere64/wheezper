@@ -4,7 +4,10 @@ package com.wheezper.app.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -43,6 +47,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,6 +57,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.wheezper.app.AiAnswer
+import com.wheezper.app.Connection
 import com.wheezper.app.MainViewModel
 import com.wheezper.app.UiState
 import com.wheezper.app.data.MeetingRepository
@@ -62,6 +68,11 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
     val session = state.openSession ?: return
     val completed = MeetingRepository.isCompleted(session)
     var assistantOpen by rememberSaveable { mutableStateOf(false) }
+    // The transcript is the point of this screen; everything above it is
+    // chrome and collapses into one row so the notes get the height.
+    var searchOpen by rememberSaveable { mutableStateOf(false) }
+    var helpOpen by rememberSaveable { mutableStateOf(false) }
+    var serverOpen by rememberSaveable { mutableStateOf(false) }
 
     val query = state.transcriptQuery.trim().lowercase()
     val visible = remember(state.events, query) {
@@ -72,15 +83,31 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
     }
     val listState = rememberLazyListState()
 
-    // Follow the live transcript, but never yank the view away from someone
-    // reading an answer further up: a new line (or an answer streaming under
-    // an older row) only scrolls when they are already at the bottom.
+    // Follow the live transcript. A new line or a new answer scrolls to the
+    // *end of that block* — not to its top, which left a freshly generated
+    // answer below the fold — and the answer keeps being followed while it
+    // streams. The moment the user drags the list, following stops until they
+    // drag back to the end, so reading an older answer is never interrupted.
+    var follow by rememberSaveable { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is DragInteraction.Start -> follow = false
+                is DragInteraction.Stop, is DragInteraction.Cancel ->
+                    follow = !listState.canScrollForward
+            }
+        }
+    }
+    val answerChars = state.answers.values.sumOf { it.text.length }
     LaunchedEffect(visible.size, state.answers.size) {
-        if (visible.isEmpty()) return@LaunchedEffect
-        val info = listState.layoutInfo
-        val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-        val atBottom = lastVisible >= visible.lastIndex - 1
-        if (atBottom) listState.animateScrollToItem(visible.lastIndex)
+        if (follow && visible.isNotEmpty()) {
+            listState.scrollToBlockEnd(visible.lastIndex, animate = true)
+        }
+    }
+    LaunchedEffect(answerChars) {
+        if (follow && visible.isNotEmpty()) {
+            listState.scrollToBlockEnd(visible.lastIndex, animate = false)
+        }
     }
 
     Scaffold(
@@ -123,10 +150,38 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            ConnectionStrip(state.connection, state.settings.serverUrl)
+            SessionChrome(
+                connection = state.connection,
+                server = state.settings.serverUrl,
+                serverOpen = serverOpen,
+                onServer = { serverOpen = !serverOpen },
+                searchOpen = searchOpen,
+                onSearch = {
+                    // Collapsing drops the filter too: leaving a hidden query
+                    // active would silently hide lines with no way to see it.
+                    if (searchOpen) vm.setTranscriptQuery("")
+                    searchOpen = !searchOpen
+                },
+                aiHelp = session.aiHelp && !completed,
+                answers = state.answers.values,
+                helpOpen = helpOpen,
+                onHelp = { helpOpen = !helpOpen },
+            )
 
-            if (session.aiHelp && !completed) {
-                AiHelpStrip(state) { everyLine -> vm.setAssistantEveryLine(everyLine) }
+            if (searchOpen) {
+                OutlinedTextField(
+                    value = state.transcriptQuery,
+                    onValueChange = vm::setTranscriptQuery,
+                    placeholder = { Text("Search this transcript") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+            }
+
+            if (session.aiHelp && !completed && helpOpen) {
+                AiHelpPanel(state) { everyLine -> vm.setAssistantEveryLine(everyLine) }
             }
 
             state.laptopCommand?.let { command ->
@@ -138,16 +193,6 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                     Banner(it, isError = true, onDismiss = vm::dismissError)
                 }
             }
-
-            OutlinedTextField(
-                value = state.transcriptQuery,
-                onValueChange = vm::setTranscriptQuery,
-                placeholder = { Text("Search this transcript") },
-                singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-            )
 
             if (visible.isEmpty()) {
                 Box(
@@ -257,16 +302,89 @@ private fun TranscriptRow(event: TranscriptEvent) {
 }
 
 /**
- * Status strip for interview help. The answers themselves render under the
- * transcript row they answer (see [AnswerCard]); this strip never holds a
- * single shared answer slot, which a fast interviewer would keep overwriting.
+ * Everything above the transcript collapsed into one row: connection, search
+ * and interview help. Each was a full-width block before, and three of them
+ * cost most of the screen before a single line of notes was visible. Tap a
+ * chip to open its panel; the transcript gets the height back.
+ */
+@Composable
+private fun SessionChrome(
+    connection: Connection,
+    server: String,
+    serverOpen: Boolean,
+    onServer: () -> Unit,
+    searchOpen: Boolean,
+    onSearch: () -> Unit,
+    aiHelp: Boolean,
+    answers: Collection<AiAnswer>,
+    helpOpen: Boolean,
+    onHelp: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(Modifier.clickable(onClick = onServer)) { StatusPill(connection) }
+        if (serverOpen) {
+            Text(
+                server.removePrefix("http://").removePrefix("https://"),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
+        if (aiHelp) {
+            val thinking = answers.count { it.streaming }
+            val label = when {
+                thinking > 0 -> "AI · answering…"
+                answers.isEmpty() -> "AI"
+                answers.size == 1 -> "AI · 1"
+                else -> "AI · ${answers.size}"
+            }
+            ChromeChip(label, active = helpOpen, onClick = onHelp)
+        }
+        ChromeChip("Search", active = searchOpen, onClick = onSearch)
+    }
+}
+
+@Composable
+private fun ChromeChip(label: String, active: Boolean, onClick: () -> Unit) {
+    val accent = MaterialTheme.colorScheme.primary
+    val color = if (active) accent else MaterialTheme.colorScheme.onSurfaceVariant
+    Surface(
+        color = if (active) accent.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.clickable(onClick = onClick),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            maxLines = 1,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+    }
+}
+
+/**
+ * Details for interview help, shown only when the AI chip is open. The answers
+ * themselves render under the transcript row they answer (see [AnswerCard]);
+ * this panel never holds a single shared answer slot, which a fast interviewer
+ * would keep overwriting.
  *
  * The mode is a toggle here, not only in Settings: "questions only" leaves the
  * lines that are not questions without an answer, and that is the first thing
  * anyone wants to change when they expected help under every far-side line.
  */
 @Composable
-private fun AiHelpStrip(state: UiState, onEveryLine: (Boolean) -> Unit) {
+private fun AiHelpPanel(state: UiState, onEveryLine: (Boolean) -> Unit) {
     val accent = MaterialTheme.colorScheme.primary
     val answers = state.answers.values
     val thinking = answers.count { it.streaming }
@@ -281,7 +399,7 @@ private fun AiHelpStrip(state: UiState, onEveryLine: (Boolean) -> Unit) {
         shape = MaterialTheme.shapes.medium,
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 6.dp),
+            .padding(horizontal = 16.dp, vertical = 4.dp),
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -292,7 +410,6 @@ private fun AiHelpStrip(state: UiState, onEveryLine: (Boolean) -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Text("AI HELP", style = MaterialTheme.typography.labelSmall, color = accent)
                 Surface(
                     color = accent.copy(alpha = 0.16f),
                     shape = MaterialTheme.shapes.small,
@@ -340,6 +457,24 @@ private fun AiHelpStrip(state: UiState, onEveryLine: (Boolean) -> Unit) {
             }
         }
     }
+}
+
+/**
+ * Scroll so the *end* of the transcript block at [index] is on screen. Plain
+ * `animateScrollToItem` puts a tall row at the top of the viewport, which is
+ * exactly what hides a long answer below it — the reason a freshly answered
+ * question looked like nothing had happened.
+ */
+private suspend fun LazyListState.scrollToBlockEnd(index: Int, animate: Boolean) {
+    if (animate) animateScrollToItem(index) else scrollToItem(index)
+    // Let the row lay out before asking where its end is.
+    withFrameNanos { }
+    val info = layoutInfo
+    val block = info.visibleItemsInfo.firstOrNull { it.index == index } ?: return
+    val overflow = (block.offset + block.size) -
+        (info.viewportEndOffset - info.afterContentPadding)
+    if (overflow <= 0) return
+    if (animate) animateScrollBy(overflow.toFloat()) else scrollBy(overflow.toFloat())
 }
 
 /**

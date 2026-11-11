@@ -572,12 +572,21 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   catch-up after opening the app answers the backlog of a **live** session
   (joining an interview late should not leave its questions unanswered) but
   never a completed one, and the bounded queue means only the newest few of a
-  long backlog are answered. The live screen's AI HELP strip toggles the mode
+  long backlog are answered. The live screen's AI HELP chip toggles the mode
   ("questions only" / "every far-side line"); switching it on also queues the
   far-side rows already on screen that have no answer yet, because the
   watermark skipped them while the mode was off. The layout is one visual
   block per line (row + its answer under a rail) — never a single shared
   answer slot, which a fast interviewer would keep overwriting.
+- **The transcript follows the newest block by its end, not its top.**
+  `scrollToBlockEnd` scrolls to the item and then by the overflow, because
+  `animateScrollToItem` alone parks a tall block at the top of the viewport
+  and leaves the answer that just arrived below the fold — the answer looked
+  like it never appeared. The list keeps following while the answer streams,
+  stops the moment the user drags, and re-arms only once they drag back to the
+  end — a growing answer must never yank someone who scrolled up. The
+  connection, AI-help and search blocks are collapsed into one chrome row of
+  chips for the same reason: the notes are the screen.
 - **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
   whisper's raw tokens: a rare word is several tokens and continuation tokens
   carry no leading space. Inserting a space per token rendered "Khan" as
