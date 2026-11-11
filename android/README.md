@@ -100,6 +100,23 @@ WHEEZPER_ANDROID_KEY_PASSWORD=... ./gradlew assembleRelease bundleRelease
 Bump `versionCode`/`versionName` in `app/build.gradle.kts` for every upload —
 Play refuses a repeated `versionCode`.
 
+## Publishing to the APK store
+
+The companion also ships through the APK store, and **every Android change ends
+with a publish there** (see `AGENTS.md`). One command does the whole thing:
+
+```bash
+# bump versionCode/versionName first
+scripts/publish-android.sh              # signed release APK -> store -> verify listing
+scripts/publish-android.sh --build-only # just the signed APK
+```
+
+It refuses to publish a debuggable build or to run without the release key, and
+prints the versionCode, sha256 and the store's own confirmation. The store
+tooling defaults to the sibling `google-play-temu` checkout
+(`WHEEZPER_STORE_PUBLISH` to override), the listing check uses
+https://wheezper-dl.pumpkinforge.de/store (override with `WHEEZPER_STORE_URL`).
+
 ## Build
 
 Needs JDK 17 and Android SDK platform 36 + build-tools 36.

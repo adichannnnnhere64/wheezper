@@ -327,6 +327,7 @@ bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
 scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
                    windows}, bench-interview-dummy.sh, test-cloud-agent.sh,
                    termux-build.sh, test-server.sh, test-session-sync.sh,
+                   publish-android.sh (signed release APK -> APK store),
                    deploy-image.sh (build locally, ship the image over ssh)
 .github/workflows/ ci.yml (gates), termux.yml, release.yml
 PLAN.md            original design intent (partly diverged; this file wins)
@@ -650,6 +651,38 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   explicit interface.
 - Formatting/`clippy` clean-ish is expected; do not reformat unrelated code.
 
+## Android: every change ends with a store publish
+
+**Rule: a change under `android/` is not finished until a signed release APK is
+the newest entry in the APK store.** CI artifacts and Play builds do not reach
+the phone on their own; the store does. The rule is executable:
+
+```bash
+# 1. bump versionCode AND versionName in android/app/build.gradle.kts — the
+#    store (and Play) key on versionCode; an unchanged one is not a release
+# 2. build the signed release and publish it, then confirm the listing
+scripts/publish-android.sh
+#    --build-only  -> just the signed APK (no upload)
+#    -> https://wheezper-dl.pumpkinforge.de/store
+```
+
+- The script fails loudly instead of shipping anything questionable: missing
+  signing key, a debuggable build, or a missing store tool (override with
+  `WHEEZPER_STORE_PUBLISH` / `WHEEZPER_ANDROID_KEYSTORE_PROPERTIES`; the API
+  check uses `WHEEZPER_STORE_URL`).
+- Signing key lives *outside* the repo — `~/.config/wheezper/android-release.jks`
+  plus `android-release.properties` (0600). Never commit it, never print its
+  passwords, and never fall back to the debug key: an update only installs over
+  the same signer (`INSTALL_FAILED_UPDATE_INCOMPATIBLE` otherwise).
+- Verify before reporting done: the store listing shows the new `versionCode`
+  and the APK URL answers `200`. Report the versionCode/versionName, the
+  download URL and the sha256.
+- If the key or the store tooling is not on this machine (fresh clone, another
+  developer), say so — do not invent a new key or ship an unsigned APK. Bumping
+  the version and pushing the code without publishing leaves the phone stale.
+- Re-uploading the same `versionCode` replaces that store entry, which is the
+  way to fix a bad build; it is not a new release.
+
 ## Do not break (CI gates)
 
 1. `cargo test --release --workspace` — includes the streaming replay test and
@@ -688,7 +721,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
     `--no-default-features` CLI builds must keep working, and
     `cargo test -p wheezper --features sync` gates the transport.
     Release artifacts are built with `--features sync`.
-12. Phase 2 budget (manual, reference machine):
+12. Android changes ship a bumped, release-signed APK to the APK store
+   (`scripts/publish-android.sh`, see "Android: every change ends with a store
+   publish"); the store listing showing the new `versionCode` is the receipt.
+13. Phase 2 budget (manual, reference machine):
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
    must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s. Run it with
    `CHANNELS=1` too (loopback-only, the single-channel setup): measured
