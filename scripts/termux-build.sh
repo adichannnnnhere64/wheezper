@@ -22,7 +22,9 @@ work="${HOME}/wheezper"
 echo "== copying sources to $work"
 mkdir -p "$work"
 cd "$src"
-tar cf - Cargo.toml Cargo.lock build.rs src vendor llm-worker bench/fixtures | tar xf - -C "$work"
+# proto + server are workspace members: cargo resolves the whole manifest even
+# when only the CLI is built.
+tar cf - Cargo.toml Cargo.lock build.rs src vendor llm-worker proto server bench/fixtures | tar xf - -C "$work"
 cd "$work"
 
 echo "== packages"
@@ -54,7 +56,9 @@ fi
 
 echo
 echo "== build"
-cargo build --release --no-default-features
+# -p wheezper: the workspace also holds the gRPC server, which is not a Termux
+# build target (and would drag tokio/sqlx into a phone build).
+cargo build --release --no-default-features -p wheezper
 ls -la target/release/wheezper
 ./target/release/wheezper --version
 
