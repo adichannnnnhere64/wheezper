@@ -125,10 +125,10 @@ fun MeetingsScreen(
         NewMeetingDialog(
             settings = state.settings,
             onDismiss = { creating = false },
-            onCreate = { title, aiHelp, model, token, cloud, everyLine ->
+            onCreate = { title, aiHelp, model, token, cloud, everyLine, context, instructions ->
                 creating = false
                 vm.saveAssistantSettings(model, token, cloud, everyLine)
-                vm.createSession(title, aiHelp)
+                vm.createSession(title, aiHelp, context, instructions)
             },
         )
     }
@@ -317,10 +317,14 @@ private fun NewMeetingDialog(
         token: String,
         cloud: Boolean,
         everyLine: Boolean,
+        aiContext: String,
+        aiInstructions: String,
     ) -> Unit,
 ) {
     var title by rememberSaveable { mutableStateOf("") }
     var aiHelp by rememberSaveable { mutableStateOf(false) }
+    var aiContext by rememberSaveable { mutableStateOf("") }
+    var aiInstructions by rememberSaveable { mutableStateOf("") }
     var everyLine by rememberSaveable { mutableStateOf(settings.assistantEveryLine) }
     var model by rememberSaveable { mutableStateOf(settings.assistantModel) }
     var token by rememberSaveable { mutableStateOf(settings.assistantToken) }
@@ -343,6 +347,20 @@ private fun NewMeetingDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
 
+                // Prompt context, not a transcript field: what the session is
+                // about goes into every assistant prompt so the answers fit.
+                OutlinedTextField(
+                    value = aiContext,
+                    onValueChange = { aiContext = it },
+                    label = { Text("What is this about? (optional)") },
+                    placeholder = {
+                        Text("Senior Java backend interview; the team runs Spring Boot and Kubernetes.")
+                    },
+                    minLines = 2,
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -361,6 +379,17 @@ private fun NewMeetingDialog(
                 }
 
                 if (aiHelp) {
+                    OutlinedTextField(
+                        value = aiInstructions,
+                        onValueChange = { aiInstructions = it },
+                        label = { Text("Answer guidance (optional)") },
+                        placeholder = {
+                            Text("First person, one sentence. Correct my grammar.")
+                        },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                     Text("Answer", style = MaterialTheme.typography.labelMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(
@@ -450,7 +479,18 @@ private fun NewMeetingDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onCreate(title, aiHelp, model, token, cloud, everyLine) },
+                onClick = {
+                    onCreate(
+                        title,
+                        aiHelp,
+                        model,
+                        token,
+                        cloud,
+                        everyLine,
+                        aiContext,
+                        aiInstructions,
+                    )
+                },
             ) {
                 Text("Create")
             }

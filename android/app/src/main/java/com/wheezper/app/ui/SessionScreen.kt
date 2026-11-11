@@ -61,6 +61,7 @@ import com.wheezper.app.Connection
 import com.wheezper.app.MainViewModel
 import com.wheezper.app.UiState
 import com.wheezper.app.data.MeetingRepository
+import com.wheezper.v1.Session
 import com.wheezper.v1.TranscriptEvent
 
 @Composable
@@ -72,6 +73,7 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
     // chrome and collapses into one row so the notes get the height.
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var helpOpen by rememberSaveable { mutableStateOf(false) }
+    var briefOpen by rememberSaveable { mutableStateOf(false) }
     var serverOpen by rememberSaveable { mutableStateOf(false) }
 
     val query = state.transcriptQuery.trim().lowercase()
@@ -166,6 +168,9 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
                 answers = state.answers.values,
                 helpOpen = helpOpen,
                 onHelp = { helpOpen = !helpOpen },
+                hasBrief = session.aiContext.isNotBlank() || session.aiInstructions.isNotBlank(),
+                briefOpen = briefOpen,
+                onBrief = { briefOpen = !briefOpen },
             )
 
             if (searchOpen) {
@@ -182,6 +187,12 @@ fun SessionScreen(state: UiState, vm: MainViewModel) {
 
             if (session.aiHelp && !completed && helpOpen) {
                 AiHelpPanel(state) { everyLine -> vm.setAssistantEveryLine(everyLine) }
+            }
+
+            if (briefOpen) {
+                BriefPanel(session) { context, instructions ->
+                    vm.saveGuidance(context, instructions)
+                }
             }
 
             state.laptopCommand?.let { command ->
@@ -319,6 +330,9 @@ private fun SessionChrome(
     answers: Collection<AiAnswer>,
     helpOpen: Boolean,
     onHelp: () -> Unit,
+    hasBrief: Boolean,
+    briefOpen: Boolean,
+    onBrief: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -340,6 +354,13 @@ private fun SessionChrome(
         } else {
             Spacer(Modifier.weight(1f))
         }
+        ChromeChip(
+            // A dot marks a saved brief so an empty assistant answer is not
+            // mistaken for "the model ignored the context I wrote".
+            label = if (hasBrief) "Brief ·" else "Brief",
+            active = briefOpen,
+            onClick = onBrief,
+        )
         if (aiHelp) {
             val thinking = answers.count { it.streaming }
             val label = when {
@@ -475,6 +496,67 @@ private suspend fun LazyListState.scrollToBlockEnd(index: Int, animate: Boolean)
         (info.viewportEndOffset - info.afterContentPadding)
     if (overflow <= 0) return
     if (animate) animateScrollBy(overflow.toFloat()) else scrollBy(overflow.toFloat())
+}
+
+/**
+ * The meeting brief: what this session is about and how the assistant should
+ * answer. Both are prompt text the server stores with the session, so every
+ * question — auto-answered or from the sheet — carries them. Saved on demand,
+ * because the useful brief is usually written after the first question.
+ */
+@Composable
+private fun BriefPanel(session: Session, onSave: (String, String) -> Unit) {
+    var context by rememberSaveable(session.aiContext, session.aiInstructions) {
+        mutableStateOf(session.aiContext)
+    }
+    var instructions by rememberSaveable(session.aiContext, session.aiInstructions) {
+        mutableStateOf(session.aiInstructions)
+    }
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = context,
+                onValueChange = { context = it },
+                label = { Text("What is this about?") },
+                placeholder = {
+                    Text("Senior Java backend interview; the team runs Spring Boot and Kubernetes.")
+                },
+                minLines = 2,
+                maxLines = 5,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = instructions,
+                onValueChange = { instructions = it },
+                label = { Text("Answer guidance") },
+                placeholder = { Text("First person, one sentence. Correct my grammar.") },
+                minLines = 2,
+                maxLines = 4,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                TextButton(onClick = { onSave(context, instructions) }) { Text("Save brief") }
+                Text(
+                    "Applied to the next answer. The transcript is never changed.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
 }
 
 /**

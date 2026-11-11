@@ -113,8 +113,16 @@ impl AssistantService {
             context::Mode::for_session(session.ai_help),
             self.full_context(provider.cloud),
         );
-        let ctx = context::build(&self.transcripts, session_id, &session.title, &question, budget)
-            .await?;
+        let ctx = context::build(
+            &self.transcripts,
+            session_id,
+            &session.title,
+            &session.ai_context,
+            &session.ai_instructions,
+            &question,
+            budget,
+        )
+        .await?;
         let (system, user) = ctx.messages(&question, budget);
         tracing::info!(
             session = %session_id,
@@ -166,8 +174,16 @@ impl AssistantService {
                 context::Mode::for_session(session.ai_help),
                 cloud,
             );
-            let ctx = context::build(&transcripts, session_id, &session.title, &question, budget)
-                .await?;
+            let ctx = context::build(
+                &transcripts,
+                session_id,
+                &session.title,
+                &session.ai_context,
+                &session.ai_instructions,
+                &question,
+                budget,
+            )
+            .await?;
             let (system, user) = ctx.messages(&question, budget);
             tracing::info!(
                 session = %session_id,

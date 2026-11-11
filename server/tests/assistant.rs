@@ -430,3 +430,89 @@ async fn answers_are_anchored_to_their_row_and_become_model_context() {
     );
     server.stop().await;
 }
+
+/// The per-session brief ("what this interview is about") and the answer
+/// guidance the user typed must reach the model — and must be editable
+/// mid-meeting, because the useful brief is written after the first question.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_brief_and_guidance_reach_the_prompt() {
+    use wheezper_proto::session_service_client::SessionServiceClient;
+
+    let Some(db) = database_url() else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let mock = mock_ollama(vec!["I have five years with Spring Boot."], false).await;
+    let Some(server) = TestServer::start_with(db, mock.url.clone()).await else {
+        eprintln!("{}", skip_reason());
+        return;
+    };
+    let channel = server.channel().await;
+    let device = pair(&channel, "phone").await;
+    let (session_id, _) = create_session_with_ai(&channel, &device, "Interview", true).await;
+
+    let updated = SessionServiceClient::new(channel.clone())
+        .update_session_guidance(request(
+            proto::UpdateSessionGuidanceRequest {
+                session_id: session_id.clone(),
+                ai_context: "Senior Java backend interview; the team runs Spring Boot on \
+                             Kubernetes and cares about transactions."
+                    .into(),
+                ai_instructions: "Answer in the first person, one sentence, and correct my \
+                                  grammar in your answer."
+                    .into(),
+            },
+            &device,
+        ))
+        .await
+        .expect("update guidance")
+        .into_inner();
+    assert!(updated.ai_context.contains("Spring Boot"));
+    assert!(updated.ai_instructions.contains("correct my grammar"));
+
+    AssistantServiceClient::new(channel.clone())
+        .ask_question(request(
+            proto::AskQuestionRequest {
+                session_id: session_id.clone(),
+                question: "How much Spring experience do you have?".into(),
+                ..Default::default()
+            },
+            &device,
+        ))
+        .await
+        .expect("ask question");
+
+    let bodies = mock.bodies();
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("Senior Java backend interview"),
+        "the session brief is missing from the prompt: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("correct my grammar"),
+        "the answer guidance is missing from the prompt: {}",
+        bodies[0]
+    );
+    assert!(
+        bodies[0].contains("Follow it where it does not conflict with the rules above"),
+        "guidance must not override the prompt's own rules: {}",
+        bodies[0]
+    );
+
+    // The brief is a prompt field, never a transcript row.
+    let sync = TranscriptServiceClient::new(channel)
+        .sync_transcripts(request(
+            proto::SyncTranscriptsRequest {
+                session_id,
+                from_sequence: 0,
+                limit: 50,
+            },
+            &device,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(sync.events.is_empty());
+    server.stop().await;
+}

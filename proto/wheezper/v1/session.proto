@@ -31,6 +31,15 @@ message Session {
   // questions as committed lines arrive. Stored so every viewer agrees about
   // whether this meeting is an interview-assist session.
   bool ai_help = 8;
+  // What this meeting/interview is about, written by the user. It is carried
+  // into every assistant prompt as plain context (the role, the stack, the
+  // names that matter) so answers fit the session instead of the generic
+  // transcript-only default. Never a place for facts about the candidate that
+  // the answer may then invent — those still come from the knowledgebase.
+  string ai_context = 9;
+  // Extra guidance for the assistant's answer (tone, length, "correct my
+  // grammar"). Applied after the built-in rules, which always win.
+  string ai_instructions = 10;
 }
 
 message CreateSessionRequest {
@@ -38,6 +47,17 @@ message CreateSessionRequest {
   // Request automatic AI answers for this session (the phone drives them; the
   // server only stores the flag and answers AskQuestion calls).
   bool ai_help = 2;
+  // Optional context and answer guidance; see `Session.ai_context`.
+  string ai_context = 3;
+  string ai_instructions = 4;
+}
+
+message UpdateSessionGuidanceRequest {
+  string session_id = 1;
+  // Both replace what the session holds ("" clears it). The live screen edits
+  // these mid-meeting: the brief is usually written after the first question.
+  string ai_context = 2;
+  string ai_instructions = 3;
 }
 
 message CreateSessionResponse {
@@ -75,6 +95,9 @@ message EndSessionResponse {
 service SessionService {
   // Requires a paired device token.
   rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+  // Replace the session's AI context/guidance (device token; the phone owns
+  // the brief). Returns the updated session.
+  rpc UpdateSessionGuidance(UpdateSessionGuidanceRequest) returns (Session);
   rpc GetSession(GetSessionRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc StartSession(StartSessionRequest) returns (Session);

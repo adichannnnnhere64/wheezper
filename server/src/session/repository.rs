@@ -16,12 +16,16 @@ pub struct SessionRow {
     pub created_at: DateTime<Utc>,
     pub transcript_count: i64,
     pub ai_help: bool,
+    /// What the session is about, as prompt context (may be empty).
+    pub ai_context: String,
+    /// Extra answer guidance (may be empty).
+    pub ai_instructions: String,
 }
 
 const SELECT_SESSION: &str = r#"
 SELECT s.id, s.title, s.status, s.started_at, s.ended_at, s.created_at,
        (SELECT count(*) FROM transcript_entries t WHERE t.session_id = s.id) AS transcript_count,
-       s.ai_help
+       s.ai_help, s.ai_context, s.ai_instructions
 FROM sessions s
 "#;
 
@@ -30,18 +34,44 @@ pub async fn create(
     title: &str,
     token_hash: &str,
     ai_help: bool,
+    ai_context: &str,
+    ai_instructions: &str,
 ) -> Result<SessionRow> {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO sessions (id, title, status, token_hash, ai_help)
-         VALUES ($1, $2, 'created', $3, $4)",
+        "INSERT INTO sessions (id, title, status, token_hash, ai_help, ai_context, ai_instructions)
+         VALUES ($1, $2, 'created', $3, $4, $5, $6)",
     )
     .bind(id)
     .bind(title)
     .bind(token_hash)
     .bind(ai_help)
+    .bind(ai_context)
+    .bind(ai_instructions)
     .execute(pool)
     .await?;
+    get(pool, id).await?.ok_or(Error::NotFound)
+}
+
+/// Replace the session's brief. Both fields are replaced, so an empty string
+/// clears it; the phone sends what the user sees in the box.
+pub async fn update_guidance(
+    pool: &PgPool,
+    id: Uuid,
+    ai_context: &str,
+    ai_instructions: &str,
+) -> Result<SessionRow> {
+    let result = sqlx::query(
+        "UPDATE sessions SET ai_context = $2, ai_instructions = $3 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(ai_context)
+    .bind(ai_instructions)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
     get(pool, id).await?.ok_or(Error::NotFound)
 }
 

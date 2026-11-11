@@ -126,7 +126,11 @@ async fn main() -> Result<()> {
             let token = device_token(&token)?;
             let response = proto::session_service_client::SessionServiceClient::new(channel)
                 .create_session(with_token(
-                    proto::CreateSessionRequest { title, ai_help },
+                    proto::CreateSessionRequest {
+                        title,
+                        ai_help,
+                        ..Default::default()
+                    },
                     token,
                 ))
                 .await?

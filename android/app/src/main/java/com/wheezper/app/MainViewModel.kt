@@ -255,13 +255,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         drainAutoQueue()
     }
 
-    fun createSession(title: String, aiHelp: Boolean = false) {
+    fun createSession(
+        title: String,
+        aiHelp: Boolean = false,
+        aiContext: String = "",
+        aiInstructions: String = "",
+    ) {
         val repo = repository ?: return
         val settings = _state.value.settings
         viewModelScope.launch {
             _state.update { it.copy(busy = true, error = null, notice = null) }
             runCatching {
-                repo.createSession(title.trim().ifBlank { "Untitled meeting" }, aiHelp)
+                repo.createSession(
+                    title.trim().ifBlank { "Untitled meeting" },
+                    aiHelp,
+                    aiContext.trim(),
+                    aiInstructions.trim(),
+                )
             }
                 .onSuccess { response ->
                     val session = response.session
@@ -285,6 +295,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     refresh()
                     openSession(session)
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(busy = false, error = friendly(error)) }
+                }
+        }
+    }
+
+    /**
+     * Save the meeting brief (what it is about) and the answer guidance from
+     * the live screen. Both are prompt text for the assistant; the transcript
+     * is untouched. The server bounds them, so an error here is shown as-is.
+     */
+    fun saveGuidance(aiContext: String, aiInstructions: String) {
+        val repo = repository ?: return
+        val session = _state.value.openSession ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(busy = true, error = null) }
+            runCatching {
+                repo.updateGuidance(session.id, aiContext.trim(), aiInstructions.trim())
+            }
+                .onSuccess { updated ->
+                    _state.update {
+                        it.copy(
+                            busy = false,
+                            openSession = if (it.openSession?.id == updated.id) updated else it.openSession,
+                            notice = "AI brief saved.",
+                        )
+                    }
                 }
                 .onFailure { error ->
                     _state.update { it.copy(busy = false, error = friendly(error)) }

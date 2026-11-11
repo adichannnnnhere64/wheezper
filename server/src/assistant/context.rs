@@ -28,6 +28,10 @@ const CLOUD_CONTEXT_CHARS: usize = 48_000;
 const MAX_EARLIER_CHARS: usize = 2_000;
 /// Cap on the "what you already said" block (previous Q&A pairs).
 const MAX_PREVIOUS_CHARS: usize = 8_000;
+/// The user's session brief and answer guidance are prefilled on every request,
+/// so they are bounded here as well as at the RPC edge.
+const MAX_BRIEF_CHARS: usize = 2_000;
+const MAX_INSTRUCTIONS_CHARS: usize = 600;
 
 #[derive(Clone, Debug)]
 pub struct ContextEntry {
@@ -85,6 +89,10 @@ pub struct PreviousAnswer {
 pub struct MeetingContext {
     pub session_id: Uuid,
     pub title: String,
+    /// What the user wrote this meeting is about (may be empty).
+    pub context: String,
+    /// Answer guidance the user asked for (may be empty).
+    pub instructions: String,
     pub recent: Vec<ContextEntry>,
     pub earlier: Vec<ContextEntry>,
     pub previous: Vec<PreviousAnswer>,
@@ -118,6 +126,16 @@ impl MeetingContext {
         let mode = budget.mode;
         let mut user = String::new();
         user.push_str(&format!("Meeting: {}\n", self.title));
+
+        // The brief is the user's own words about what this session is. It is
+        // context, never evidence: the prompt still refuses to claim anything
+        // that is not in the transcript (meeting) or the knowledgebase
+        // (interview personal facts).
+        if !self.context.trim().is_empty() {
+            user.push_str("What this session is about (written by the user):\n");
+            user.push_str(self.context.trim());
+            user.push_str("\n\n");
+        }
 
         // Answers already given are part of the assistant's memory: a question
         // asked twice, or a follow-up to one of our own answers, must not get
@@ -168,7 +186,7 @@ impl MeetingContext {
                               in the transcript. Keep answers under 120 words and lead with the direct \
                               answer."
                     .to_string();
-                (system, user)
+                (with_guidance(system, &self.instructions), user)
             }
             Mode::Interview => {
                 user.push_str("\nThe interviewer just said: ");
@@ -183,14 +201,13 @@ impl MeetingContext {
                               prefer it. Never invent personal facts, employers, dates or experience \
                               that are not in the transcript."
                     .to_string();
-                (system, user)
+                (with_guidance(system, &self.instructions), user)
             }
         }
     }
 }
 
-fn render_entries(entries: &[ContextEntry], max_chars: usize) -> String {
-    let mut lines: Vec<String> = entries
+fn render_entries(entries: &[ContextEntry], max_chars: usize) -> String {    let mut lines: Vec<String> = entries
         .iter()
         .map(|e| {
             let time = e.started_at.format("%H:%M:%S");
@@ -229,6 +246,8 @@ pub async fn build(
     transcripts: &TranscriptService,
     session_id: Uuid,
     title: &str,
+    context: &str,
+    instructions: &str,
     question: &str,
     budget: Budget,
 ) -> crate::error::Result<MeetingContext> {
@@ -267,11 +286,37 @@ pub async fn build(
     Ok(MeetingContext {
         session_id,
         title: title.to_string(),
+        context: bounded(context, MAX_BRIEF_CHARS),
+        instructions: bounded(instructions, MAX_INSTRUCTIONS_CHARS),
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
         previous,
         total_entries,
     })
+}
+
+/// Append the user's own answer guidance to a mode's system prompt. The rules
+/// above it stay authoritative: guidance can ask for a tone, a length or a
+/// grammar correction, it cannot license inventing meeting content.
+fn with_guidance(mut system: String, instructions: &str) -> String {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        return system;
+    }
+    system.push_str("\n\nThe user asked for this answer guidance: ");
+    system.push_str(instructions);
+    system.push_str("\nFollow it where it does not conflict with the rules above.");
+    system
+}
+
+/// Trim and cap a user-written prompt field (defence in depth: the session
+/// service already rejects over-long briefs).
+fn bounded(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
 }
 
 /// Render earlier answers, keeping the newest pairs when over budget.
@@ -348,11 +393,34 @@ mod tests {
         MeetingContext {
             session_id: Uuid::nil(),
             title: "Review".into(),
+            context: String::new(),
+            instructions: String::new(),
             recent,
             earlier,
             previous: Vec::new(),
             total_entries: total,
         }
+    }
+
+    #[test]
+    fn brief_is_context_and_guidance_appends_to_the_system_prompt() {
+        let mut meeting = ctx(vec![entry(1, "them", "hello")], Vec::new(), 1);
+        meeting.context = "Senior Java backend interview".into();
+        meeting.instructions = "one sentence, correct my grammar".into();
+        let (system, user) =
+            meeting.messages("what is a record?", Budget::for_request(Mode::Interview, false));
+        assert!(user.contains("What this session is about"));
+        assert!(user.contains("Senior Java backend interview"));
+        assert!(system.contains("one sentence, correct my grammar"));
+        // Guidance must never outrank the mode's own rules.
+        assert!(system.contains("Follow it where it does not conflict with the rules above"));
+
+        // Without a brief the prompt is the Phase-3 one, byte for byte.
+        let plain = ctx(vec![entry(1, "them", "hello")], Vec::new(), 1);
+        let (plain_system, plain_user) =
+            plain.messages("what is a record?", Budget::for_request(Mode::Interview, false));
+        assert!(!plain_user.contains("What this session is about"));
+        assert!(!plain_system.contains("answer guidance"));
     }
 
     #[test]

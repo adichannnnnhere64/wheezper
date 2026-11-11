@@ -276,6 +276,19 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   meeting plus its earlier answers. Sessions without `ai_help` keep the strict
   transcript-only prompt. Both paths still persist the answer separately and
   never touch `transcript_entries`.
+- **Per-session brief: `ai_context` + `ai_instructions`.** The phone writes what
+  the meeting/interview is about (role, stack, names) and how the assistant
+  should answer (tone, length, "correct my grammar"). `ai_context` goes into
+  the **user** message as "what this session is about"; `ai_instructions` is
+  appended to the **system** prompt *after* the mode's rules, with "follow it
+  where it does not conflict with the rules above" — guidance may steer style,
+  it can never license inventing meeting content or personal facts. Both are
+  bounded at the RPC edge (2,000 / 600 chars, an explicit error, never a
+  silent truncation) and again in `context::build`; both are prompt text, never
+  a transcript row. `CreateSession` sets them and `UpdateSessionGuidance`
+  replaces them (device token only — a session publish token may read its
+  session, not edit it), because the useful brief is written after the first
+  question.
 - TLS clients: `https://` endpoints must set
   `ClientTlsConfig::new().with_webpki_roots()` (crate feature
   `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
@@ -735,9 +748,10 @@ scripts/publish-android.sh
 9. `cargo test -p wheezper-server` with a PostgreSQL
    (`WHEEZPER_TEST_DATABASE_URL`): pairing, idempotent publish, sequence order,
    restart durability, stream resume, assistant context/immutability, `ai_help`
-   round-trip, anchored answers + `ListAnswers` + previous-answer context, and
+   round-trip, anchored answers + `ListAnswers` + previous-answer context,
    per-request model/token overrides (the mock asserts the `Authorization`
-   header and the model body field).
+   header and the model body field), and the session brief/guidance reaching
+   the prompt after `UpdateSessionGuidance`.
 9b. `cargo test --release update::` — version comparison, asset/hash parsing,
    and a real in-place update against a local HTTP server (the old binary must
    survive a checksum mismatch). `wheezper --update` on a current build must

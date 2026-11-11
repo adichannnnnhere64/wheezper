@@ -181,6 +181,7 @@ pub async fn create_session_with_ai(
             wheezper_proto::CreateSessionRequest {
                 title: title.to_string(),
                 ai_help,
+                ..Default::default()
             },
             device_token,
         ))

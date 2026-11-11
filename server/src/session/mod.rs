@@ -24,6 +24,8 @@ impl From<SessionRow> for proto::Session {
             created_at: Some(crate::time::proto_ts(row.created_at)),
             transcript_count: row.transcript_count,
             ai_help: row.ai_help,
+            ai_context: row.ai_context,
+            ai_instructions: row.ai_instructions,
         }
     }
 }

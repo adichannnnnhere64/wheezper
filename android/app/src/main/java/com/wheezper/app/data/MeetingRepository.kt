@@ -99,11 +99,36 @@ class MeetingRepository(private val client: WheezperClient) : AutoCloseable {
             com.wheezper.v1.GetSessionRequest.newBuilder().setSessionId(sessionId).build()
         )
 
-    suspend fun createSession(title: String, aiHelp: Boolean): CreateSessionResponse =
+    suspend fun createSession(
+        title: String,
+        aiHelp: Boolean,
+        aiContext: String = "",
+        aiInstructions: String = "",
+    ): CreateSessionResponse =
         client.sessions.createSession(
             com.wheezper.v1.CreateSessionRequest.newBuilder()
                 .setTitle(title)
                 .setAiHelp(aiHelp)
+                .setAiContext(aiContext)
+                .setAiInstructions(aiInstructions)
+                .build()
+        )
+
+    /**
+     * Replace the session's AI brief (what it is about) and answer guidance.
+     * Editable mid-meeting: the useful brief is usually written after the first
+     * question has been heard.
+     */
+    suspend fun updateGuidance(
+        sessionId: String,
+        aiContext: String,
+        aiInstructions: String,
+    ): Session =
+        client.sessions.updateSessionGuidance(
+            com.wheezper.v1.UpdateSessionGuidanceRequest.newBuilder()
+                .setSessionId(sessionId)
+                .setAiContext(aiContext)
+                .setAiInstructions(aiInstructions)
                 .build()
         )
 
