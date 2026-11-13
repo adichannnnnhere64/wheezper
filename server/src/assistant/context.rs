@@ -607,6 +607,35 @@ mod tests {
     }
 
     #[test]
+    fn facts_outrank_the_model_and_about_me() {
+        let mut meeting = ctx(Vec::new(), Vec::new(), 0);
+        meeting.about_me = "I like Rust.".into();
+        meeting.facts = Some(ProfileFacts {
+            summary: "Six years of Spring Boot; notice period 30 days; expects 95,000 PHP.".into(),
+        });
+        let (_, user) = meeting.messages("How much notice do you need?", Budget::for_request(Mode::Interview, true));
+        assert!(user.contains("notice period 30 days"));
+        assert!(
+            user.contains("these are the truth"),
+            "the record must be framed as authoritative: {user}"
+        );
+        // Facts come before the user's own blurb, so the model reads them first.
+        let facts_at = user.find("notice period 30 days").unwrap();
+        let about_at = user.find("I like Rust.").unwrap();
+        assert!(facts_at < about_at);
+    }
+
+    #[test]
+    fn no_facts_means_no_facts_block() {
+        let mut meeting = ctx(Vec::new(), Vec::new(), 0);
+        meeting.facts = Some(ProfileFacts {
+            summary: "   ".into(),
+        });
+        let (_, user) = meeting.messages("Anything?", Budget::for_request(Mode::Interview, true));
+        assert!(!user.contains("these are the truth"));
+    }
+
+    #[test]
     fn a_prepared_answer_needs_two_matching_terms() {
         let mut meeting = ctx(Vec::new(), Vec::new(), 0);
         meeting.cards = vec![
