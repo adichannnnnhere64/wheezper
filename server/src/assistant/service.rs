@@ -142,6 +142,31 @@ impl AssistantService {
         )
         .await?;
         let (system, user) = ctx.messages(&question, budget);
+
+        // A prepared answer needs no model: it is the user's own wording, and
+        // asking a small model to "rephrase" it is how numbers and names drift.
+        if let Some(card) = ctx.card_answer() {
+            let answer = card.answer.trim().to_string();
+            tracing::info!(session = %session_id, hits = card.hits, "answered from a prepared card");
+            persist(
+                &self.transcripts,
+                session_id,
+                &question,
+                &answer,
+                "card",
+                "curated",
+                answered_sequence,
+            )
+            .await;
+            return Ok(Answer {
+                text: answer,
+                provider: "card".to_string(),
+                model: "curated".to_string(),
+                prompt_tokens: 0,
+                output_tokens: 0,
+            });
+        }
+
         tracing::info!(
             session = %session_id,
             entries = ctx.total_entries,
@@ -214,6 +239,28 @@ impl AssistantService {
             )
             .await?;
             let (system, user) = ctx.messages(&question, budget);
+
+            if let Some(card) = ctx.card_answer() {
+                let answer = card.answer.trim().to_string();
+                tracing::info!(session = %session_id, hits = card.hits, "answered from a prepared card");
+                if let Err(err) = repository::save(
+                    &pool,
+                    session_id,
+                    &question,
+                    &answer,
+                    "card",
+                    "curated",
+                    answered_sequence,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "could not persist assistant message");
+                }
+                yield StreamEvent { text: answer, usage: None };
+                yield StreamEvent { text: String::new(), usage: None };
+                return;
+            }
+
             tracing::info!(
                 session = %session_id,
                 entries = ctx.total_entries,

@@ -104,6 +104,8 @@ pub struct MeetingContext {
     pub instructions: String,
     /// "About me" text the user typed in Settings; background for answers.
     pub about_me: String,
+    /// Curated answers a person wrote for this user, best match first.
+    pub cards: Vec<AnswerCard>,
     pub recent: Vec<ContextEntry>,
     pub earlier: Vec<ContextEntry>,
     pub previous: Vec<PreviousAnswer>,
@@ -116,6 +118,26 @@ pub struct MeetingContext {
 /// facts. A session created with `ai_help` is an interview: the far side asks a
 /// question and the user needs an answer to say out loud, so general technical
 /// knowledge is allowed (personal claims still are not).
+///
+/// A curated answer card is a question/answer pair a person wrote deliberately.
+/// It outranks the model: when it matches on at least `MIN_CARD_HITS` distinct
+/// terms the server answers from the card and never asks the model, because the
+/// small models here invent details (a Kubernetes question once pulled a
+/// Kubernetes-with-Helm answer out of thin air, and a Gemini card for a
+/// Kubernetes question).
+#[derive(Clone, Debug)]
+pub struct AnswerCard {
+    pub question: String,
+    pub answer: String,
+    pub rank: f64,
+    /// How many distinct query terms the card actually matched. A single generic
+    /// term ("experience") is not a match.
+    pub hits: i64,
+}
+
+/// Distinct matched terms a card needs before it may answer on its own.
+pub const MIN_CARD_HITS: i64 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Meeting,
@@ -156,6 +178,19 @@ impl MeetingContext {
                           preferences; never invent anything beyond it):\n");
             user.push_str(self.about_me.trim());
             user.push_str("\n\n");
+        }
+
+        // Curated answers beat the model. They are the user's own prepared
+        // wording, so they are quoted as-is rather than paraphrased.
+        if !self.cards.is_empty() {
+            user.push_str(
+                "Prepared answers for questions like this one, written by the user \
+                 (prefer the closest one and keep its facts and numbers; do not \
+                 mix details from different prepared answers):\n",
+            );
+            for card in &self.cards {
+                user.push_str(&format!("Q: {}\nA: {}\n\n", card.question.trim(), card.answer.trim()));
+            }
         }
 
         // Answers already given are part of the assistant's memory: a question
@@ -243,6 +278,16 @@ impl MeetingContext {
             }
         }
     }
+
+    /// The best prepared answer, when it matched strongly enough to stand alone.
+    ///
+    /// One hit is not a match: a card on "Kubernetes experience" would otherwise
+    /// answer every question that happens to contain "experience".
+    pub fn card_answer(&self) -> Option<&AnswerCard> {
+        self.cards
+            .iter()
+            .find(|card| card.hits >= MIN_CARD_HITS && !card.answer.trim().is_empty())
+    }
 }
 
 fn render_entries(entries: &[ContextEntry], max_chars: usize) -> String {
@@ -323,17 +368,70 @@ pub async fn build(
         Vec::new()
     };
 
+    let cards = load_cards(transcripts.pool(), question).await.unwrap_or_default();
+
     Ok(MeetingContext {
         session_id,
         title: title.to_string(),
         context: bounded(context, MAX_BRIEF_CHARS),
         instructions: bounded(instructions, MAX_INSTRUCTIONS_CHARS),
         about_me: bounded(about_me, MAX_ABOUT_ME_CHARS),
+        cards,
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
         previous,
         total_entries,
     })
+}
+
+/// Up to four curated answer cards matching the question.
+///
+/// `plainto_tsquery` ANDs every lexeme, which matches nothing for a spoken
+/// question ("can you just name me the components of an agent..."). Build an OR
+/// query from the question's lexemes instead and rank by ts_rank.
+///
+/// The OR uses `to_tsquery('simple', ...)` because tsvector_to_array returns
+/// stems already; `to_tsquery('english', ...)` stems them a second time
+/// ('databas' -> 'databa') and silently matches nothing.
+///
+/// Only shared cards (`profile_id IS NULL`) are considered until devices are
+/// linked to profiles again; per-profile cards stay in the table for that.
+async fn load_cards(pool: &sqlx::PgPool, question: &str) -> crate::error::Result<Vec<AnswerCard>> {
+    let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
+        "WITH q AS ( \
+             SELECT to_tsvector('english', $1) AS qv \
+         ), terms AS ( \
+             SELECT unnest(tsvector_to_array(qv)) AS term FROM q \
+         ), q2 AS ( \
+             SELECT to_tsquery('simple', string_agg(term, ' | ')) AS tsq FROM terms \
+         ) \
+         SELECT c.question, c.answer, \
+                ts_rank(to_tsvector('english', c.question || ' ' || c.keywords || ' ' || c.answer), \
+                        q2.tsq)::float8 AS rank, \
+                (SELECT count(*) FROM terms t \
+                  WHERE to_tsvector('english', c.keywords) \
+                        @@ to_tsquery('simple', t.term))::bigint AS hits \
+         FROM answer_cards c, q2 \
+         WHERE q2.tsq IS NOT NULL \
+           AND c.profile_id IS NULL \
+           AND to_tsvector('english', c.question || ' ' || c.keywords || ' ' || c.answer) \
+               @@ q2.tsq \
+           AND to_tsvector('english', c.keywords) @@ q2.tsq \
+         ORDER BY hits DESC, rank DESC \
+         LIMIT 4",
+    )
+    .bind(question)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(question, answer, rank, hits)| AnswerCard {
+            question,
+            answer,
+            rank,
+            hits,
+        })
+        .collect())
 }
 
 /// Append the user's own answer guidance to a mode's system prompt. The rules
@@ -441,11 +539,61 @@ mod tests {
             context: String::new(),
             instructions: String::new(),
             about_me: String::new(),
+            cards: Vec::new(),
             recent,
             earlier,
             previous: Vec::new(),
             total_entries: total,
         }
+    }
+
+    #[test]
+    fn a_prepared_answer_needs_two_matching_terms() {
+        let mut meeting = ctx(Vec::new(), Vec::new(), 0);
+        meeting.cards = vec![
+            AnswerCard {
+                question: "What does an agent loop look like?".into(),
+                answer: "perceive, plan, act, reflect".into(),
+                rank: 0.9,
+                hits: 3,
+            },
+            AnswerCard {
+                question: "Kubernetes experience".into(),
+                answer: "three years of Helm charts".into(),
+                rank: 0.1,
+                hits: 1,
+            },
+        ];
+        let best = meeting.card_answer().expect("the strong card answers");
+        assert_eq!(best.answer, "perceive, plan, act, reflect");
+    }
+
+    #[test]
+    fn one_generic_term_is_not_a_match() {
+        let mut meeting = ctx(Vec::new(), Vec::new(), 0);
+        meeting.cards = vec![AnswerCard {
+            question: "Kubernetes experience".into(),
+            answer: "three years of Helm charts".into(),
+            rank: 0.1,
+            hits: 1,
+        }];
+        assert!(meeting.card_answer().is_none());
+    }
+
+    #[test]
+    fn prepared_answers_are_in_the_prompt_but_never_the_system_prompt() {
+        let mut meeting = ctx(vec![entry(1, "them", "name the parts of an agent")], Vec::new(), 1);
+        meeting.cards = vec![AnswerCard {
+            question: "Components of an agent".into(),
+            answer: "model, tools, memory and an orchestration loop".into(),
+            rank: 0.8,
+            hits: 2,
+        }];
+        let (system, user) =
+            meeting.messages("name the parts of an agent", Budget::for_request(Mode::Interview, false));
+        assert!(user.contains("Prepared answers"));
+        assert!(user.contains("model, tools, memory and an orchestration loop"));
+        assert!(!system.contains("orchestration loop"));
     }
 
     #[test]
