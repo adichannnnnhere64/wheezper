@@ -59,6 +59,13 @@ struct Cli {
     #[arg(short, long)]
     notes: Option<PathBuf>,
 
+    /// Echo finished lines to stdout (and the on-stop summary). Off by
+    /// default: the notepad file is the only place text goes. Without it the
+    /// live preview tier is never spawned either, so its cores go to the
+    /// notes tier, which then keeps up better.
+    #[arg(long)]
+    print: bool,
+
     /// Known-song mode: reference lyrics (one line per lyric line). The
     /// decoder is prompted with the lyrics around a moving cursor, so it
     /// follows the real words instead of guessing at mumbled/sung ones.
@@ -370,6 +377,8 @@ struct Engine {
     lyrics: Option<LyricFollower>,
     /// --lyric-sync: output the reference words where the ASR aligns.
     lyric_sync: bool,
+    /// --print: echo finished lines to stdout (off: notes file only).
+    echo: bool,
 }
 
 impl Engine {
@@ -549,6 +558,7 @@ impl Engine {
             polish: cli.polish && cli.ollama.is_some(),
             lyrics,
             lyric_sync: cli.lyric_sync,
+            echo: cli.print,
         })
     }
 
@@ -722,10 +732,12 @@ impl Engine {
                         self.lyric_remember(&text);
                         *tail = Some(last_words(&text, 12));
                         self.clear_partial();
-                        let ts = Local::now().format("%H:%M:%S");
-                        match label {
-                            Some(ch) => println!("[{ts}] {ch}: {text}"),
-                            None => println!("[{ts}] {text}"),
+                        if self.echo {
+                            let ts = Local::now().format("%H:%M:%S");
+                            match label {
+                                Some(ch) => println!("[{ts}] {ch}: {text}"),
+                                None => println!("[{ts}] {text}"),
+                            }
                         }
                         if let Some(hook) = &self.webhook {
                             hook.post(label.unwrap_or(""), &text);
@@ -872,6 +884,11 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("no_vad").and_then(|v| v.as_bool())
     {
         cli.no_vad = v;
+    }
+    if !given("print")
+        && let Some(v) = get("print").and_then(|v| v.as_bool())
+    {
+        cli.print = v;
     }
 }
 
@@ -1129,7 +1146,9 @@ fn summarize_session(engine: &mut Engine) -> Result<()> {
         return Ok(());
     }
     engine.notepad.append_block("Summary", &summary)?;
-    println!("\n{summary}");
+    if engine.echo {
+        println!("\n{summary}");
+    }
     eprintln!("wheezper: summary appended to notepad.");
     Ok(())
 }
@@ -1385,7 +1404,9 @@ fn run_stream(
     // Piped output spawns no preview tier, so the final tier is alone and
     // keeps the Phase-1 thread share.
     let cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
-    let live = std::io::stdout().is_terminal();
+    // No echo means nobody is watching, so the preview tier is not spawned:
+    // its cores go to the notes tier, which then keeps up better.
+    let live = cli.print && std::io::stdout().is_terminal();
     let (threads, prov_threads) = match cli.threads {
         n if n > 0 => (n, (n / 2).max(1)),
         _ if live => stream::split_threads(cores, 0),
@@ -1511,9 +1532,11 @@ fn run_stream(
                     view.hide();
                     engine.lyric_advance(&d.text);
                     engine.lyric_remember(&d.text);
-                    print_open(sc, !was_open);
-                    print!("{} ", d.text.trim());
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if cli.print {
+                        print_open(sc, !was_open);
+                        print!("{} ", d.text.trim());
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
                 }
             }
         }
@@ -1552,7 +1575,7 @@ fn run_stream(
                 && let Some(line) = sc.take_line()
             {
                 view.hide();
-                commit_line(&mut engine, sc.label, &line);
+                commit_line(&mut engine, sc.label, &line, cli.print);
             }
         }
 
@@ -1616,9 +1639,11 @@ fn run_stream(
                         view.hide();
                         engine.lyric_advance(&d.text);
                         engine.lyric_remember(&d.text);
-                        print_open(sc, !was_open);
-                        print!("{} ", d.text.trim());
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        if cli.print {
+                            print_open(sc, !was_open);
+                            print!("{} ", d.text.trim());
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
                     }
                 }
             }
@@ -1643,7 +1668,7 @@ fn run_stream(
             && let Some(line) = sc.take_line()
         {
             view.hide();
-            commit_line(&mut engine, sc.label, &line);
+            commit_line(&mut engine, sc.label, &line, cli.print);
         }
     }
     for p in provs.iter_mut() {
@@ -1658,8 +1683,10 @@ fn run_stream(
 
 /// Write one completed streaming line to the notepad + webhook and close
 /// the terminal line.
-fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str) {
-    println!();
+fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str, echo: bool) {
+    if echo {
+        println!();
+    }
     if let Err(e) = engine.append_line(label, line) {
         eprintln!("wheezper: notepad write failed: {e:#}");
     }

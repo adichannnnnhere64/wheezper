@@ -55,6 +55,10 @@ wheezper --source dual --webhook https://example.com/hook
 # rolling live captions while you speak (stdout only; pairs well with --model tiny)
 wheezper --partial --model tiny
 
+# default: nothing is printed, the notes file is the only output. To watch
+# lines scroll by on a terminal again:
+wheezper --source dual --print
+
 # domain-specific terms, products, or meeting topic (opt-in whisper bias)
 wheezper --prompt "Engineering planning for the Atlas migration"
 
@@ -95,8 +99,18 @@ wheezper --source loopback --no-vad --max-segment 40 --model turbo \
          --lyrics song.lyrics --lyric-sync
 ```
 
-Output (default `notes/YYYY-MM-DD.md`, flushed per line) is also echoed to
-stdout, so you can watch it live:
+Output (default `notes/YYYY-MM-DD.md`, flushed per line) is **not printed by
+default** — the file is the only place transcript text goes. Add `--print` to
+echo each line to stdout as it is written:
+
+```bash
+$ wheezper                      # silent: notes only
+$ wheezper --print              # also echoes every line to the terminal
+```
+
+Without `--print` the live preview tier is never spawned either (nobody is
+looking), so its cores go to the notes tier: `--print` costs nothing in the
+notes, it is purely a display choice.
 
 ```markdown
 # Meeting — 2026-11-07 19:06
@@ -169,8 +183,10 @@ Live capture runs **two tiers per channel** (Phase 2):
   only this text reaches the notes file. It runs a few seconds behind — you
   already read the words in the preview — so the notes stay clean.
 
-When stdout is piped (not a terminal) the preview tier is skipped entirely and
-wheezper behaves like the single-tier Phase-1 engine.
+When stdout is piped (not a terminal) **or `--print` is not passed**, the
+preview tier is skipped entirely and wheezper behaves like the single-tier
+Phase-1 engine — which is also the default, since the notes file is the only
+output unless you ask to watch it.
 
 `stream::tests::measures_commit_latency` feeds real audio in real time and
 stamps every committed word, so "word finished being spoken → word on screen"
@@ -452,6 +468,7 @@ source = "dual"      # mic | loopback | dual | stdin
 model = "base"       # tiny | base | small | medium | turbo | /path/to/model.bin
 language = "en"     # or "auto"
 partial = true       # rolling live captions (stdout only)
+# print = true       # echo finished lines to stdout (default: notes file only)
 webhook = "http://192.168.1.20:8399/hook"
 notes = "notes/work.md"
 # prompt = "Engineering planning for the Atlas migration"
@@ -570,6 +587,7 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
     --webhook <URL>   POST each utterance to this URL as JSON
     --partial         rolling live captions of the utterance in progress
+    --print           echo finished lines to stdout (default: notes file only)
     --prompt <TEXT>   domain/context hint (first 40 words; opt-in)
     --with-agent <SPEC>  async annotations: PROVIDER:MODEL[:BUDGET]
     --knowledgebase <FILE>  interview answers from this file (with --with-agent)

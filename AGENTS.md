@@ -68,8 +68,9 @@ the final tier on the 6-core reference box; the notes lead time halved).
   reach stdout in ~0.2–0.4 s and are revised in place as the final tier
   confirms (single bottom-line rewrite, `▍`-prefixed, ANSI CR+clear — no
   cursor-up, which breaks on wrapped rows). Display-only: never written to
-  the notes. Only spawned when stdout is a TTY — piped output skips the
-  worker and behaves exactly like Phase 1.
+  the notes. Only spawned when `--print` is passed *and* stdout is a TTY — the
+  default (no `--print`) is silent, notes-file-only, and skips the worker
+  exactly like piped output does; the freed cores go to the final tier.
 - **Preview model** (`--preview-model`, default `auto`): the preview may load
   `base` while the notes stay on `small`/`medium`/`turbo` (one pass 0.10 s vs
   0.20–0.40 s measured). Both workers still share the core budget by
@@ -785,7 +786,10 @@ scripts/publish-android.sh
    (no llama.cpp, no Android NDK; `libaaudio` only exists on real devices).
 7. Notes format stays parseable: `- [HH:MM:SS] **label:** text`, one line per
    utterance, flushed per line. Only **final-tier** text may reach the notes;
-   provisional preview text is stdout-only (TTY).
+   provisional preview text is stdout-only (TTY). **stdout is silent by
+   default**: transcript text is echoed only with `--print` (which also gates
+   the preview tier and the on-stop summary echo). Do not print transcript
+   text unconditionally again — the notes file is the only default output.
 8. Do not commit song audio or lyrics: `*.opus`, `*.lyrics`, `*.lyeics`,
    `bench/out/` are gitignored and not redistributable.
 9. `cargo test -p wheezper-server` with a PostgreSQL

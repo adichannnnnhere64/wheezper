@@ -30,6 +30,7 @@ ollama-model = "gemma3:1b"  # Google's gemma3 (default) | .gguf path
 # polish = true              # LLM-clean each utterance (latency!)
 
 # partial = true            # rolling live captions (stdout only)
+# print = true              # echo finished lines to stdout (default: notes only)
 # rate = 16000              # stdin only
 # threshold-db = -40        # silence gate
 # min-silence = 0.6         # seconds of silence that close a segment
