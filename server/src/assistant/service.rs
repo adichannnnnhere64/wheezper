@@ -121,6 +121,7 @@ impl AssistantService {
         question: String,
         answered_sequence: Option<i64>,
         options: &AssistantOptions,
+        profile_id: Option<Uuid>,
     ) -> Result<Answer> {
         let provider = self.resolve(options)?;
         let question = validate(question)?;
@@ -138,6 +139,7 @@ impl AssistantService {
             &session.ai_instructions,
             &options.about_me,
             &question,
+            profile_id,
             budget,
         )
         .await?;
@@ -210,6 +212,7 @@ impl AssistantService {
         detail: bool,
         think: Think,
         about_me: String,
+        profile_id: Option<Uuid>,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
         let transcripts = self.transcripts.clone();
         let sessions = self.sessions.clone();
@@ -235,6 +238,7 @@ impl AssistantService {
                 &session.ai_instructions,
                 &about_me,
                 &question,
+                profile_id,
                 budget,
             )
             .await?;

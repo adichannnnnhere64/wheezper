@@ -104,6 +104,11 @@ pub struct MeetingContext {
     pub instructions: String,
     /// "About me" text the user typed in Settings; background for answers.
     pub about_me: String,
+    /// What a person (the operator, or whoever invited this device) recorded
+    /// about the user in their profile. Unlike `about_me`, this is written for
+    /// the user, not by them, and is the authority on personal facts — salary,
+    /// notice period, years of experience — that a model must not invent.
+    pub facts: Option<ProfileFacts>,
     /// Curated answers a person wrote for this user, best match first.
     pub cards: Vec<AnswerCard>,
     pub recent: Vec<ContextEntry>,
@@ -138,6 +143,16 @@ pub struct AnswerCard {
 /// Distinct matched terms a card needs before it may answer on its own.
 pub const MIN_CARD_HITS: i64 = 2;
 
+/// A curated record of the person this device answers for.
+///
+/// Written by the operator (or whoever created the invite), never by the model.
+/// Kept separate from the transcript on purpose: it is the authority on personal
+/// facts, so an answer that contradicts it is wrong even when it sounds fluent.
+#[derive(Clone, Debug)]
+pub struct ProfileFacts {
+    pub summary: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Meeting,
@@ -167,6 +182,19 @@ impl MeetingContext {
         if !self.context.trim().is_empty() {
             user.push_str("What this session is about (written by the user):\n");
             user.push_str(self.context.trim());
+            user.push_str("\n\n");
+        }
+
+        // The profile record outranks both the model and "about me": a person
+        // curated these facts (salary, notice period, years), so an answer that
+        // contradicts them is wrong no matter how fluent it sounds.
+        if let Some(facts) = self.facts.as_ref().filter(|f| !f.summary.trim().is_empty()) {
+            user.push_str(
+                "Facts recorded about me by the person who set this up (these are the \
+                 truth — use these numbers and claims exactly, and never state a \
+                 personal fact that is not in here):\n",
+            );
+            user.push_str(facts.summary.trim());
             user.push_str("\n\n");
         }
 
@@ -334,6 +362,7 @@ pub async fn build(
     instructions: &str,
     about_me: &str,
     question: &str,
+    profile_id: Option<Uuid>,
     budget: Budget,
 ) -> crate::error::Result<MeetingContext> {
     let recent = transcripts.recent(session_id, budget.recent_entries).await?;
@@ -368,7 +397,10 @@ pub async fn build(
         Vec::new()
     };
 
-    let cards = load_cards(transcripts.pool(), question).await.unwrap_or_default();
+    let cards = load_cards(transcripts.pool(), question, profile_id)
+        .await
+        .unwrap_or_default();
+    let facts = load_facts(transcripts.pool(), profile_id).await.unwrap_or_default();
 
     Ok(MeetingContext {
         session_id,
@@ -376,6 +408,7 @@ pub async fn build(
         context: bounded(context, MAX_BRIEF_CHARS),
         instructions: bounded(instructions, MAX_INSTRUCTIONS_CHARS),
         about_me: bounded(about_me, MAX_ABOUT_ME_CHARS),
+        facts,
         cards,
         recent: recent.into_iter().map(to_entry).collect(),
         earlier: earlier.into_iter().map(to_entry).collect(),
@@ -394,9 +427,12 @@ pub async fn build(
 /// stems already; `to_tsquery('english', ...)` stems them a second time
 /// ('databas' -> 'databa') and silently matches nothing.
 ///
-/// Only shared cards (`profile_id IS NULL`) are considered until devices are
-/// linked to profiles again; per-profile cards stay in the table for that.
-async fn load_cards(pool: &sqlx::PgPool, question: &str) -> crate::error::Result<Vec<AnswerCard>> {
+/// Cards shared by everyone plus this device's own profile cards.
+async fn load_cards(
+    pool: &sqlx::PgPool,
+    question: &str,
+    profile_id: Option<Uuid>,
+) -> crate::error::Result<Vec<AnswerCard>> {
     let rows: Vec<(String, String, f64, i64)> = sqlx::query_as(
         "WITH q AS ( \
              SELECT to_tsvector('english', $1) AS qv \
@@ -413,7 +449,7 @@ async fn load_cards(pool: &sqlx::PgPool, question: &str) -> crate::error::Result
                         @@ to_tsquery('simple', t.term))::bigint AS hits \
          FROM answer_cards c, q2 \
          WHERE q2.tsq IS NOT NULL \
-           AND c.profile_id IS NULL \
+           AND (c.profile_id IS NULL OR c.profile_id = $2) \
            AND to_tsvector('english', c.question || ' ' || c.keywords || ' ' || c.answer) \
                @@ q2.tsq \
            AND to_tsvector('english', c.keywords) @@ q2.tsq \
@@ -421,6 +457,7 @@ async fn load_cards(pool: &sqlx::PgPool, question: &str) -> crate::error::Result
          LIMIT 4",
     )
     .bind(question)
+    .bind(profile_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -432,6 +469,27 @@ async fn load_cards(pool: &sqlx::PgPool, question: &str) -> crate::error::Result
             hits,
         })
         .collect())
+}
+
+/// The profile record this device answers for, when it has one.
+///
+/// A device paired before profiles existed has `profile_id = NULL` and simply
+/// gets no facts — the answer falls back to "about me" and the model.
+async fn load_facts(
+    pool: &sqlx::PgPool,
+    profile_id: Option<Uuid>,
+) -> crate::error::Result<Option<ProfileFacts>> {
+    let Some(profile_id) = profile_id else {
+        return Ok(None);
+    };
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT summary FROM profiles WHERE id = $1")
+            .bind(profile_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .filter(|(summary,)| !summary.trim().is_empty())
+        .map(|(summary,)| ProfileFacts { summary }))
 }
 
 /// Append the user's own answer guidance to a mode's system prompt. The rules
@@ -539,6 +597,7 @@ mod tests {
             context: String::new(),
             instructions: String::new(),
             about_me: String::new(),
+            facts: None,
             cards: Vec::new(),
             recent,
             earlier,

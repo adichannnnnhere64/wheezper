@@ -26,11 +26,13 @@ impl AssistantService for AssistantGrpc {
         &self,
         request: Request<proto::AskQuestionRequest>,
     ) -> Result<Response<proto::AskQuestionResponse>, Status> {
-        self.state
+        let principal = self
+            .state
             .auth
-            .authenticate_device(request.metadata())
+            .authenticate(request.metadata())
             .await
             .map_err(Status::from)?;
+        let profile_id = principal.profile_id();
         let req = request.into_inner();
         let session_id = parse_uuid(&req.session_id, "session_id").map_err(Status::from)?;
         let options = options(&req)?;
@@ -38,7 +40,7 @@ impl AssistantService for AssistantGrpc {
         let answer = self
             .state
             .assistant
-            .ask(session_id, req.question, sequence, &options)
+            .ask(session_id, req.question, sequence, &options, profile_id)
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::AskQuestionResponse {
@@ -54,11 +56,13 @@ impl AssistantService for AssistantGrpc {
         &self,
         request: Request<proto::AskQuestionRequest>,
     ) -> Result<Response<Self::StreamAnswerStream>, Status> {
-        self.state
+        let principal = self
+            .state
             .auth
-            .authenticate_device(request.metadata())
+            .authenticate(request.metadata())
             .await
             .map_err(Status::from)?;
+        let profile_id = principal.profile_id();
         let req = request.into_inner();
         let session_id = parse_uuid(&req.session_id, "session_id").map_err(Status::from)?;
 
@@ -81,6 +85,7 @@ impl AssistantService for AssistantGrpc {
             detail,
             think,
             about_me,
+            profile_id,
         );
 
         let stream = async_stream::try_stream! {
