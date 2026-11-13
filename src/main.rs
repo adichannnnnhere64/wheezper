@@ -11,7 +11,6 @@ mod segmenter;
 mod sink;
 mod stream;
 mod transcribe;
-mod update;
 mod vad;
 
 use anyhow::{Context, Result};
@@ -23,7 +22,7 @@ use dsp::{Framer, Resampler};
 use notepad::Notepad;
 use segmenter::Segmenter;
 use std::io::{IsTerminal, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use transcribe::Transcriber;
 use vad::Vad;
@@ -47,24 +46,9 @@ struct Cli {
     #[arg(short, long, env = "WHEEZPER_MODEL", default_value = "base")]
     model: String,
 
-    /// Model for the live preview tier (stdout only; notes stay on --model).
-    /// `auto` = keep --model when it is tiny/base, otherwise use base; `same`
-    /// = use --model for both tiers; anything else is resolved like --model.
-    /// A cheap preview model keeps every word on screen fast even when the
-    /// notes model is small/medium/turbo.
-    #[arg(long, env = "WHEEZPER_PREVIEW_MODEL", default_value = "auto", value_name = "MODEL")]
-    preview_model: String,
-
     /// Notepad output file [default: notes/YYYY-MM-DD.md]
     #[arg(short, long)]
     notes: Option<PathBuf>,
-
-    /// Echo finished lines to stdout (and the on-stop summary). Off by
-    /// default: the notepad file is the only place text goes. Without it the
-    /// live preview tier is never spawned either, so its cores go to the
-    /// notes tier, which then keeps up better.
-    #[arg(long)]
-    print: bool,
 
     /// Known-song mode: reference lyrics (one line per lyric line). The
     /// decoder is prompted with the lyrics around a moving cursor, so it
@@ -79,9 +63,7 @@ struct Cli {
     #[arg(long, requires = "lyrics")]
     lyric_sync: bool,
 
-    /// Whisper language code, "auto", or a list like "en,tl" for code-switched
-    /// speech (a list means auto-detect per window: whisper.cpp decodes one
-    /// language at a time)
+    /// Whisper language code, or "auto" to detect per segment
     #[arg(short, long, default_value = "auto")]
     language: String,
 
@@ -196,13 +178,6 @@ struct Cli {
     #[arg(long)]
     list_devices: bool,
 
-    /// Update this binary to the latest published release and exit. Downloads
-    /// the raw binary + SHA256SUMS from the GitHub release, verifies the hash
-    /// and replaces the running executable (on Windows the swap happens as the
-    /// process exits, because a running .exe is locked)
-    #[arg(long)]
-    update: bool,
-
     /// stdin input sample rate (Hz); stdin must be mono f32le
     #[arg(long, default_value_t = 16000)]
     rate: u32,
@@ -248,29 +223,6 @@ fn main() -> Result<()> {
     if let Some(cfg) = config::load(cli.config.as_deref())? {
         apply_config(&mut cli, &matches, &cfg.table);
         eprintln!("wheezper: config <- {}", cfg.path.display());
-    }
-
-    // `--lang en,tl`: whisper.cpp takes one language per window. A list means
-    // code-switched speech, so the only honest mapping is per-window auto
-    // detection; the AI answers are pinned to English by the server prompt.
-    if cli.language.contains(',') {
-        let list: Vec<&str> = cli
-            .language
-            .split(',')
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        if !list.is_empty() {
-            eprintln!(
-                "wheezper: lang={} (multi-language: whisper auto-detects per window; answers stay English)",
-                list.join(",")
-            );
-            cli.language = "auto".into();
-        }
-    }
-
-    if cli.update {
-        return update::run();
     }
 
     if cli.list_devices {
@@ -377,8 +329,6 @@ struct Engine {
     lyrics: Option<LyricFollower>,
     /// --lyric-sync: output the reference words where the ASR aligns.
     lyric_sync: bool,
-    /// --print: echo finished lines to stdout (off: notes file only).
-    echo: bool,
 }
 
 impl Engine {
@@ -558,7 +508,6 @@ impl Engine {
             polish: cli.polish && cli.ollama.is_some(),
             lyrics,
             lyric_sync: cli.lyric_sync,
-            echo: cli.print,
         })
     }
 
@@ -732,12 +681,10 @@ impl Engine {
                         self.lyric_remember(&text);
                         *tail = Some(last_words(&text, 12));
                         self.clear_partial();
-                        if self.echo {
-                            let ts = Local::now().format("%H:%M:%S");
-                            match label {
-                                Some(ch) => println!("[{ts}] {ch}: {text}"),
-                                None => println!("[{ts}] {text}"),
-                            }
+                        let ts = Local::now().format("%H:%M:%S");
+                        match label {
+                            Some(ch) => println!("[{ts}] {ch}: {text}"),
+                            None => println!("[{ts}] {text}"),
                         }
                         if let Some(hook) = &self.webhook {
                             hook.post(label.unwrap_or(""), &text);
@@ -761,11 +708,6 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("model").and_then(|v| v.as_str())
     {
         cli.model = v.to_string();
-    }
-    if !given("preview_model")
-        && let Some(v) = get("preview-model").or_else(|| get("preview_model")).and_then(|v| v.as_str())
-    {
-        cli.preview_model = v.to_string();
     }
     if !given("notes")
         && let Some(v) = get("notes").and_then(|v| v.as_str())
@@ -884,11 +826,6 @@ fn apply_config(cli: &mut Cli, matches: &ArgMatches, cfg: &toml::Table) {
         && let Some(v) = get("no_vad").and_then(|v| v.as_bool())
     {
         cli.no_vad = v;
-    }
-    if !given("print")
-        && let Some(v) = get("print").and_then(|v| v.as_bool())
-    {
-        cli.print = v;
     }
 }
 
@@ -1146,9 +1083,7 @@ fn summarize_session(engine: &mut Engine) -> Result<()> {
         return Ok(());
     }
     engine.notepad.append_block("Summary", &summary)?;
-    if engine.echo {
-        println!("\n{summary}");
-    }
+    println!("\n{summary}");
     eprintln!("wheezper: summary appended to notepad.");
     Ok(())
 }
@@ -1358,33 +1293,6 @@ impl LiveView {
     }
 }
 
-/// Pick the model for the live preview tier.
-///
-/// Preview text is display-only, so a smaller model than the notes model is not
-/// a quality regression: it puts complete words on screen sooner and frees CPU
-/// for the notes tier, which is the one that falls behind when the notes model
-/// is `small`/`medium`/`turbo` (measured on the reference box: one provisional
-/// pass is 0.10 s on base vs 0.20-0.40 s on small).
-///
-/// `auto` keeps `--model` when it is already cheap (tiny/base, or an explicit
-/// path the user chose), otherwise it uses base. `same` opts out.
-fn resolve_preview_model(choice: &str, notes_arg: &str, notes_model: &Path) -> Result<PathBuf> {
-    let choice = choice.trim();
-    match choice.to_ascii_lowercase().as_str() {
-        "" | "same" => Ok(notes_model.to_path_buf()),
-        "auto" => {
-            let name = notes_arg.trim().to_ascii_lowercase();
-            if name == "tiny" || name == "base" || Path::new(notes_arg).exists() {
-                Ok(notes_model.to_path_buf())
-            } else {
-                models::resolve(Some("base")).context("resolving the preview model 'base'")
-            }
-        }
-        _ => models::resolve(Some(choice))
-            .with_context(|| format!("resolving preview model '{choice}'")),
-    }
-}
-
 /// Unified live loop, two tiers per channel. The final tier is the Phase-1
 /// engine — generous windows, words committed exactly once by timestamp,
 /// append-only, the only thing that reaches the notes. The provisional tier
@@ -1404,23 +1312,12 @@ fn run_stream(
     // Piped output spawns no preview tier, so the final tier is alone and
     // keeps the Phase-1 thread share.
     let cores = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
-    // No echo means nobody is watching, so the preview tier is not spawned:
-    // its cores go to the notes tier, which then keeps up better.
-    let live = cli.print && std::io::stdout().is_terminal();
+    let live = std::io::stdout().is_terminal();
     let (threads, prov_threads) = match cli.threads {
         n if n > 0 => (n, (n / 2).max(1)),
         _ if live => stream::split_threads(cores, 0),
         _ => (cores.min(4), 0),
     };
-    // Printed because "inference is not keeping up" is unfixable without
-    // knowing the split: the final tier is the one that loses notes, and a
-    // wide laptop left half its cores idle here before this was visible.
-    let preview = if prov_threads > 0 {
-        format!(" preview={prov_threads}")
-    } else {
-        String::new()
-    };
-    eprintln!("wheezper: stream: threads final={threads}{preview} of {cores} cores");
     let model_path = models::resolve(Some(&cli.model))
         .with_context(|| format!("resolving model '{}'", cli.model))?;
     let (tx, rx) = stream::spawn_worker(
@@ -1434,16 +1331,8 @@ fn run_stream(
     // live: piped output skips the extra worker (and its CPU) entirely and
     // behaves exactly like Phase 1
     let prov = if live {
-        let preview_path = resolve_preview_model(&cli.preview_model, &cli.model, &model_path)?;
-        if preview_path != model_path {
-            eprintln!(
-                "wheezper: stream: preview model={} (notes stay on {})",
-                preview_path.display(),
-                model_path.display()
-            );
-        }
         let (ptx, prx) = stream::spawn_worker(
-            &preview_path,
+            &model_path,
             &cli.language,
             prov_threads,
             !cli.no_vad,
@@ -1532,11 +1421,9 @@ fn run_stream(
                     view.hide();
                     engine.lyric_advance(&d.text);
                     engine.lyric_remember(&d.text);
-                    if cli.print {
-                        print_open(sc, !was_open);
-                        print!("{} ", d.text.trim());
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                    }
+                    print_open(sc, !was_open);
+                    print!("{} ", d.text.trim());
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
             }
         }
@@ -1575,7 +1462,7 @@ fn run_stream(
                 && let Some(line) = sc.take_line()
             {
                 view.hide();
-                commit_line(&mut engine, sc.label, &line, cli.print);
+                commit_line(&mut engine, sc.label, &line);
             }
         }
 
@@ -1639,11 +1526,9 @@ fn run_stream(
                         view.hide();
                         engine.lyric_advance(&d.text);
                         engine.lyric_remember(&d.text);
-                        if cli.print {
-                            print_open(sc, !was_open);
-                            print!("{} ", d.text.trim());
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                        }
+                        print_open(sc, !was_open);
+                        print!("{} ", d.text.trim());
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                 }
             }
@@ -1668,7 +1553,7 @@ fn run_stream(
             && let Some(line) = sc.take_line()
         {
             view.hide();
-            commit_line(&mut engine, sc.label, &line, cli.print);
+            commit_line(&mut engine, sc.label, &line);
         }
     }
     for p in provs.iter_mut() {
@@ -1683,10 +1568,8 @@ fn run_stream(
 
 /// Write one completed streaming line to the notepad + webhook and close
 /// the terminal line.
-fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str, echo: bool) {
-    if echo {
-        println!();
-    }
+fn commit_line(engine: &mut Engine, label: Option<&str>, line: &str) {
+    println!();
     if let Err(e) = engine.append_line(label, line) {
         eprintln!("wheezper: notepad write failed: {e:#}");
     }
@@ -1705,25 +1588,7 @@ fn warn_dropped(rx: &capture::AudioReceiver) {
 
 #[cfg(test)]
 mod phase3_tests {
-    use super::{combine_prompt, first_words, resolve_preview_model};
-    use std::path::Path;
-
-    #[test]
-    fn preview_model_auto_keeps_a_cheap_notes_model() {
-        let notes = Path::new("/models/ggml-base-q5_1.bin");
-        // tiny/base are cheap enough for the preview: no second model
-        for name in ["base", "tiny", "Cargo.toml"] {
-            assert_eq!(
-                resolve_preview_model("auto", name, notes).unwrap(),
-                notes,
-                "auto should keep the notes model for {name}"
-            );
-        }
-        // explicit opt-outs / choices never resolve the notes model name
-        for choice in ["same", ""] {
-            assert_eq!(resolve_preview_model(choice, "turbo", notes).unwrap(), notes);
-        }
-    }
+    use super::{combine_prompt, first_words};
 
     #[test]
     fn domain_prompt_is_bounded_and_keeps_local_context() {

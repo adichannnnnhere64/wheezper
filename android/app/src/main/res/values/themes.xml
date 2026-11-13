@@ -1,7 +1,0 @@
-<resources>
-    <style name="Theme.Wheezper" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#12141A</item>
-        <item name="android:navigationBarColor">#12141A</item>
-        <item name="android:windowLightStatusBar">false</item>
-    </style>
-</resources>

@@ -6,7 +6,7 @@ must not regress.
 
 **wheezper** is a single-binary CLI that listens to a meeting/call and writes a
 timestamped markdown transcript as it happens: local whisper.cpp inference, no
-cloud, no install, Linux / Windows / Android(Termux). Version `0.6.1`.
+cloud, no install, Linux / Windows / Android(Termux). Version `0.6.0`.
 
 ---
 
@@ -45,10 +45,8 @@ Evidence (measured, see "Baseline numbers"):
 ### Phase 2 — DONE (shipped). Two-tier streaming: 0.2–0.35 s on screen
 
 Baseline (measured, `CHANNELS=2`): median **4.23 s**, p90 5.13 s; single
-channel 2.60 s. Shipped result after the final-tier thread rebalance:
-provisional median **0.42 s**, p90 **0.77 s** dual-channel (single channel
-0.25 / 0.35) — inside the 0.5 s / 0.8 s budget (the preview lost a thread to
-the final tier on the 6-core reference box; the notes lead time halved).
+channel 2.60 s. Shipped result: provisional median **0.22–0.33 s**, p90
+**0.46–0.62 s** dual-channel — inside the 0.5 s / 0.8 s budget with margin.
 
 **Design.** Each channel runs two tiers (`src/stream.rs`):
 
@@ -58,24 +56,16 @@ the final tier on the 6-core reference box; the notes lead time halved).
   built only from this tier.** Its lag (~4 s single / ~7 s dual) is invisible:
   the preview already showed the words. Cadence, dedupe and the silence rule
   matter for accuracy — see the traps below.
-- **Provisional tier** = live-edge preview: tail windows ≤ 1.2 s
-  (`audio_ctx=60`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
-  `max_tokens=20`, and no rolling context. 1.2 s, not 0.8 s: the pass cost is
-  the same but a sub-second window decoded fragments ("(", "H", "P"); at
-  1.2 s the preview reads as words. It is prompt-free by default; an
+- **Provisional tier** = live-edge preview: tail windows ≤ 0.8 s
+  (`audio_ctx=40`, 20 ms/frame), one greedy decode (`temperature_inc=0`),
+  `max_tokens=6`, and no rolling context. It is prompt-free by default; an
   explicit Phase-3 domain hint is applied without continuity text. Passes cost
   ~0.10 s; words
   reach stdout in ~0.2–0.4 s and are revised in place as the final tier
   confirms (single bottom-line rewrite, `▍`-prefixed, ANSI CR+clear — no
   cursor-up, which breaks on wrapped rows). Display-only: never written to
-  the notes. Only spawned when `--print` is passed *and* stdout is a TTY — the
-  default (no `--print`) is silent, notes-file-only, and skips the worker
-  exactly like piped output does; the freed cores go to the final tier.
-- **Preview model** (`--preview-model`, default `auto`): the preview may load
-  `base` while the notes stay on `small`/`medium`/`turbo` (one pass 0.10 s vs
-  0.20–0.40 s measured). Both workers still share the core budget by
-  `split_threads`; `same` opts out. This is display-only, so it is not a notes
-  quality trade.
+  the notes. Only spawned when stdout is a TTY — piped output skips the
+  worker and behaves exactly like Phase 1.
 
 Acceptance (gated, run it after touching the streaming engine):
 
@@ -110,22 +100,13 @@ THREADS=4 nix-shell --run \
    windows decode to the 220-token cap, costing ~0.7–2.6 s per pass.
 4. **Thread budget decides the tail.** Two ggml workers oversubscribing the
    box spin-barrier convoy and double every pass: 4+4 measured p90 > 1 s.
-   `stream::split_threads` now gives the **final tier half the box** (capped
-   at 6) and the preview the rest (capped at 3), always leaving one core for
-   the capture/main loop. It used to give the final tier the leftovers
-   (1 thread on a 4-core box, 2 on 6, 3–4 on a 16-thread laptop) and that is
-   exactly what produced "inference is not keeping up": the final tier could
-   not decode faster than the audio arrived, its 30 s buffer filled, and
-   speech was dropped from the notes. On 6 cores the shipped split is
-   3 (final) + 2 (provisional) + 1: the final pass dropped from 3.1–3.5 s to
-   2.0 s and the preview still measured 0.42 s median / 0.77 s p90 dual
-   (inside 0.5 / 0.8, but with less margin than the old 3-thread preview).
-   The preview gains nothing past 3 threads (a 4th only adds jitter:
-   measured 0.17 s/0.30 s p90 vs 0.15/0.31 at 3), so everything above that
-   goes to the final tier. When stdout is piped the final tier is alone and
-   keeps the old full share (`cores.min(4)`). The split is printed at
-   startup (`stream: threads final=N preview=M of C cores`) — without it the
-   "not keeping up" warning is undiagnosable.
+   The shipped split on 6 cores is 2 (final) + 3 (provisional) + 1 (capture/
+   main loop) — see `stream::split_threads`. On ≥9-thread laptops the
+   provisional tier is capped at 3 threads (a 4th only adds jitter: measured
+   0.17 s/0.30 s p90 vs 0.15/0.31 at 3) and the spare budget goes to the
+   final tier (up to 4), because low-frequency laptop cores make the final
+   pass the backlog risk, not the preview. When stdout is piped the final
+   tier is alone and gets the old full share (`cores.min(4)`).
 5. Append-only whisper cannot reach 0.5 s at acceptable quality: stable
    decode needs ≥ ~2 s of window, and every fast small-window config
    measured (0.86–1.22 s median) commits permanent garbage ("Esk not",
@@ -251,58 +232,15 @@ it, a plain `cargo build` stays local-only so no user pays for tonic/tokio):
   publishing). Device tokens read/list/use the assistant; a session token may
   only publish to, and read, its own session.
 - Assistant (`assistant/`): recent 250 lines + up to 20 older full-text matches
-  (`to_tsvector`) + the meeting's previous answers, bounded by
-  `context::Budget` (local interview: last 12 lines / 12k chars; cloud: whole
-  meeting / 48k chars), Ollama `stream: true` NDJSON, `think: false`. Answers
-  are persisted separately and never touch transcript rows.
-  `AskQuestion`/`StreamAnswer` accept a per-request model, provider token,
-  backend (`DEFAULT` = configured URL, `OLLAMA_CLOUD` = fixed
-  `https://ollama.com/api`) and `answered_sequence`; the token is never stored
-  or logged. `ListAnswers` returns the stored answers anchored to their
-  transcript rows (`DISTINCT ON (answered_sequence)`, newest wins).
+  (`to_tsvector`), ~12k-char prompt bound, Ollama `stream: true` NDJSON,
+  `think: false`. Answers are persisted separately and never touch transcript
+  rows. `AskQuestion`/`StreamAnswer` accept a per-request model, provider token
+  and backend (`DEFAULT` = configured URL, `OLLAMA_CLOUD` = fixed
+  `https://ollama.com/api`); the token is never stored or logged.
 - AI help: `CreateSession(ai_help)` stores a per-session flag; the Android app
   watches committed lines and auto-calls `StreamAnswer` (questions-only default
-  or every far-side line). Each answer is **rendered under the transcript row
-  it answers** and stays there (a fast interviewer's next question gets its own
-  card); questions queue in a small bounded FIFO with one request in flight.
-  Answers are also persisted in `assistant_messages` (with
-  `answered_sequence`), never in the transcript, and the app calls
-  `ListAnswers` on open so the rows get their answers back after a restart.
-- `ai_help` also selects the **interview prompt** (`assistant::context::Mode`):
-  the far side asked a question, so the answer is one 10-20 word sentence spoken
-  as the candidate, allowed to use general technical knowledge (never invented
-  personal facts). `context::Budget::for_request(mode, cloud)` decides how much
-  is sent: a small local model answering an interview still gets only the last
-  12 lines (prefill is the latency there), while a cloud backend gets the whole
-  meeting plus its earlier answers. Sessions without `ai_help` keep the strict
-  transcript-only prompt. Both paths still persist the answer separately and
-  never touch `transcript_entries`.
-- **Per-session brief: `ai_context` + `ai_instructions`.** The phone writes what
-  the meeting/interview is about (role, stack, names) and how the assistant
-  should answer (tone, length, "correct my grammar"). `ai_context` goes into
-  the **user** message as "what this session is about"; `ai_instructions` is
-  appended to the **system** prompt *after* the mode's rules, with "follow it
-  where it does not conflict with the rules above" — guidance may steer style,
-  it can never license inventing meeting content or personal facts. Both are
-  bounded at the RPC edge (2,000 / 600 chars, an explicit error, never a
-  silent truncation) and again in `context::build`; both are prompt text, never
-  a transcript row. `CreateSession` sets them and `UpdateSessionGuidance`
-  replaces them (device token only — a session publish token may read its
-  session, not edit it), because the useful brief is written after the first
-  question.
-- **Notes are emailed on `EndSession`, best-effort.** SMTP via
-  `WHEEZPER_EMAIL_TO/_FROM/_USER/_PASS/_RELAY` (STARTTLS by default), in a
-  detached task after the RPC returns: a slow relay must never fail ending a
-  meeting that is already stored, and a send failure logs a warning. Off unless
-  configured — a transcript is private and the default is silence. A knowledge
-  base was tried here and removed: every answer paid 0.13-1.15 s of local
-  embedding on the same Ollama queue, so the user's own words belong in
-  Settings, not in a retrieval hop.
-- TLS clients: `https://` endpoints must set
-  `ClientTlsConfig::new().with_webpki_roots()` (crate feature
-  `tls-webpki-roots`). A plain `Channel::from_shared` against https fails with
-  "Connecting to HTTPS without TLS enabled", which is easy to misread as a
-  server or firewall problem.
+  or every far-side line). Answers appear in the app panel and in
+  `assistant_messages`, never in the transcript.
 
 **Android** (`android/`, Kotlin + Compose, no audio/no model): dashboard,
 live transcript (auto-reconnect + `SyncTranscripts` gap recovery), history with
@@ -344,8 +282,6 @@ src/models.rs      model resolution + first-use download (whisper, VAD, GGUF)
 src/notepad.rs     markdown sink; src/sink.rs webhook sink; src/config.rs TOML
 src/remote.rs      optional gRPC session sink (feature `sync`): fsync'd pending
                    queue + background retry/reconnect/ack worker
-src/update.rs      `--update`: GitHub release → raw binary + SHA256SUMS →
-                   verified in-place replacement of the running executable
 proto/             versioned gRPC contract (wheezper.v1) + Rust codegen
 server/            wheezper-server: sessions/transcripts/assistant over
                    PostgreSQL (SQLx), migrations/, wheezper-admin operator CLI
@@ -358,9 +294,7 @@ bench/             score.py (WER/CER, transcript-only/VTT-aware), run.sh,
                    RESULTS.md, fixtures, song sweep, score tests
 scripts/           build-linux.sh, build-windows.sh, vmtest-{linux,capture,
                    windows}, bench-interview-dummy.sh, test-cloud-agent.sh,
-                   termux-build.sh, test-server.sh, test-session-sync.sh,
-                   publish-android.sh (signed release APK -> APK store),
-                   deploy-image.sh (build locally, ship the image over ssh)
+                   termux-build.sh, test-server.sh, test-session-sync.sh
 .github/workflows/ ci.yml (gates), termux.yml, release.yml
 PLAN.md            original design intent (partly diverged; this file wins)
 ```
@@ -423,8 +357,8 @@ Phase 2 two-tier (live TTY, `WZ_ACCEPT=1` gate):
 
 | tier | 1 ch | 2 ch | pass cost |
 |---|---|---|---|
-| provisional (on screen) | 0.23 s median / 0.32 s p90 | 0.42 s / 0.77 s (2 threads) | 0.10 s |
-| final (into notes) | 4.1 s median | 6.9 s median / 7.2 s p90 | 2.0 s (3 threads) |
+| provisional (on screen) | 0.22 s median / 0.46 s p90 | 0.22–0.33 s / 0.46–0.62 s | 0.10 s |
+| final (into notes) | 4.1 s median | 7.3 s median / 8.5 s p90 | 3.1–3.5 s (2 threads) |
 
 Live-capture accuracy (`scripts/vmtest-capture.sh`, base, three replays of the
 fixture through a virtual sink, notes scored against the tripled reference):
@@ -519,10 +453,6 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   fires on `new_audio_s` of new audio (or a full window when behind), silence
   is dropped without a pass (`speech_in_buf`), and "the utterance ended" is
   measured on the channel timeline (`speech_ended`, from `last_speech_s`).
-  Do **not** add a silence-triggered final pass to save latency: a window that
-  ends in 2 s of padding silence makes whisper loop the previous words
-  (measured with `GAP_MS=2000`: 39.4 % accuracy with an idle-triggered pass vs
-  78.8 % without it). The preview may be revised; the notes may not.
 - **The streaming tier does not use the continuity prompt** (`prompt_tail` is
   empty unless `WZ_PROMPT_WORDS=n`). A 12-word tail is text the decoder tries to
   *complete*: measured 2 words committed for 3 s of audio, plus invented
@@ -544,36 +474,11 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   handler re-reads the backlog.
 - **Credentials are hashes in the database and bearer tokens on the wire.**
   Never log a token or a pairing code; `EndSession` revokes the session token by
-  rotating its hash. A pairing code that was not configured is generated once
-  and kept in a `0600` file (`WHEEZPER_PAIRING_CODE_FILE`), and
-  `wheezper-server --print-pairing-code` writes it to the operator's terminal —
-  startup logging only says which of the two sources is in use. TLS is required for anything non-local; the Android release
+  rotating its hash. TLS is required for anything non-local; the Android release
   build refuses cleartext, the debug build allows it for LAN testing.
 - **`sqlx::migrate!` is runtime**, so `cargo build`/`cargo test` need no
   database. Integration tests skip (with a printed skip line) when
   `WHEEZPER_TEST_DATABASE_URL` is unset — CI sets it via a postgres service.
-- **Self-update installs verified bytes or nothing.** `--update` reads the
-  release's raw binary asset (`wheezper-linux-amd64` /
-  `wheezper-windows-x64.exe`, published by `release.yml` next to the archives)
-  plus `SHA256SUMS` from *the same release*, and refuses to install when the
-  asset or its hash is missing. The names are a table in `src/update.rs`; the
-  release job must keep publishing them (`fail_on_unmatched_files: false` is
-  there for the optional Android APK, not for the binaries). Windows cannot
-  replace a running `.exe`: the new binary is staged as `wheezper.exe.new` and
-  a detached `cmd` moves it into place after the process exits — do not
-  "simplify" that into a rename, it fails with a sharing violation.
-- **Android updates go through Google Play, not a downloaded APK.** The app
-  ships as a Play custom/private app with Play App Signing, so the installed
-  APK is signed by *Google's* key: a self-downloaded APK signed with the upload
-  key is a different signer and the installer rejects it
-  (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`). The "Check for updates" button
-  therefore uses Play's in-app update API
-  (`com.google.android.play:app-update`), and a sideloaded/debug build reports
-  "not from Play" instead. Do not re-add a `REQUEST_INSTALL_PACKAGES` download
-  path. CI builds the signed APK + AAB (`wheezper-android-release` artifact)
-  only when the `ANDROID_KEYSTORE_B64` / `_PASSWORD` / `_KEY_ALIAS` /
-  `_KEY_PASSWORD` secrets exist, and `versionCode` must be bumped for every
-  Play upload — Play refuses a repeated one.
 - **One server instance per database.** The live fan-out is an in-process
   `broadcast` channel; scaling out needs a shared bus (LISTEN/NOTIFY) first.
 - **Edit `proto/wheezper/v1/*.proto`, never the Android mirror.** Gradle's
@@ -585,96 +490,10 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   The assistant endpoint is an allowlist (`DEFAULT` = operator URL,
   `OLLAMA_CLOUD` = fixed ollama.com URL); never let a client supply a URL.
 - **AI help triggers on committed lines only, and the phone drives it.** The
-  server stores `sessions.ai_help` and uses it to pick the interview prompt;
-  there is no server-side auto-answer worker. Answers are anchored to the
-  transcript sequence they answer and render under that row, so they are never
-  overwritten by the next question; pending questions are a bounded FIFO (4)
-  with one request in flight. The candidate's own (`me`) lines are never
-  answered. Do not trigger answers from provisional preview text. The first
-  catch-up after opening the app answers the backlog of a **live** session
-  (joining an interview late should not leave its questions unanswered) but
-  never a completed one, and the bounded queue means only the newest few of a
-  long backlog are answered. The live screen's AI HELP chip toggles the mode
-  ("questions only" / "every far-side line"); switching it on also queues the
-  far-side rows already on screen that have no answer yet, because the
-  watermark skipped them while the mode was off. The layout is one visual
-  block per line (row + its answer under a rail) — never a single shared
-  answer slot, which a fast interviewer would keep overwriting.
-- **"Questions only" is a generous heuristic, not a `?` check.** Committed
-  lines are lowercase and usually lose their punctuation, and an interviewer
-  often buries the question behind a setup sentence ("consequences of being a
-  non-deterministic number four, explain temperature and top p how would you
-  get a reliable structured output"). `QuestionHeuristic` answers when the line
-  has a `?`, starts with a question word after a filler ("and what about…"),
-  contains an asking phrase anywhere, or is a long turn addressed at "you".
-  A false positive costs one wasted answer; a false negative costs the answer
-  the user needed — do not tighten it back to a prefix match, and keep
-  `QuestionHeuristicTest` honest with the real transcript shapes.
-- **Double-tap is the manual escape hatch for the heuristic.** `askAboutEvent`
-  answers *that* row on demand: a far-side line that reads like a statement (a
-  heuristic false negative) or an existing answer the user wants expanded. It
-  runs on `manualJob`, not the automatic FIFO, so it never waits behind a
-  queue; it drops a queued automatic answer for the same row so the manual one
-  is not overwritten; and it sets `explain_more`, which switches the
-  *interview* system prompt to 2-4 sentences of concrete detail instead of the
-  automatic 10-20 word line. The rules about inventing facts are identical in
-  both shapes — detail is a length change, not a licence.
-- **The phone's display order, token counter and thinking level are per-app
-  state, not session data.** "Newest" reverses the list only (answers stay
-  anchored to their sequence number, and the follow logic scrolls to item 0
-  instead of the block end). The token counter sums provider-reported
-  `prompt_tokens + output_tokens` from each done chunk — a provider that reports
-  nothing leaves it at 0 rather than showing an invented number. Thinking is
-  `off|low|medium|high`, sent per request and validated server-side into
-  Ollama's `think`; it stays off by default because reasoning tokens cost
-  latency in an interview. "About me" (Settings, max 2,000 chars) is sent as
-  prompt context on every request — the user's own words, capped like the
-  session brief, and still not a licence to invent experience.
-- **The transcript follows the newest block by its end, not its top.**
-  `scrollToBlockEnd` scrolls to the item and then by the overflow, because
-  `animateScrollToItem` alone parks a tall block at the top of the viewport
-  and leaves the answer that just arrived below the fold — the answer looked
-  like it never appeared. The list keeps following while the answer streams,
-  stops the moment the user drags, and re-arms only once they drag back to the
-  end — a growing answer must never yank someone who scrolled up. The
-  connection, AI-help and search blocks are collapsed into one chrome row of
-  chips for the same reason: the notes are the screen.
-- **`--lang en,tl` means auto-detect, not two models.** whisper.cpp decodes one
-  language per window; a comma list is code-switched speech, so the CLI maps it
-  to per-window `auto` and says so once at startup. The *answers* are pinned to
-  English by the server prompt ("always answer in English, even when the
-  transcript is Tagalog or mixed") — the transcript stays in whatever was said.
-- **The preview is tokens, not words.** `ProvisionalTier::preview` concatenates
-  whisper's raw tokens: a rare word is several tokens and continuation tokens
-  carry no leading space. Inserting a space per token rendered "Khan" as
-  "Kh an" on screen (the committed line always concatenated correctly).
-- **The Ollama Cloud URL already ends in `/api`.** `OLLAMA_CLOUD_URL` is
-  `https://ollama.com/api`, so request paths must be joined to `api_base(url)`
-  (which strips a trailing `/api`), never `format!("{url}/api/chat")` — that
-  posts to `/api/api/chat` and ollama.com answers `404 path "/api/api/chat"
-  not found`, which reads like a wrong model name. Both providers (`src/llm.rs`
-  and `server/src/assistant/provider.rs`) normalise; keep it that way.
-- **`ai_help` is interview mode, not a general "smarter assistant" switch.** It
-  lets the model use general technical knowledge for the interviewer's question;
-  the meeting prompt must stay transcript-grounded (a meeting answer that
-  invents a decision is a bug, an interview answer that explains Java is the
-  feature). Keep the *local* interview context short: prefill, not decoding, is
-  the latency on a small box. That is what `Budget::for_request(mode, cloud)`
-  encodes; do not give a local model the whole meeting just because a cloud one
-  can take it. Earlier answers are part of the context on purpose: a follow-up
-  must not get an answer that contradicts the one the user already read.
-- **An answer must stay anchored to its transcript row.** `answered_sequence`
-  is the anchor (NULL/0 = the free-form sheet); the insert stores it, the phone
-  sends it on ask, and `ListAnswers` hands them back on open. Losing the anchor
-  means the app has no idea where to render an answer again, and a restarted
-  phone shows an empty interview. Answers are never inserted into
-  `transcript_entries`.
-- **A WASAPI Xrun is noise, not a failure.** `cpal` reports
-  `ErrorKind::Xrun` ("A buffer underrun or overrun occurred") whenever Windows
-  sets `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` — which happens every time a
-  loopback stream resumes after silence. `src/capture.rs` prints it once per
-  capture and continues; do not turn it into a fatal error and do not print it
-  per packet.
+  server only stores `sessions.ai_help`; there is no server-side auto-answer
+  worker. Only the newest queued question is kept while an answer streams, and
+  the candidate's own (`me`) lines are never answered. Do not trigger answers
+  from provisional preview text.
 - `set_no_context(true)` (aka `WZ_NOCTX=1`) disables previous-segment
   conditioning; without it whisper loops on music (143 inserted words vs 6).
   The explicit `initial_prompt` still applies.
@@ -732,43 +551,6 @@ only). Music needs `--no-vad` and long segments; meetings want the VAD **on**.
   explicit interface.
 - Formatting/`clippy` clean-ish is expected; do not reformat unrelated code.
 
-## Android: every change ends with a store publish
-
-**Rule: a change under `android/` is not finished until a signed release APK is
-the newest entry in the APK store.** CI artifacts and Play builds do not reach
-the phone on their own; the store does. The rule is executable:
-
-```bash
-# 1. bump versionCode AND versionName in android/app/build.gradle.kts — the
-#    store (and Play) key on versionCode; an unchanged one is not a release
-# 2. build the signed release and publish it, then confirm the listing
-scripts/publish-android.sh
-#    --build-only  -> just the signed APK (no upload)
-#    -> https://wheezper-dl.pumpkinforge.de/store
-```
-
-- The script fails loudly instead of shipping anything questionable: missing
-  signing key, a debuggable build, or a missing store tool (override with
-  `WHEEZPER_STORE_PUBLISH` / `WHEEZPER_ANDROID_KEYSTORE_PROPERTIES`; the API
-  check uses `WHEEZPER_STORE_URL`).
-- Signing key lives *outside* the repo — `~/.config/wheezper/android-release.jks`
-  plus `android-release.properties` (0600). Never commit it, never print its
-  passwords, and never fall back to the debug key: an update only installs over
-  the same signer (`INSTALL_FAILED_UPDATE_INCOMPATIBLE` otherwise).
-- Verify before reporting done: the store listing shows the new `versionCode`
-  and the APK URL answers `200`. Report the versionCode/versionName, the
-  download URL and the sha256.
-- CI enforces the ordering: the `android / store build is published` job fails a
-  push to `main` when the store's `versionCode` is lower than the repo's (or the
-  package is absent, or the listing is unreadable). So publish *first*, then
-  push — a pushed version bump with no store build is a red pipeline, on
-  purpose. PRs and tags are exempt (they build, they do not publish).
-- If the key or the store tooling is not on this machine (fresh clone, another
-  developer), say so — do not invent a new key or ship an unsigned APK. Bumping
-  the version and pushing the code without publishing leaves the phone stale.
-- Re-uploading the same `versionCode` replaces that store entry, which is the
-  way to fix a bad build; it is not a new release.
-
 ## Do not break (CI gates)
 
 1. `cargo test --release --workspace` — includes the streaming replay test and
@@ -786,23 +568,14 @@ scripts/publish-android.sh
    (no llama.cpp, no Android NDK; `libaaudio` only exists on real devices).
 7. Notes format stays parseable: `- [HH:MM:SS] **label:** text`, one line per
    utterance, flushed per line. Only **final-tier** text may reach the notes;
-   provisional preview text is stdout-only (TTY). **stdout is silent by
-   default**: transcript text is echoed only with `--print` (which also gates
-   the preview tier and the on-stop summary echo). Do not print transcript
-   text unconditionally again — the notes file is the only default output.
+   provisional preview text is stdout-only (TTY).
 8. Do not commit song audio or lyrics: `*.opus`, `*.lyrics`, `*.lyeics`,
    `bench/out/` are gitignored and not redistributable.
 9. `cargo test -p wheezper-server` with a PostgreSQL
    (`WHEEZPER_TEST_DATABASE_URL`): pairing, idempotent publish, sequence order,
    restart durability, stream resume, assistant context/immutability, `ai_help`
-   round-trip, anchored answers + `ListAnswers` + previous-answer context,
-   per-request model/token overrides (the mock asserts the `Authorization`
-   header and the model body field), and the session brief/guidance reaching
-   the prompt after `UpdateSessionGuidance`.
-9b. `cargo test --release update::` — version comparison, asset/hash parsing,
-   and a real in-place update against a local HTTP server (the old binary must
-   survive a checksum mismatch). `wheezper --update` on a current build must
-   print "already up to date" against the live release.
+   round-trip, and per-request model/token overrides (the mock asserts the
+   `Authorization` header and the model body field).
 10. `scripts/test-session-sync.sh`: the CLI buffers events while the server is
     down and drains them, in order and without duplicates, after reconnect;
     local markdown is written either way.
@@ -811,19 +584,9 @@ scripts/publish-android.sh
     `--no-default-features` CLI builds must keep working, and
     `cargo test -p wheezper --features sync` gates the transport.
     Release artifacts are built with `--features sync`.
-12. Android changes ship a bumped, release-signed APK to the APK store
-   (`scripts/publish-android.sh`, see "Android: every change ends with a store
-   publish"). The `android / store build is published` job gates a push to
-   `main`: the store's `versionCode` must be >= the one in
-   `android/app/build.gradle.kts`. Publish before you push.
-13. Phase 2 budget (manual, reference machine):
+12. Phase 2 budget (manual, reference machine):
    `CHANNELS=2 MODEL=base WZ_ACCEPT=1 stream::tests::measures_commit_latency`
-   must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s. Run it with
-   `CHANNELS=1` too (loopback-only, the single-channel setup): measured
-   0.25 s median / 0.35 s p90, so the same gate passes with margin. The final
-   tier now takes half the box, so the preview runs on 2 threads on the
-   6-core reference machine and its dual-channel p90 is close to the gate —
-   check both numbers after touching the split.
+   must keep passing: provisional median ≤ 0.5 s, p90 ≤ 0.8 s.
 
 ## Open questions for the human
 
@@ -831,8 +594,7 @@ scripts/publish-android.sh
   transcript rows stay append-only; only the stdout preview revises (TTY only).
   Opt-in Phase 3 annotations are inserted beneath their transcript row.
 - ~~Phase 2: may a different streaming engine be added?~~ **Moot**: the
-  two-tier design hit the 0.5 s budget inside whisper.cpp. `--preview-model`
-  (auto: `base` for a big notes model) covers the remaining "preview too slow"
-  case without touching the notes tier.
+  two-tier design hit the 0.5 s budget inside whisper.cpp; revisit only if
+  the provisional tier needs to get cheaper still (e.g. `tiny.en`).
 - ~~Phase 3: does `1017` mean output-token budget?~~ **Answered**: yes.
 - ~~Phase 3: where do annotations go?~~ **Answered**: notepad only.

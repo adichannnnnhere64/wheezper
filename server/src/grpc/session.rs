@@ -27,12 +27,7 @@ impl SessionServiceGrpc for SessionGrpc {
         let (row, token) = self
             .state
             .sessions
-            .create(
-                &req.title,
-                req.ai_help,
-                &req.ai_context,
-                &req.ai_instructions,
-            )
+            .create(&req.title, req.ai_help)
             .await
             .map_err(Status::from)?;
         tracing::info!(
@@ -45,34 +40,6 @@ impl SessionServiceGrpc for SessionGrpc {
             session: Some(row.into()),
             session_token: token,
         }))
-    }
-
-    async fn update_session_guidance(
-        &self,
-        request: Request<proto::UpdateSessionGuidanceRequest>,
-    ) -> Result<Response<proto::Session>, Status> {
-        // The brief describes what the user is doing, so only the paired phone
-        // writes it — a session publish token may read its session, not edit it.
-        self.state
-            .auth
-            .authenticate_device(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let req = request.into_inner();
-        let session_id = parse_uuid(&req.session_id, "session_id").map_err(Status::from)?;
-        let row = self
-            .state
-            .sessions
-            .update_guidance(session_id, &req.ai_context, &req.ai_instructions)
-            .await
-            .map_err(Status::from)?;
-        tracing::info!(
-            session = %row.id,
-            context_chars = row.ai_context.chars().count(),
-            instruction_chars = row.ai_instructions.chars().count(),
-            "session guidance updated"
-        );
-        Ok(Response::new(row.into()))
     }
 
     async fn get_session(
@@ -163,25 +130,6 @@ impl SessionServiceGrpc for SessionGrpc {
             .await
             .map_err(Status::from)?;
         tracing::info!(session = %row.id, "session ended");
-        // Mail the notes after the RPC is answered: a slow SMTP relay must not
-        // hold up the phone, and a failure must not fail the end of a meeting
-        // that is already stored.
-        if self.state.email.is_some() {
-            let state = self.state.clone();
-            let completed = row.clone();
-            tokio::spawn(async move {
-                if state.email.is_some() {
-                    match crate::email::send_notes(&state, &completed).await {
-                        Ok(()) => tracing::info!(session = %completed.id, "meeting notes emailed"),
-                        Err(err) => tracing::warn!(
-                            session = %completed.id,
-                            error = %err,
-                            "could not email notes"
-                        ),
-                    }
-                }
-            });
-        }
         Ok(Response::new(proto::EndSessionResponse {
             session: Some(row.into()),
         }))

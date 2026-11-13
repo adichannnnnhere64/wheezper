@@ -85,9 +85,6 @@ pub struct Tuning {
     pub tail_window: bool,
     /// Keep an open line and report it via `line_ready` (final tier only).
     pub track_line: bool,
-    /// Which tier this is, for the "falling behind" diagnostic: losing notes
-    /// (final) and a slow on-screen preview need different advice.
-    pub tier: &'static str,
 }
 
 impl Tuning {
@@ -113,23 +110,17 @@ impl Tuning {
             buf_cap_s: 30.0,
             tail_window: false,
             track_line: true,
-            tier: "final",
         }
     }
 
     /// Live preview: cheap windows on the live edge. `window_s` must stay
     /// within `audio_ctx * 20 ms` of the provisional profile (see
     /// `transcribe`), or audio past the encoder window is silently cut.
-    ///
-    /// 1.2 s, not 0.8 s: the pass cost is unchanged (the encoder window is
-    /// the same fixed cost) but a sub-second window is too short for whisper
-    /// to decode whole words — it emitted fragments ("(", "H", "P") on the
-    /// jfk fixture. At 1.2 s the preview reads as words and still measures
-    /// 0.25 s median / 0.35 s p90 single-channel (0.42 / 0.77 dual) on the
-    /// 6-core reference box, inside the 0.5 s / 0.8 s budget.
+    /// Tuned on the reference machine for the ≤0.5 s median / ≤0.8 s p90
+    /// dual-channel budget.
     pub fn provisional() -> Self {
         Self {
-            window_s: 1.2,
+            window_s: 0.8,
             min_window_s: 0.30,
             idle_min_window_s: 0.25,
             new_audio_s: 0.02,
@@ -138,7 +129,6 @@ impl Tuning {
             buf_cap_s: 4.0,
             tail_window: true,
             track_line: false,
-            tier: "preview",
         }
     }
 
@@ -162,26 +152,34 @@ impl Tuning {
     }
 }
 
-/// Split the core budget between the tiers. One core is always reserved
-/// for the capture/main loop: oversubscribing the box makes the ggml spin
-/// barriers convoy and doubles every pass time (measured on the 6-core
-/// reference box: 2+4 misses the preview p90 budget, 2+3 clears it).
+/// Split the core budget between the tiers. The provisional tier is the
+/// latency-critical one (the 0.5 s budget); the final tier's lag is
+/// invisible behind the preview, so it runs on the leftovers — never below
+/// one thread, or the notes would fall hopelessly behind. One core is
+/// always reserved for the capture/main loop: oversubscribing the box
+/// makes the ggml spin barriers convoy and doubles every pass time
+/// (measured on the 6-core reference box: 2+4 misses the p90 budget,
+/// 2+3 clears it with margin).
 ///
-/// The final tier gets half the box (capped at 6), not the leftovers. It is
-/// the only tier that can *lose notes*: when a pass cannot decode faster
-/// than audio arrives, its 30 s buffer fills and speech is dropped
-/// ("inference is not keeping up"). That is what a 4-core laptop used to
-/// hit with a single final thread. The preview gains nothing past 3 threads
-/// (measured: the 4th only adds jitter), so everything above that goes to
-/// the final tier where it directly buys notes latency and drop margin.
+/// On many-thread laptops (>8 logical cores) the provisional tier gains
+/// nothing past 3 threads (measured: 4th thread only adds jitter) while
+/// the low-frequency cores make the final pass the backlog risk — so the
+/// extra budget goes to the final tier (2 -> 4), where it halves the
+/// worst-case notes lag that is the only place a single-channel setup can
+/// fall behind real time.
 pub fn split_threads(cores: i32, requested: i32) -> (i32, i32) {
     if requested > 0 {
         // explicit --threads: split it evenly and predictably
         let half = (requested / 2).max(1);
         return (half, half);
     }
-    let fin = (cores / 2).clamp(1, 6);
-    let prov = (cores - fin - 1).clamp(1, 3);
+    if cores >= 9 {
+        let fin = (cores / 4).clamp(2, 4);
+        let prov = 3;
+        return (fin, prov);
+    }
+    let fin = (cores / 3).clamp(1, 2);
+    let prov = (cores - fin - 1).clamp(1, 4);
     (fin, prov)
 }
 
@@ -357,20 +355,9 @@ impl StreamChannel {
             // speech, and it means the box cannot keep up with the model
             if !self.warned_drop {
                 self.warned_drop = true;
-                let who = match self.label {
-                    Some(ch) => format!("{ch} channel, {} tier", self.tuning.tier),
-                    None => format!("{} tier", self.tuning.tier),
-                };
-                let lost = drop_n as f64 / TARGET_RATE as f64;
-                if self.tuning.track_line {
-                    eprintln!(
-                        "wheezper: stream: {who} cannot keep up — dropped {lost:.1} s of uncommitted audio (notes may miss words). See the thread split printed at startup; raise --threads or use a smaller --model"
-                    );
-                } else {
-                    eprintln!(
-                        "wheezper: stream: {who} is behind — the on-screen preview skipped {lost:.1} s of audio (notes are unaffected)"
-                    );
-                }
+                eprintln!(
+                    "wheezper: stream: inference is not keeping up — dropping the oldest uncommitted audio (try a smaller --model or more --threads)"
+                );
             }
         }
     }
@@ -725,17 +712,13 @@ impl ProvisionalTier {
     }
 
     /// Current preview text (the words decoded past the final boundary).
-    ///
-    /// The list holds whisper *tokens*, not whitespace-split words: a rare
-    /// word is several tokens and continuation tokens carry no leading space.
-    /// Concatenate as-is (exactly like the committed line does) — inserting a
-    /// space after every token turned "Khan" into "Kh an" on screen.
     pub fn preview(&self) -> String {
         let mut out = String::new();
         for (_, w) in &self.words {
-            out.push_str(w);
+            out.push_str(w.trim_start());
+            out.push(' ');
         }
-        out.trim().to_string()
+        out.trim_end().to_string()
     }
 
     pub fn flush(&mut self) {
@@ -783,15 +766,13 @@ mod tests {
         // explicit request: even split, both tiers kept alive
         assert_eq!(super::split_threads(14, 8), (4, 4));
         assert_eq!(super::split_threads(2, 1), (1, 1));
-        // the notes tier gets half the box: it is the one that drops audio
-        assert_eq!(super::split_threads(4, 0), (2, 1));
-        assert_eq!(super::split_threads(6, 0), (3, 2));
-        assert_eq!(super::split_threads(8, 0), (4, 3));
+        // small boxes: up to 2 final, provisional gets the rest minus one
+        assert_eq!(super::split_threads(6, 0), (2, 3));
+        assert_eq!(super::split_threads(4, 0), (1, 2));
         assert_eq!(super::split_threads(2, 0), (1, 1));
-        // many-thread laptops: finals cap at 6, provisional at 3
-        assert_eq!(super::split_threads(14, 0), (6, 3));
-        assert_eq!(super::split_threads(16, 0), (6, 3));
-        assert_eq!(super::split_threads(64, 0), (6, 3));
+        // many-thread laptops: provisional caps at 3, finals get the gain
+        assert_eq!(super::split_threads(14, 0), (3, 3));
+        assert_eq!(super::split_threads(16, 0), (4, 3));
         for cores in [1, 2, 4, 6, 8, 9, 12, 14, 20, 32] {
             let (fin, prov) = super::split_threads(cores, 0);
             assert!(fin >= 1 && prov >= 1, "cores={cores}: {fin}/{prov}");
@@ -808,19 +789,6 @@ mod tests {
         tier.push_16k(&vec![0.1; TARGET_RATE as usize]);
         assert!(tier.maybe_send(0, &tx, "engineering planning"));
         assert_eq!(rx.recv().unwrap().prompt.as_deref(), Some("engineering planning"));
-    }
-
-    #[test]
-    fn preview_joins_continuation_tokens_without_spaces() {
-        let mut tier = ProvisionalTier::new();
-        // whisper tokens carry the leading space of a new word; continuation
-        // tokens do not. Inserting one per token rendered "Khan" as "Kh an".
-        tier.words = vec![
-            (0.4, " Hello".to_string()),
-            (0.5, " Kh".to_string()),
-            (0.6, "an".to_string()),
-        ];
-        assert_eq!(tier.preview(), "Hello Khan");
     }
 
     /// Measures live caption latency: word-end -> on screen, end to end,

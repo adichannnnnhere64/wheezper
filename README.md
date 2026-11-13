@@ -55,10 +55,6 @@ wheezper --source dual --webhook https://example.com/hook
 # rolling live captions while you speak (stdout only; pairs well with --model tiny)
 wheezper --partial --model tiny
 
-# default: nothing is printed, the notes file is the only output. To watch
-# lines scroll by on a terminal again:
-wheezper --source dual --print
-
 # domain-specific terms, products, or meeting topic (opt-in whisper bias)
 wheezper --prompt "Engineering planning for the Atlas migration"
 
@@ -82,11 +78,6 @@ wheezper --model small
 wheezper --list-devices
 wheezper --source loopback --device hdmi
 
-# update this binary in place from the latest validated GitHub release
-# (downloads the raw binary + SHA256SUMS, verifies, swaps; on Windows the swap
-# happens as the process exits because a running .exe is locked)
-wheezper --update
-
 # any recording or exotic source: pipe mono f32le PCM
 ffmpeg -i recording.wav -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
 
@@ -99,18 +90,8 @@ wheezper --source loopback --no-vad --max-segment 40 --model turbo \
          --lyrics song.lyrics --lyric-sync
 ```
 
-Output (default `notes/YYYY-MM-DD.md`, flushed per line) is **not printed by
-default** — the file is the only place transcript text goes. Add `--print` to
-echo each line to stdout as it is written:
-
-```bash
-$ wheezper                      # silent: notes only
-$ wheezper --print              # also echoes every line to the terminal
-```
-
-Without `--print` the live preview tier is never spawned either (nobody is
-looking), so its cores go to the notes tier: `--print` costs nothing in the
-notes, it is purely a display choice.
+Output (default `notes/YYYY-MM-DD.md`, flushed per line) is also echoed to
+stdout, so you can watch it live:
 
 ```markdown
 # Meeting — 2026-11-07 19:06
@@ -152,11 +133,7 @@ wheezper --source dual \
   chosen in the app, and an optional Ollama token (needed for Ollama Cloud) is
   stored on the phone and sent per request: the server never stores or logs it.
   Only committed text triggers an answer, so the answer follows the firm
-  transcript, not the provisional preview. Each answer is **anchored to the
-  transcript row it answers** and stays there: a fast interviewer's next
-  question gets its own card under its own row. Questions queue in a small
-  bounded FIFO (one request in flight), so a slow answer is never overwritten
-  and the backlog cannot run away.
+  transcript, not the provisional preview.
 
 Build/run the backend and app:
 
@@ -175,7 +152,7 @@ for the companion app and its pairing flow.
 
 Live capture runs **two tiers per channel** (Phase 2):
 
-- a **provisional** tier decodes just the live edge (≤1.2 s windows, capped
+- a **provisional** tier decodes just the live edge (≤0.8 s windows, capped
   encoder context, one greedy pass) and puts words on screen as a revisable
   `▍` preview line — **~0.2–0.35 s** after they are spoken;
 - the **final** tier is the quality engine (8 s windows, full decode with the
@@ -183,10 +160,8 @@ Live capture runs **two tiers per channel** (Phase 2):
   only this text reaches the notes file. It runs a few seconds behind — you
   already read the words in the preview — so the notes stay clean.
 
-When stdout is piped (not a terminal) **or `--print` is not passed**, the
-preview tier is skipped entirely and wheezper behaves like the single-tier
-Phase-1 engine — which is also the default, since the notes file is the only
-output unless you ask to watch it.
+When stdout is piped (not a terminal) the preview tier is skipped entirely and
+wheezper behaves like the single-tier Phase-1 engine.
 
 `stream::tests::measures_commit_latency` feeds real audio in real time and
 stamps every committed word, so "word finished being spoken → word on screen"
@@ -194,21 +169,13 @@ is measured end to end (6-core desktop, models local):
 
 | setup | median | p90 | one pass |
 |---|---|---|---|
-| preview tier, `base`, 1 ch | **0.23 s** | 0.32 s | 0.10 s |
-| preview tier, `base`, dual (both sides talking) | **0.32 s** | 0.53 s | 0.10 s |
+| preview tier, `base`, 1 ch | **0.22 s** | 0.46 s | 0.10 s |
+| preview tier, `base`, dual (both sides talking) | **0.22–0.33 s** | 0.46–0.62 s | 0.10 s |
 | final tier (into notes), `base`, 1 ch | 4.11 s | 5.50 s | 3.1 s (2 threads) |
-| final tier (into notes), `base`, dual | 6.9 s | 7.2 s | 3.3 s |
+| final tier (into notes), `base`, dual | 6.6–7.4 s | 7.6 s | 3.3 s |
 | Phase-1 single tier (piped stdout), `base`, 1 ch | 2.60 s | 3.00 s | 1.80 s (4 threads) |
 | Phase-1 single tier (piped stdout), `base`, dual | 4.23 s | 5.13 s | 1.70 s |
 | Phase-1 single tier (piped stdout), `small`, 1 ch | 6.86 s | 7.70 s | 6.40 s |
-
-Only the preview tier needs to be fast, so it can use a **cheaper model than
-`--model`**: `--preview-model` (default `auto`) keeps `tiny`/`base` as-is and uses
-`base` for the preview when the notes model is `small`, `medium` or `turbo`
-(measured one provisional pass: 0.10 s on base vs 0.20–0.40 s on small). The
-notes still come from `--model`, and the preview still revises in place.
-`--preview-model same` uses one model for both tiers; any other value is
-resolved like `--model`.
 
 Reproduce (add `WZ_ACCEPT=1` to gate the 0.5 s median / 0.8 s p90 budget on
 the preview tier):
@@ -298,33 +265,6 @@ curl -L -o ~/.local/share/wheezper/ggml-base-q5_1.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin
 ```
 
-## Faster transcription (GPU)
-
-Every whisper pass is ~fixed cost (whisper.cpp pads to a 30 s window), so the
-knobs that matter are the model and whether the encoder runs on the GPU:
-
-- `--model base --preview-model auto` (the defaults) is the best CPU setup: the
-  preview stays on `base` while the notes can use `small`.
-- On a machine with a real GPU, build with Vulkan (NVIDIA/AMD/Intel, Windows and
-  Linux) or CUDA:
-
-```bash
-cargo build --release --features vulkan   # needs the Vulkan SDK + glslc
-cargo build --release --features cuda     # needs the CUDA toolkit
-```
-
-  whisper-rs enables GPU offload by default when it is built in, so there is no
-  flag to add. A 6-core CPU final pass is ~3 s; a laptop GPU is well under 1 s,
-  which is what makes `small` (or `medium` on a strong GPU) usable as the
-  **notes** model in real time. The GPU build is opt-in because the binary then
-  needs the driver's Vulkan/CUDA runtime — the shipped artifacts stay portable
-  CPU builds, and a software Vulkan device (mesa llvmpipe) is slower than the
-  CPU path.
-- Do not raise `--threads` past the split the app picks: two ggml workers
-  oversubscribing the box convoy on their spin barriers and every pass gets
-  slower, not faster (see `AGENTS.md`, "Two ggml workers must not
-  oversubscribe the box").
-
 ## Install / build
 
 ```bash
@@ -350,23 +290,6 @@ cargo build --release --no-default-features
 # build with remote sessions (release artifacts ship this way)
 cargo build --release --features sync
 ```
-
-## Updating
-
-`wheezper --update` replaces the binary you are running. It reads
-`https://github.com/adichannnnnhere64/wheezper/releases/latest`, downloads
-`wheezper-linux-amd64` (or `wheezper-windows-x64.exe`) plus `SHA256SUMS` from
-that release, verifies the hash and renames the new binary over the old one. No
-installer, no admin rights; it does need write access to the directory the
-binary lives in. Linux/macOS swap atomically; Windows stages
-`wheezper.exe.new` and a detached shell moves it into place after the process
-exits, so the update is on disk the next time you start it.
-
-The Android companion is distributed through Google Play, so Play delivers its
-updates. **Settings → App → Check for updates** uses Play's in-app update API,
-which is the only in-app path that can replace a Play-installed app (Play holds
-the signing key, so a self-downloaded APK is a different signer and the
-installer rejects it).
 
 ## CI / CD: tested artifacts only
 
@@ -468,7 +391,6 @@ source = "dual"      # mic | loopback | dual | stdin
 model = "base"       # tiny | base | small | medium | turbo | /path/to/model.bin
 language = "en"     # or "auto"
 partial = true       # rolling live captions (stdout only)
-# print = true       # echo finished lines to stdout (default: notes file only)
 webhook = "http://192.168.1.20:8399/hook"
 notes = "notes/work.md"
 # prompt = "Engineering planning for the Atlas migration"
@@ -578,8 +500,6 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
 ```
 -m, --model <PATH|NAME>  model path or name: tiny, base, small, medium, turbo
                           [default: base] (or env WHEEZPER_MODEL)
-    --preview-model <M>  live-preview model [default: auto] (env WHEEZPER_PREVIEW_MODEL)
-                          auto | same | tiny | base | ... | path
 -n, --notes <PATH>     notepad file [default: notes/YYYY-MM-DD.md]
 -l, --language <LANG>  language code, or "auto" [default: auto]
     --source <SRC>     mic | loopback | dual | stdin [default: stdin if piped, else mic]
@@ -587,7 +507,6 @@ ffmpeg -i /tmp/meeting.m4a -ar 16000 -ac 1 -f f32le - | wheezper --source stdin
     --host <NAME>     audio host override (pulseaudio, wasapi, alsa, ...)
     --webhook <URL>   POST each utterance to this URL as JSON
     --partial         rolling live captions of the utterance in progress
-    --print           echo finished lines to stdout (default: notes file only)
     --prompt <TEXT>   domain/context hint (first 40 words; opt-in)
     --with-agent <SPEC>  async annotations: PROVIDER:MODEL[:BUDGET]
     --knowledgebase <FILE>  interview answers from this file (with --with-agent)

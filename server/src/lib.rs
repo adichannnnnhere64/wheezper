@@ -9,7 +9,6 @@ pub mod assistant;
 pub mod auth;
 pub mod config;
 pub mod db;
-pub mod email;
 pub mod error;
 pub mod grpc;
 pub mod session;
@@ -50,17 +49,7 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>> {
         &config.assistant_model,
         config.assistant_api_key.clone(),
     );
-    let assistant = AssistantService::new(
-        transcripts.clone(),
-        sessions.clone(),
-        provider,
-        config.assistant_context.clone(),
-    );
-
-    let email = email::Email::from_env();
-    if let Some(email_config) = &email {
-        tracing::info!(relay = %email_config.relay_name(), "meeting notes are emailed on EndSession");
-    }
+    let assistant = AssistantService::new(transcripts.clone(), sessions.clone(), provider);
 
     Ok(Arc::new(AppState {
         auth: Authenticator::new(pool.clone()),
@@ -68,7 +57,6 @@ pub async fn build_state(config: Config) -> Result<Arc<AppState>> {
         sessions,
         transcripts,
         assistant,
-        email,
     }))
 }
 

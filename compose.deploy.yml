@@ -1,0 +1,64 @@
+# Deployment stack for hermes: PostgreSQL + wheezper-server.
+# Public gRPC endpoint: https://wheezper.pumpkinforge.de (443) via nginx, Let's Encrypt cert
+# for wheezper.pumpkinforge.de (certbot DNS-01, renewed by the host cron).
+name: wheezper
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: wheezper
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: wheezper
+    volumes:
+      - wheezper-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wheezper -d wheezper"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    env_file: .env
+    environment:
+      WHEEZPER_BIND: 0.0.0.0:50051
+      WHEEZPER_DATABASE_URL: postgres://wheezper:${POSTGRES_PASSWORD}@db:5432/wheezper
+      # Ollama Cloud: no local weights on this box (freed ~2.3 GB).
+      # Key comes from .env (OLLAMA_API_KEY); the phone never holds it.
+      WHEEZPER_ASSISTANT_URL: https://ollama.com
+      WHEEZPER_ASSISTANT_MODEL: deepseek-v4.1-flash:1017
+      WHEEZPER_TLS_CERT: /certs/fullchain.pem
+      WHEEZPER_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "127.0.0.1:50151:50051"   # loopback only: the public front door is nginx on 443
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/50051"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  wheezper-db:

@@ -44,15 +44,11 @@ impl TestServer {
             database_url: db_url.clone(),
             bind: addr.parse().expect("addr"),
             pairing_code: PAIRING_CODE.to_string(),
-            pairing_code_file: None,
             device_ttl: Duration::from_secs(3600),
             retention_days: 0,
             assistant_url,
             assistant_model: "test-model".to_string(),
             assistant_api_key: None,
-            // Tests hit a mock on 127.0.0.1, so `auto` would keep the short
-            // interview window; `full` exercises the whole-meeting prompt.
-            assistant_context: "full".to_string(),
             tls_cert: None,
             tls_key: None,
         };
@@ -181,7 +177,6 @@ pub async fn create_session_with_ai(
             wheezper_proto::CreateSessionRequest {
                 title: title.to_string(),
                 ai_help,
-                ..Default::default()
             },
             device_token,
         ))

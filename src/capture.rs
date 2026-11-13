@@ -142,11 +142,7 @@ fn choose_input_range(
 /// the backend accepts first wins.
 fn open_on(device: &Device) -> Result<Capture> {
     let device_name = dev_name(device);
-    // An Xrun is not fatal and not rare: WASAPI sets DATA_DISCONTINUITY on a
-    // loopback stream every time it resumes after silence (Teams idle, then
-    // someone talks), and cpal reports each one. Printing it per packet made a
-    // healthy call look broken, so say it once per capture and keep going.
-    let xrun_reported = Arc::new(AtomicBool::new(false));
+    let err_cb = |err| eprintln!("wheezper: audio stream error: {err}");
 
     let mut candidates: Vec<(SampleFormat, StreamConfig)> = Vec::new();
     let ranges: Vec<SupportedStreamConfigRange> = device
@@ -199,20 +195,6 @@ fn open_on(device: &Device) -> Result<Capture> {
         let channels = config.channels;
         // ~3 minutes of buffered audio; overflow drops the oldest chunks.
         let (sender, receiver) = audio_queue(rate as usize * 180);
-        let xrun_flag = Arc::clone(&xrun_reported);
-        let device_for_errors = device_name.clone();
-        let err_cb = move |err: cpal::Error| {
-            if err.kind() == cpal::ErrorKind::Xrun {
-                if !xrun_flag.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "wheezper: {device_for_errors}: audio glitch (buffer underrun/overrun); \
-                         a gap is possible — continuing"
-                    );
-                }
-            } else {
-                eprintln!("wheezper: {device_for_errors}: audio stream error: {err}");
-            }
-        };
         let built = match format {
             SampleFormat::F32 => build_input::<f32>(device, config, channels as usize, sender, err_cb),
             SampleFormat::I16 => build_input::<i16>(device, config, channels as usize, sender, err_cb),

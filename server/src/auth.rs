@@ -43,14 +43,19 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
-    Device { id: Uuid, name: String },
+    Device {
+        id: Uuid,
+        name: String,
+        /// Which profile this device belongs to (multi-user support).
+        profile_id: Option<Uuid>,
+    },
     Session { session_id: Uuid },
 }
 
 impl Principal {
     pub fn device_or_err(&self) -> Result<(&Uuid, &str)> {
         match self {
-            Principal::Device { id, name } => Ok((id, name.as_str())),
+            Principal::Device { id, name, .. } => Ok((id, name.as_str())),
             Principal::Session { .. } => Err(Error::Unauthorized),
         }
     }
@@ -74,9 +79,17 @@ impl Authenticator {
         device_name: &str,
         ttl: Duration,
     ) -> Result<(String, DateTime<Utc>)> {
-        if !constant_time_eq(pairing_code.trim(), expected_code) {
-            return Err(Error::Unauthorized);
-        }
+        let entered = pairing_code.trim();
+        let profile_id = if constant_time_eq(entered, expected_code) {
+            self.default_profile_id().await?
+        } else {
+            match self.consume_invite(entered).await? {
+                Some(id) => Some(id),
+                // Neither the operator code nor a live invite: same answer for
+                // both, so a probe cannot tell them apart.
+                None => return Err(Error::Unauthorized),
+            }
+        };
         let name = device_name.trim();
         let name = if name.is_empty() {
             "device"
@@ -86,29 +99,72 @@ impl Authenticator {
         let token = new_token();
         let expires_at = Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default();
         sqlx::query(
-            "INSERT INTO devices (id, name, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO devices (id, name, token_hash, expires_at, profile_id) \
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(Uuid::new_v4())
         .bind(name)
         .bind(hash_token(&token))
         .bind(expires_at)
+        .bind(profile_id)
         .execute(&self.pool)
         .await?;
         Ok((token, expires_at))
+    }
+
+    /// The server-wide default profile (slug `default`), if one exists. Devices
+    /// paired with the operator code land here.
+    async fn default_profile_id(&self) -> Result<Option<Uuid>> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM profiles WHERE slug = 'default'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Validate and consume a single-use-ish invite code, returning its profile.
+    /// `None` means "not an invite" — the caller answers Unauthorized either way.
+    async fn consume_invite(&self, code: &str) -> Result<Option<Uuid>> {
+        let hash = hash_token(code);
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, profile_id FROM invites \
+             WHERE code_hash = $1 AND uses < max_uses \
+               AND (expires_at IS NULL OR expires_at > now()) \
+             FOR UPDATE",
+        )
+        .bind(&hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((invite_id, profile_id)) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query("UPDATE invites SET uses = uses + 1 WHERE id = $1")
+            .bind(invite_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(invite = %invite_id, profile = %profile_id, "invite consumed");
+        Ok(Some(profile_id))
     }
 
     pub async fn authenticate(&self, metadata: &MetadataMap) -> Result<Principal> {
         let token = bearer(metadata)?;
         let hash = hash_token(token);
 
-        let device: Option<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, name FROM devices WHERE token_hash = $1 AND expires_at > now()",
+        let device: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, name, profile_id FROM devices WHERE token_hash = $1 AND expires_at > now()",
         )
         .bind(&hash)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((id, name)) = device {
-            return Ok(Principal::Device { id, name });
+        if let Some((id, name, profile_id)) = device {
+            return Ok(Principal::Device {
+                id,
+                name,
+                profile_id,
+            });
         }
 
         let session: Option<(Uuid, String)> =

@@ -1,7 +1,0 @@
-.gradle/
-build/
-local.properties
-app/src/main/proto/
-*.iml
-.idea/
-.kotlin/

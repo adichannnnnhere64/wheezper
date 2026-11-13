@@ -11,7 +11,7 @@
 //! cannot be turned into an SSRF probe.
 
 use super::context;
-use super::provider::{OLLAMA_CLOUD_URL, Ollama, Prompt, Think, Usage};
+use super::provider::{OLLAMA_CLOUD_URL, Ollama, Prompt};
 use super::repository;
 use crate::error::{Error, Result};
 use crate::session::SessionService;
@@ -32,28 +32,14 @@ pub struct AssistantOptions {
     pub api_key: Option<String>,
     /// Answer through `https://ollama.com/api` instead of the configured URL.
     pub cloud: bool,
-    /// The user asked for a longer answer than the automatic one-liner.
-    pub detail: bool,
-    /// Reasoning budget; `Off` is the shipped default (thinking costs tokens
-    /// and delays the answer, and the prompts already ask for a short one).
-    pub thinking: Think,
-    /// "About me" text from the phone's settings; prompt context, not data.
-    pub about_me: String,
+    /// Which paired device is asking; selects that device's profile (multi-user).
+    pub device_id: Option<Uuid>,
 }
 
 pub struct Answer {
     pub text: String,
     pub provider: String,
     pub model: String,
-    pub prompt_tokens: i64,
-    pub output_tokens: i64,
-}
-
-/// One piece of a streamed answer: text, and (once, at the end) the provider's
-/// token usage for the whole request.
-pub struct StreamEvent {
-    pub text: String,
-    pub usage: Option<Usage>,
 }
 
 /// A provider resolved for one call.
@@ -61,9 +47,6 @@ pub struct AssistantProvider {
     ollama: Ollama,
     pub name: &'static str,
     pub model: String,
-    /// Answers through Ollama Cloud: no local prefill budget, so the prompt
-    /// may carry the whole meeting (see `context::Budget`).
-    pub cloud: bool,
 }
 
 impl AssistantProvider {
@@ -77,33 +60,14 @@ pub struct AssistantService {
     transcripts: TranscriptService,
     sessions: SessionService,
     provider: Ollama,
-    /// `auto` | `full` | `short`: how much meeting the interview prompt carries
-    /// (`WHEEZPER_ASSISTANT_CONTEXT`). See `context::Budget`.
-    context_policy: String,
 }
 
 impl AssistantService {
-    pub fn new(
-        transcripts: TranscriptService,
-        sessions: SessionService,
-        provider: Ollama,
-        context_policy: String,
-    ) -> Self {
+    pub fn new(transcripts: TranscriptService, sessions: SessionService, provider: Ollama) -> Self {
         Self {
             transcripts,
             sessions,
             provider,
-            context_policy,
-        }
-    }
-
-    /// A cloud provider is the default "whole meeting" case; a local one keeps
-    /// the short interview window unless the operator asked otherwise.
-    fn full_context(&self, cloud: bool) -> bool {
-        match self.context_policy.as_str() {
-            "full" => true,
-            "short" => false,
-            _ => cloud,
         }
     }
 
@@ -119,29 +83,80 @@ impl AssistantService {
         &self,
         session_id: Uuid,
         question: String,
-        answered_sequence: Option<i64>,
         options: &AssistantOptions,
     ) -> Result<Answer> {
         let provider = self.resolve(options)?;
         let question = validate(question)?;
         let session = self.sessions.get(session_id).await?;
-        let budget = context::Budget::for_request(
-            context::Mode::for_session(session.ai_help),
-            self.full_context(provider.cloud),
-        )
-        .with_detail(options.detail);
+        let mode = context::Mode::for_session(session.ai_help);
         let ctx = context::build(
             &self.transcripts,
             session_id,
             &session.title,
-            &session.ai_context,
-            &session.ai_instructions,
-            &options.about_me,
             &question,
-            budget,
+            mode,
+            options.device_id,
         )
         .await?;
-        let (system, user) = ctx.messages(&question, budget);
+
+        // Card-first: a curated answer is better than anything this model will
+        // compose, and it cannot invent experience. The keyword gate in the
+        // query already decided the card is relevant.
+        if let Some(card) = ctx.cards.first() {
+            let answer = card.answer.trim().to_string();
+            persist(
+                &self.transcripts,
+                session_id,
+                &question,
+                &answer,
+                "card",
+                "curated",
+            )
+            .await;
+            tracing::info!(session = %session_id, rank = card.rank, "answered from answer card");
+            return Ok(Answer {
+                text: answer,
+                provider: "card".to_string(),
+                model: "curated".to_string(),
+            });
+        }
+
+        let (system, user) = ctx.messages(&question, mode);
+
+        // A meeting with no transcript has nothing to answer from: answer that
+        // deterministically instead of letting a small model invent content.
+        if mode == context::Mode::Meeting && ctx.total_entries == 0 {
+            let answer = "The meeting has no transcript yet, so there is nothing to answer from."
+                .to_string();
+            persist(&self.transcripts, session_id, &question, &answer, "server", "none").await;
+            return Ok(Answer {
+                text: answer,
+                provider: "server".to_string(),
+                model: "none".to_string(),
+            });
+        }
+
+        // No card matched. The local 1.5B model cannot be trusted to answer an
+        // open interview question: with the same prompt it invented "I used
+        // Kubernetes with Helm and GitOps" and, earlier, CrewAI. So only a model
+        // the user chose themselves (their own cloud token) may answer freely;
+        // otherwise say there is no prepared answer.
+        if mode == context::Mode::Interview && !uses_own_cloud_model(options) {
+            let answer = "No prepared answer for that one yet. Add it under Settings -> \
+                          Answers (answer cards) and it will be answered reliably."
+                .to_string();
+            persist(&self.transcripts, session_id, &question, &answer, "server", "none").await;
+            return Ok(Answer {
+                text: answer,
+                provider: "server".to_string(),
+                model: "none".to_string(),
+            });
+        }
+
+        let prompt = match mode {
+            context::Mode::Interview => Prompt::interview(system, user),
+            context::Mode::Meeting => Prompt::new(system, user),
+        };
         tracing::info!(
             session = %session_id,
             entries = ctx.total_entries,
@@ -150,10 +165,7 @@ impl AssistantService {
             "assistant question"
         );
 
-        let (answer, usage) = provider
-            .ollama
-            .generate(&Prompt { system, user, think: options.thinking })
-            .await?;
+        let answer = provider.ollama.generate(&prompt).await?;
         persist(
             &self.transcripts,
             session_id,
@@ -161,7 +173,6 @@ impl AssistantService {
             &answer,
             provider.provider_name(),
             &provider.model,
-            answered_sequence,
         )
         .await;
 
@@ -169,8 +180,6 @@ impl AssistantService {
             text: answer,
             provider: provider.name.to_string(),
             model: provider.model,
-            prompt_tokens: usage.prompt_tokens,
-            output_tokens: usage.output_tokens,
         })
     }
 
@@ -180,40 +189,76 @@ impl AssistantService {
         &self,
         session_id: Uuid,
         question: String,
-        answered_sequence: Option<i64>,
         provider: AssistantProvider,
-        detail: bool,
-        think: Think,
-        about_me: String,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+        device_id: Option<Uuid>,
+        // Caller brought their own (bigger) model, so an uncarded interview
+        // question may be answered by it instead of refused.
+        own_model: bool,
+    ) -> Pin<Box<dyn Stream<Item = Result<String>> + Send>> {
         let transcripts = self.transcripts.clone();
         let sessions = self.sessions.clone();
-
         let pool = transcripts.pool().clone();
         let provider_name = provider.provider_name();
         let model = provider.model.clone();
-        let cloud = self.full_context(provider.cloud);
 
         Box::pin(async_stream::try_stream! {
             let question = validate(question)?;
             let session = sessions.get(session_id).await?;
-            let budget = context::Budget::for_request(
-                context::Mode::for_session(session.ai_help),
-                cloud,
-            )
-            .with_detail(detail);
+            let mode = context::Mode::for_session(session.ai_help);
             let ctx = context::build(
                 &transcripts,
                 session_id,
                 &session.title,
-                &session.ai_context,
-                &session.ai_instructions,
-                &about_me,
                 &question,
-                budget,
+                mode,
+                device_id,
             )
             .await?;
-            let (system, user) = ctx.messages(&question, budget);
+            // Card-first, same rule as the non-streaming path.
+            if let Some(card) = ctx.cards.first() {
+                let answer = card.answer.trim().to_string();
+                yield answer.clone();
+                if let Err(err) = repository::save(
+                    &pool, session_id, &question, &answer, "card", "curated",
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "could not persist assistant message");
+                }
+                return;
+            }
+            let (system, user) = ctx.messages(&question, mode);
+
+            // Same deterministic guard as the unary path.
+            if mode == context::Mode::Meeting && ctx.total_entries == 0 {
+                let answer = "The meeting has no transcript yet, so there is nothing to answer from."
+                    .to_string();
+                yield answer.clone();
+                if let Err(err) =
+                    repository::save(&pool, session_id, &question, &answer, "server", "none").await
+                {
+                    tracing::warn!(error = %err, "could not persist assistant message");
+                }
+                return;
+            }
+
+            let prompt = match mode {
+                context::Mode::Interview => Prompt::interview(system, user),
+                context::Mode::Meeting => Prompt::new(system, user),
+            };
+            if mode == context::Mode::Interview && !own_model {
+                let answer = "No prepared answer for that one yet. Add it under Settings -> \
+                              Answers (answer cards) and it will be answered reliably.";
+                yield answer.to_string();
+                if let Err(err) = repository::save(
+                    &pool, session_id, &question, answer, "server", "none",
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "could not persist assistant message");
+                }
+                return;
+            }
             tracing::info!(
                 session = %session_id,
                 entries = ctx.total_entries,
@@ -223,17 +268,11 @@ impl AssistantService {
             );
 
             let mut answer = String::new();
-            let mut usage = None;
-            let mut deltas = Box::pin(provider.ollama.stream(Prompt { system, user, think }));
-            while let Some(part) = deltas.next().await {
-                let part = part?;
-                if let Some(u) = part.usage {
-                    usage = Some(u);
-                }
-                if !part.text.is_empty() {
-                    answer.push_str(&part.text);
-                    yield StreamEvent { text: part.text, usage: None };
-                }
+            let mut deltas = Box::pin(provider.ollama.stream(prompt));
+            while let Some(delta) = deltas.next().await {
+                let delta = delta?;
+                answer.push_str(&delta);
+                yield delta;
             }
             if answer.trim().is_empty() {
                 Err(Error::provider("the model returned an empty answer"))?;
@@ -248,28 +287,16 @@ impl AssistantService {
                 answer.trim(),
                 provider_name,
                 &model,
-                answered_sequence,
             )
             .await
             {
                 tracing::warn!(error = %err, "could not persist assistant message");
             }
-
-            // Last part: the caller turns this into the final (done) chunk.
-            yield StreamEvent { text: String::new(), usage };
         })
     }
 
     pub async fn message_count(&self, session_id: Uuid) -> Result<i64> {
         repository::count(self.transcripts.pool(), session_id).await
-    }
-
-    /// Answers anchored to transcript rows, for a client that reopens the
-    /// meeting (the phone renders them under their row again).
-    pub async fn answers(&self, session_id: Uuid) -> Result<Vec<repository::AssistantMessageRow>> {
-        // A session that does not exist must not silently return an empty list.
-        self.sessions.get(session_id).await?;
-        repository::answers_for_rows(self.transcripts.pool(), session_id).await
     }
 }
 
@@ -314,8 +341,18 @@ fn validate_token(token: &str) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// True when the caller brought their own bigger model. Those answers are
+/// allowed to go beyond the answer cards; the local model is not.
+pub fn uses_own_cloud_model(options: &AssistantOptions) -> bool {
+    options.cloud
+        && options
+            .api_key
+            .as_deref()
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false)
+}
+
 /// Store the question/answer pair; never fatal for the caller.
-#[allow(clippy::too_many_arguments)]
 async fn persist(
     transcripts: &TranscriptService,
     session_id: Uuid,
@@ -323,7 +360,6 @@ async fn persist(
     answer: &str,
     provider: &str,
     model: &str,
-    answered_sequence: Option<i64>,
 ) {
     if let Err(err) = repository::save(
         transcripts.pool(),
@@ -332,7 +368,6 @@ async fn persist(
         answer.trim(),
         provider,
         model,
-        answered_sequence,
     )
     .await
     {
@@ -378,13 +413,11 @@ fn resolve_provider(default: &Ollama, options: &AssistantOptions) -> Result<Assi
         ollama: Ollama::new(url, &model, key),
         name,
         model,
-        cloud: options.cloud,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::assistant::provider::api_base;
     use super::*;
 
     fn service() -> Ollama {
@@ -407,16 +440,13 @@ mod tests {
                 model: Some("deepseek-v4.1-flash".into()),
                 api_key: Some("user-token".into()),
                 cloud: true,
-                detail: false,
-                thinking: Default::default(),
-                about_me: String::new(),
+                device_id: None,
             },
         )
         .unwrap();
         assert_eq!(provider.name, "ollama-cloud");
         assert_eq!(provider.model, "deepseek-v4.1-flash");
-        assert_eq!(provider.ollama.url, api_base(OLLAMA_CLOUD_URL));
-        assert_eq!(provider.ollama.chat_url(), "https://ollama.com/api/chat");
+        assert_eq!(provider.ollama.url, OLLAMA_CLOUD_URL);
         assert_eq!(provider.ollama.api_key.as_deref(), Some("user-token"));
     }
 

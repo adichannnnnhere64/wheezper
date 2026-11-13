@@ -25,32 +25,13 @@ docker compose -f server/compose.yml up --build
 The port is plaintext gRPC. Put a TLS terminator in front, or mount certs and
 set `WHEEZPER_TLS_CERT` / `WHEEZPER_TLS_KEY`. See [TLS](#tls).
 
-Deploying to a small server: build the image on your laptop and ship it rather
-than building on the box (a Rust release build wants ~4 GB of builder cache):
-
-```bash
-scripts/deploy-image.sh HOST /path/to/deploy/dir
-# docker save | ssh | docker load, then `docker compose up -d --no-build server`
-```
-
-Plain `cargo build -p wheezper-server` plus a `COPY` Dockerfile works too if the
-target already has the same glibc.
-
 ## Quick start (native)
 
 ```bash
 export WHEEZPER_DATABASE_URL=postgres://wheezper:wheezper@localhost/wheezper
-export WHEEZPER_PAIRING_CODE="$(openssl rand -base64 24)"   # optional
+export WHEEZPER_PAIRING_CODE="$(openssl rand -base64 24)"
 cargo run -p wheezper-server
 # migrations run automatically at startup
-```
-
-Without `WHEEZPER_PAIRING_CODE` the server generates a `XXXX-XXXX-XXXX-XXXX`
-code on first start and keeps it in `$XDG_STATE_HOME/wheezper/pairing-code`
-(`0600`). Print it for the phone with:
-
-```bash
-wheezper-server --print-pairing-code   # terminal only, never the log stream
 ```
 
 Operate it with the bundled CLI:
@@ -93,15 +74,13 @@ All configuration is environment variables (12-factor; no config file).
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHEEZPER_DATABASE_URL` | **required** | PostgreSQL URL (`DATABASE_URL` also accepted) |
-| `WHEEZPER_PAIRING_CODE` | generated | shared secret exchanged for a device token; min 12 chars. Unset: one is generated once and kept in `WHEEZPER_PAIRING_CODE_FILE` |
-| `WHEEZPER_PAIRING_CODE_FILE` | `$XDG_STATE_HOME/wheezper/pairing-code` | where a generated pairing code is stored (`0600`) |
+| `WHEEZPER_PAIRING_CODE` | **required** | shared secret exchanged for a device token; min 12 chars |
 | `WHEEZPER_BIND` | `0.0.0.0:50051` | gRPC listen address |
 | `WHEEZPER_DEVICE_TTL_HOURS` | `168` | device-token lifetime |
 | `WHEEZPER_RETENTION_DAYS` | `0` | delete completed sessions older than N days (0 = forever) |
 | `WHEEZPER_ASSISTANT_URL` | `http://localhost:11434` | Ollama base URL (local or `ollama.com/api`) |
 | `WHEEZPER_ASSISTANT_MODEL` | `gemma3:1b` | Ollama model name |
 | `OLLAMA_API_KEY` / `WHEEZPER_ASSISTANT_API_KEY` | unset | bearer key for a cloud provider |
-| `WHEEZPER_ASSISTANT_CONTEXT` | `auto` | interview prompt size: `auto` (short for a local model, whole meeting for a cloud one), `full`, `short` |
 | `WHEEZPER_TLS_CERT` / `WHEEZPER_TLS_KEY` | unset | PEM files; both or neither |
 | `RUST_LOG` | `info` | tracing filter |
 
@@ -181,22 +160,12 @@ falls back to the server's `OLLAMA_API_KEY` when the request has none.
 `AskQuestion` / `StreamAnswer`:
 
 1. load the session,
-2. take the most recent transcript entries plus up to 20 older full-text
+2. take the most recent 250 transcript entries plus up to 20 older full-text
    matches for the question (`to_tsvector` / `plainto_tsquery`; the MVP stand-in
-   for embeddings) plus the answers already given in this meeting,
-3. apply the context budget (`assistant::context::Budget`): a local interview
-   keeps the last 12 lines and 12k chars because a small model must prefill them
-   before it answers; a cloud request (`OLLAMA_CLOUD`) gets the whole meeting up
-   to 48k chars,
+   for embeddings),
+3. cap the prompt at ~12k characters,
 4. stream the answer from Ollama (NDJSON),
-5. persist the question/answer pair with its `answered_sequence` (best-effort).
-
-`ListAnswers` returns those pairs anchored to their transcript row
-(`DISTINCT ON (answered_sequence)`, newest wins), so a phone that reopens the
-meeting renders each answer under the line it answers instead of showing an
-interview with no answers. The app sends `answered_sequence` on
-`AskQuestion`/`StreamAnswer`; `0` means "not about one transcript row" (the
-free-form Ask-AI sheet).
+5. persist the question/answer pair (best-effort).
 
 The system prompt forbids inventing meeting content, and answers are stored
 outside the transcript. `think: false` is set because cloud reasoning models

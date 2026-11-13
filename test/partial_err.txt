@@ -1,5 +1,0 @@
-wheezper: model=/home/adrian/.local/share/wheezper/ggml-tiny-q5_1.bin
-wheezper: notes -> notes/2026-11-07.md
-wheezper: lang=en
-wheezper: source=stdin (16000 Hz, mono f32le)
-wheezper: done.

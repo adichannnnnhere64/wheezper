@@ -126,11 +126,7 @@ async fn main() -> Result<()> {
             let token = device_token(&token)?;
             let response = proto::session_service_client::SessionServiceClient::new(channel)
                 .create_session(with_token(
-                    proto::CreateSessionRequest {
-                        title,
-                        ai_help,
-                        ..Default::default()
-                    },
+                    proto::CreateSessionRequest { title, ai_help },
                     token,
                 ))
                 .await?
@@ -260,9 +256,6 @@ async fn main() -> Result<()> {
                         } else {
                             proto::AssistantBackend::Default as i32
                         },
-                        answered_sequence: 0,
-                        explain_more: false,
-                        ..Default::default()
                     },
                     token,
                 ))
